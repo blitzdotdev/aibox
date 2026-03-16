@@ -20,14 +20,15 @@
 #   aibox help                    Show this help (default)
 #
 # Flags:
-#   --name NAME           Run a named instance (e.g. --name refactor)
+#   -n, --name NAME       Run a named instance (e.g. -n refactor)
 #                         Allows multiple containers per project
-#   --image NAME          Override base Docker image (default: aibox:latest)
+#   -d, --dir PATH        Run in a different project directory
+#   -i, --image NAME      Override base Docker image (default: aibox:latest)
+#   -c, --copy            Copy project into container (full isolation, no host sync)
+#   -w, --worktree        Use git worktree (lightweight isolation, stays on host)
+#   -y, --yolo            Yolo mode: skip permissions, full sudo, no firewall
+#   -s, --safe            Safe mode: keep permissions, restricted sudo, firewall on
 #   --shared-modules      Share node_modules between host and container
-#   --copy                Copy project into container (full isolation, no host sync)
-#   --worktree            Use git worktree (lightweight isolation, stays on host)
-#   --yolo                Yolo mode: skip permissions, full sudo, no firewall
-#   --safe                Safe mode: keep permissions, restricted sudo, firewall on
 #
 # Network firewall:
 #   Default: only allows Claude API, npm, GitHub, PyPI, SSH, DNS.
@@ -183,6 +184,7 @@ _check_deps() {
 IMAGE="$DEFAULT_IMAGE"
 SHARED_MODULES=false
 INSTANCE_NAME=""
+PROJECT_DIR_FLAG=""
 DOWN_ALL=false
 DOWN_CLEAN=false
 SKIP_PERMISSIONS=false
@@ -193,24 +195,28 @@ POSITIONAL=()
 parse_flags() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --image)
+      -i|--image)
         IMAGE="${2:?'--image requires a value'}"
         shift 2
         ;;
-      --name)
+      -n|--name)
         INSTANCE_NAME="${2:?'--name requires a value'}"
+        shift 2
+        ;;
+      -d|--dir)
+        PROJECT_DIR_FLAG="${2:?'--dir requires a value'}"
         shift 2
         ;;
       --shared-modules)
         SHARED_MODULES=true
         shift
         ;;
-      --copy)
+      -c|--copy)
         [[ -n "$ISOLATION" ]] && { echo "Error: --copy and --worktree are mutually exclusive" >&2; exit 1; }
         ISOLATION="copy"
         shift
         ;;
-      --worktree)
+      -w|--worktree)
         [[ -n "$ISOLATION" ]] && { echo "Error: --copy and --worktree are mutually exclusive" >&2; exit 1; }
         ISOLATION="worktree"
         shift
@@ -223,11 +229,11 @@ parse_flags() {
         DOWN_CLEAN=true
         shift
         ;;
-      --yolo)
+      -y|--yolo)
         SKIP_PERMISSIONS=true
         shift
         ;;
-      --safe)
+      -s|--safe)
         SAFE_MODE=true
         shift
         ;;
@@ -254,7 +260,14 @@ elif [[ "$SAFE_MODE" == "true" ]]; then
 fi
 
 # ── Per-project config file (.aibox) ─────────────────────────────
-PROJECT_DIR="$(pwd)"
+if [[ -n "$PROJECT_DIR_FLAG" ]]; then
+  PROJECT_DIR="$(cd "$PROJECT_DIR_FLAG" 2>/dev/null && pwd)" || {
+    echo "Error: directory not found: $PROJECT_DIR_FLAG" >&2
+    exit 1
+  }
+else
+  PROJECT_DIR="$(pwd)"
+fi
 PROJECT_CONF="${PROJECT_DIR}/.aibox"
 
 # ── Safety: refuse to run in dangerous directories ───────────────
