@@ -1,6 +1,6 @@
 {
   "name": "aibox-cli",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Run AI coding agents in isolated Docker containers",
   "author": "repalash <palash@shaders.app>",
   "license": "MIT",
@@ -35,5 +35,8 @@
   ],
   "engines": {
     "node": ">=18"
+  },
+  "scripts": {
+    "release": "git tag v$npm_package_version && git push origin v$npm_package_version && gh release create v$npm_package_version --generate-notes"
   }
 }
