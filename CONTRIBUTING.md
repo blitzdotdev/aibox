@@ -18,25 +18,22 @@ ln -sf "$(pwd)/bin/aibox" /usr/local/bin/aibox
 
 ## Publishing
 
-Publishing is automated. When you create a GitHub release, CI publishes to npm and updates the Homebrew tap automatically.
+Publishing is fully automated. Pushing a version tag triggers CI which creates a GitHub release, publishes to npm, and updates the Homebrew tap.
 
 ```bash
-git tag v0.3.0
-git push origin v0.3.0
-gh release create v0.3.0 --generate-notes
+# 1. Bump version in package.json, commit
+# 2. Tag and push
+npm run release
 ```
 
-This triggers `.github/workflows/release.yml` which:
+`npm run release` tags with the version from `package.json` and pushes the tag. CI (`.github/workflows/release.yml`) then:
+- Creates a GitHub release with auto-generated notes
 - Publishes to npm (`aibox-cli`)
 - Updates `url` and `sha256` in [`blitzdotdev/homebrew-tap`](https://github.com/blitzdotdev/homebrew-tap)
 
-Users install with:
-```bash
-brew install blitzdotdev/tap/aibox
-```
-
 ### Version Bumps
 
-1. Update `AIBOX_VERSION` in `bin/aibox`
-2. Update `version` in `package.json`
-3. Commit, tag, and create a GitHub release — npm and brew are updated automatically
+1. Update `version` in `package.json`
+2. Commit, then `npm run release` — CI handles the rest
+
+Note: `AIBOX_VERSION` in `bin/aibox` is separate — it tracks the Docker image format and only needs bumping when the Dockerfile or entrypoint changes (triggers automatic image rebuild for users).
