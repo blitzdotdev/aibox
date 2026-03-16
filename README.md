@@ -19,11 +19,8 @@ On macOS, if Docker isn't installed, aibox will offer to install [Colima](https:
 ## Usage
 
 ```bash
-# first time (once)
-aibox build
-
 # in any project directory
-aibox up                    # start container
+aibox up                    # start container (auto-builds image on first run)
 aibox claude --yolo         # no prompts, full sudo, no firewall
 aibox claude --safe         # keep prompts, restricted sudo, firewall on
 aibox claude                # asks you each time
@@ -70,6 +67,17 @@ aibox down --clean        # also remove copy volumes / worktrees
 aibox down --all          # stop all containers for this project
 aibox nuke                # remove ALL aibox containers
 ```
+
+### From a Git Repo
+
+Start directly from a repo URL — aibox clones it and runs:
+
+```bash
+aibox --repo https://github.com/user/project.git claude --yolo
+aibox --repo git@github.com:user/project.git --branch dev claude
+```
+
+Repos are cloned to `~/.config/aibox/repos/` with `--recursive` (submodules included). On subsequent runs, the existing clone is reused.
 
 ### Custom Image
 
@@ -151,6 +159,8 @@ SHARED_MODULES=false
 |-------|------|-------------|
 | `-n` | `--name NAME` | Named instance (multiple containers per project) |
 | `-d` | `--dir PATH` | Run in a different project directory |
+| `-r` | `--repo URL` | Clone a git repo and run in it |
+| `-b` | `--branch NAME` | Branch to checkout (with `--repo`) |
 | `-i` | `--image NAME` | Override base Docker image |
 | `-c` | `--copy` | Copy repo into Docker volume (full isolation) |
 | `-w` | `--worktree` | Use git worktree (lightweight isolation) |

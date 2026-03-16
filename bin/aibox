@@ -23,6 +23,8 @@
 #   -n, --name NAME       Run a named instance (e.g. -n refactor)
 #                         Allows multiple containers per project
 #   -d, --dir PATH        Run in a different project directory
+#   -r, --repo URL        Clone a git repo and run in it
+#   -b, --branch NAME     Branch to checkout (with --repo)
 #   -i, --image NAME      Override base Docker image (default: aibox:latest)
 #   -c, --copy            Copy project into container (full isolation, no host sync)
 #   -w, --worktree        Use git worktree (lightweight isolation, stays on host)
@@ -185,6 +187,8 @@ IMAGE="$DEFAULT_IMAGE"
 SHARED_MODULES=false
 INSTANCE_NAME=""
 PROJECT_DIR_FLAG=""
+REPO_URL=""
+REPO_BRANCH=""
 DOWN_ALL=false
 DOWN_CLEAN=false
 SKIP_PERMISSIONS=false
@@ -205,6 +209,14 @@ parse_flags() {
         ;;
       -d|--dir)
         PROJECT_DIR_FLAG="${2:?'--dir requires a value'}"
+        shift 2
+        ;;
+      -r|--repo)
+        REPO_URL="${2:?'--repo requires a value'}"
+        shift 2
+        ;;
+      -b|--branch)
+        REPO_BRANCH="${2:?'--branch requires a value'}"
         shift 2
         ;;
       --shared-modules)
@@ -257,6 +269,31 @@ if [[ "$SKIP_PERMISSIONS" == "true" ]]; then
   export AIBOX_MODE="yolo"
 elif [[ "$SAFE_MODE" == "true" ]]; then
   export AIBOX_MODE="safe"
+fi
+
+# ── Repo clone ───────────────────────────────────────────────────
+if [[ -n "$REPO_URL" ]]; then
+  # Derive a directory name from the repo URL (hash prevents collisions)
+  _repo_name=$(basename "$REPO_URL" .git)
+  _repo_hash=$(printf '%s' "$REPO_URL" | shasum | cut -c1-6)
+  _repo_dir="${CONFIG_DIR}/repos/${_repo_name}-${_repo_hash}"
+
+  if [[ -d "$_repo_dir/.git" ]]; then
+    echo "Repo already cloned (${_repo_dir}). Reusing."
+    # Fetch latest and checkout branch if specified
+    if [[ -n "$REPO_BRANCH" ]]; then
+      git -C "$_repo_dir" fetch --all --quiet 2>/dev/null || true
+      git -C "$_repo_dir" checkout "$REPO_BRANCH" 2>/dev/null || true
+    fi
+  else
+    echo "Cloning ${REPO_URL}..."
+    mkdir -p "${CONFIG_DIR}/repos"
+    _clone_args=(--recursive)
+    [[ -n "$REPO_BRANCH" ]] && _clone_args+=(--branch "$REPO_BRANCH")
+    git clone "${_clone_args[@]}" "$REPO_URL" "$_repo_dir"
+  fi
+
+  PROJECT_DIR_FLAG="$_repo_dir"
 fi
 
 # ── Per-project config file (.aibox) ─────────────────────────────
