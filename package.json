@@ -1,6 +1,6 @@
 {
   "name": "aibox-cli",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Run AI coding agents in isolated Docker containers",
   "author": "repalash <palash@shaders.app>",
   "license": "MIT",
