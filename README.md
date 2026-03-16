@@ -6,7 +6,7 @@ Run AI coding agents in isolated Docker containers. Mount your project, skip per
 
 ```bash
 # npm
-npm install -g @blitzdev/aibox
+npm install -g aibox
 
 # brew
 brew install blitzdotdev/tap/aibox
@@ -14,7 +14,7 @@ brew install blitzdotdev/tap/aibox
 
 ### Prerequisites
 
-Docker must be available. On macOS, aibox works with [Colima](https://github.com/abiosoft/colima) or [OrbStack](https://orbstack.dev). If Docker isn't installed, aibox will offer to install it via Homebrew.
+On macOS, if Docker isn't installed, aibox will offer to install [Colima](https://github.com/abiosoft/colima) + Docker via Homebrew automatically. It also works with [Docker Desktop](https://www.docker.com/products/docker-desktop/) or [OrbStack](https://orbstack.dev) if you already have them.
 
 ## Usage
 
@@ -42,10 +42,31 @@ aibox --name tests claude --safe
 aibox --name refactor down
 ```
 
+### Isolated Instances
+
+By default, named instances share the project directory. For true isolation:
+
+```bash
+# Full isolation — copy repo into a Docker volume
+aibox --name refactor --copy claude --yolo
+
+# Lightweight — git worktree on host
+aibox --name feat --worktree claude --yolo
+```
+
+`--copy` uses `git bundle` to clone tracked files into a volume (excludes .gitignored files, preserves history). Changes stay inside the container until pushed. Best for automation and parallel agents.
+
+`--worktree` creates a `git worktree` at `~/.config/aibox/worktrees/`. Near-instant, shares remotes with the main repo. Best for feature branches and quick experiments.
+
+Both create a new branch `aibox/<instance-name>` automatically.
+
 ### Management
 
 ```bash
 aibox status              # list all aibox containers
+aibox volumes             # list copy volumes and worktrees
+aibox down                # stop current container
+aibox down --clean        # also remove copy volumes / worktrees
 aibox down --all          # stop all containers for this project
 aibox nuke                # remove ALL aibox containers
 ```
@@ -131,9 +152,12 @@ SHARED_MODULES=false
 | `--name NAME` | Named instance (multiple containers per project) |
 | `--image NAME` | Override base Docker image |
 | `--shared-modules` | Share node_modules between host and container |
+| `--copy` | Copy repo into Docker volume (full isolation) |
+| `--worktree` | Use git worktree (lightweight isolation) |
 | `--yolo` | Skip prompts, full sudo, no firewall |
 | `--safe` | Keep prompts, restricted sudo, firewall on |
 | `--all` | With `down`: stop all project containers |
+| `--clean` | With `down`: also remove copy volumes / worktrees |
 
 ## License
 

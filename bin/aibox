@@ -10,8 +10,10 @@
 #   aibox shell                   Open a zsh shell in the container
 #   aibox shell <command>         Run a command in the container
 #   aibox down                    Stop and remove the container
+#   aibox down --clean            Also remove copy volumes / worktrees
 #   aibox down --all              Stop all containers for this project
 #   aibox status                  List all aibox containers
+#   aibox volumes                 List copy volumes and worktrees
 #   aibox nuke                    Remove ALL aibox containers (all projects)
 #   aibox build [--image NAME]    Build the base image
 #   aibox init [flags]            Generate compose.dev.yaml + configure WebStorm
@@ -22,6 +24,8 @@
 #                         Allows multiple containers per project
 #   --image NAME          Override base Docker image (default: aibox:latest)
 #   --shared-modules      Share node_modules between host and container
+#   --copy                Copy project into container (full isolation, no host sync)
+#   --worktree            Use git worktree (lightweight isolation, stays on host)
 #   --yolo                Yolo mode: skip permissions, full sudo, no firewall
 #   --safe                Safe mode: keep permissions, restricted sudo, firewall on
 #
@@ -180,8 +184,10 @@ IMAGE="$DEFAULT_IMAGE"
 SHARED_MODULES=false
 INSTANCE_NAME=""
 DOWN_ALL=false
+DOWN_CLEAN=false
 SKIP_PERMISSIONS=false
 SAFE_MODE=false
+ISOLATION=""
 POSITIONAL=()
 
 parse_flags() {
@@ -199,8 +205,22 @@ parse_flags() {
         SHARED_MODULES=true
         shift
         ;;
+      --copy)
+        [[ -n "$ISOLATION" ]] && { echo "Error: --copy and --worktree are mutually exclusive" >&2; exit 1; }
+        ISOLATION="copy"
+        shift
+        ;;
+      --worktree)
+        [[ -n "$ISOLATION" ]] && { echo "Error: --copy and --worktree are mutually exclusive" >&2; exit 1; }
+        ISOLATION="worktree"
+        shift
+        ;;
       --all)
         DOWN_ALL=true
+        shift
+        ;;
+      --clean)
+        DOWN_CLEAN=true
         shift
         ;;
       --yolo)
@@ -315,6 +335,28 @@ if ! [[ "$INSTANCE_NAME" =~ ^[a-z0-9_-]+$ ]]; then
 fi
 CONTAINER_NAME="${BASE_CONTAINER_NAME}-${INSTANCE_NAME}"
 WORKSPACE_DIR="/${PROJECT_NAME}"
+
+# ── Isolation mode setup ─────────────────────────────────────────
+COPY_VOLUME=""
+WORKTREE_DIR=""
+
+if [[ "$ISOLATION" == "copy" ]]; then
+  COPY_VOLUME="${CONTAINER_NAME}-src"
+elif [[ "$ISOLATION" == "worktree" ]]; then
+  WORKTREE_DIR="${CONFIG_DIR}/worktrees/${CONTAINER_NAME}"
+fi
+
+# Detect isolation mode from existing container label (reconnect support)
+if [[ -z "$ISOLATION" ]]; then
+  _existing_isolation=$(docker inspect "$CONTAINER_NAME" --format '{{index .Config.Labels "aibox.isolation"}}' 2>/dev/null || echo "")
+  if [[ "$_existing_isolation" == "copy" ]]; then
+    ISOLATION="copy"
+    COPY_VOLUME="${CONTAINER_NAME}-src"
+  elif [[ "$_existing_isolation" == "worktree" ]]; then
+    ISOLATION="worktree"
+    WORKTREE_DIR="${CONFIG_DIR}/worktrees/${CONTAINER_NAME}"
+  fi
+fi
 
 # ── Dockerfile management ────────────────────────────────────────
 ensure_dockerfile() {
@@ -467,6 +509,84 @@ ENTRYPOINT
   fi
 }
 
+# ── Isolation: copy mode ──────────────────────────────────────────
+_prepare_copy_volume() {
+  local branch_name="aibox/${INSTANCE_NAME}"
+
+  # Warn about uncommitted changes
+  if ! git -C "$PROJECT_DIR" diff --quiet 2>/dev/null || ! git -C "$PROJECT_DIR" diff --cached --quiet 2>/dev/null; then
+    echo "Warning: uncommitted changes will NOT be included in the copy."
+  fi
+
+  docker volume create "$COPY_VOLUME" >/dev/null 2>&1 || true
+
+  # Check if volume already has content (--entrypoint bypasses su-exec drop)
+  local has_content
+  has_content=$(docker run --rm --entrypoint sh -v "${COPY_VOLUME}:/${PROJECT_NAME}" "$IMAGE" -c "ls -A /${PROJECT_NAME} 2>/dev/null | head -1" 2>/dev/null || true)
+
+  if [[ -n "$has_content" ]]; then
+    echo "Copy volume already populated (${COPY_VOLUME}). Reusing."
+    return
+  fi
+
+  echo "Copying project into isolated volume (branch: ${branch_name})..."
+
+  # Create bundle to a temp file first so we can check for failure
+  local bundle_file
+  bundle_file=$(mktemp)
+  if ! git -C "$PROJECT_DIR" bundle create "$bundle_file" --all 2>/dev/null; then
+    rm -f "$bundle_file"
+    docker volume rm "$COPY_VOLUME" 2>/dev/null || true
+    echo "Error: git bundle failed. Is this a git repository with commits?" >&2
+    exit 1
+  fi
+
+  if ! cat "$bundle_file" | docker run --rm -i --entrypoint sh \
+      -v "${COPY_VOLUME}:/${PROJECT_NAME}" \
+      "$IMAGE" -c "
+        cat > /tmp/repo.bundle
+        cd /${PROJECT_NAME}
+        git clone /tmp/repo.bundle .
+        rm /tmp/repo.bundle
+        git checkout -b '${branch_name}' 2>/dev/null || git checkout '${branch_name}'
+        chown -R aibox:aibox /${PROJECT_NAME}
+      "; then
+    rm -f "$bundle_file"
+    docker volume rm "$COPY_VOLUME" 2>/dev/null || true
+    echo "Error: failed to clone into volume." >&2
+    exit 1
+  fi
+
+  rm -f "$bundle_file"
+  echo "Copied to volume ${COPY_VOLUME}"
+}
+
+# ── Isolation: worktree mode ─────────────────────────────────────
+_prepare_worktree() {
+  local branch_name="aibox/${INSTANCE_NAME}"
+
+  if [[ -d "$WORKTREE_DIR" ]]; then
+    echo "Worktree already exists (${WORKTREE_DIR}). Reusing."
+    return
+  fi
+
+  mkdir -p "${CONFIG_DIR}/worktrees"
+
+  echo "Creating worktree (branch: ${branch_name})..."
+
+  # Try creating with a new branch, fall back to existing branch
+  if git -C "$PROJECT_DIR" worktree add "$WORKTREE_DIR" -b "$branch_name" 2>/dev/null; then
+    true
+  elif git -C "$PROJECT_DIR" worktree add "$WORKTREE_DIR" "$branch_name" 2>/dev/null; then
+    true
+  else
+    echo "Error: failed to create worktree. Is this a git repository?" >&2
+    exit 1
+  fi
+
+  echo "Created worktree at ${WORKTREE_DIR}"
+}
+
 # ── Compose YAML generation ──────────────────────────────────────
 # Auth volume shared across all containers using the same base image.
 # name: field prevents docker compose from prefixing with project name.
@@ -476,7 +596,13 @@ _volumes_yaml() {
   local indent="$1"
   local prefix="$2"
 
-  echo "${indent}- \"${prefix}:${WORKSPACE_DIR}\""
+  if [[ "$ISOLATION" == "copy" ]]; then
+    echo "${indent}- ${COPY_VOLUME}:${WORKSPACE_DIR}"
+  elif [[ "$ISOLATION" == "worktree" ]]; then
+    echo "${indent}- \"${WORKTREE_DIR}:${WORKSPACE_DIR}\""
+  else
+    echo "${indent}- \"${prefix}:${WORKSPACE_DIR}\""
+  fi
   echo "${indent}- ${AUTH_VOLUME}:/home/aibox/.claude"
 
   # Mount host's IDE lock files so Claude Code can discover JetBrains/VS Code plugins
@@ -485,7 +611,7 @@ _volumes_yaml() {
     echo "${indent}- \"${host_ide_dir}:/home/aibox/.claude/ide:ro\""
   fi
 
-  if [[ "$SHARED_MODULES" == "false" ]]; then
+  if [[ "$SHARED_MODULES" == "false" && -z "$ISOLATION" ]]; then
     echo "${indent}- node_modules:${WORKSPACE_DIR}/node_modules"
   fi
 }
@@ -494,7 +620,11 @@ _top_volumes_yaml() {
   printf "volumes:\n"
   printf "  ${AUTH_VOLUME}:\n"
   printf "    external: true\n"
-  if [[ "$SHARED_MODULES" == "false" ]]; then
+  if [[ "$ISOLATION" == "copy" ]]; then
+    printf "  ${COPY_VOLUME}:\n"
+    printf "    external: true\n"
+  fi
+  if [[ "$SHARED_MODULES" == "false" && -z "$ISOLATION" ]]; then
     printf "  node_modules:\n"
   fi
 }
@@ -548,6 +678,7 @@ _labels_yaml() {
   echo "${indent}aibox.project: \"${PROJECT_NAME}\""
   echo "${indent}aibox.path: \"${PROJECT_DIR}\""
   echo "${indent}aibox.instance: \"${INSTANCE_NAME}\""
+  echo "${indent}aibox.isolation: \"${ISOLATION}\""
 }
 
 generate_compose() {
@@ -711,6 +842,13 @@ cmd_up() {
     fi
   fi
 
+  # Prepare isolation volumes/worktrees if needed
+  if [[ "$ISOLATION" == "copy" ]]; then
+    _prepare_copy_volume
+  elif [[ "$ISOLATION" == "worktree" ]]; then
+    _prepare_worktree
+  fi
+
   if ! docker ps --format '{{.Names}}' | grep -Fxq "$CONTAINER_NAME"; then
     # Ensure shared auth volume exists (external: true requires it)
     docker volume create "$AUTH_VOLUME" &>/dev/null || true
@@ -781,17 +919,8 @@ cmd_claude() {
 }
 
 cmd_shell() {
-  ensure_init
-
   if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -Fxq "$CONTAINER_NAME"; then
-    if docker image inspect "$IMAGE" &>/dev/null; then
-      echo "Starting ${CONTAINER_NAME}..." >&2
-      dc up -d >/dev/null
-    else
-      echo "Container '${CONTAINER_NAME}' is not running and image '${IMAGE}' not found." >&2
-      echo "Run: ${SCRIPT_NAME} build && ${SCRIPT_NAME} up" >&2
-      exec "${SHELL:-/bin/bash}"
-    fi
+    cmd_up
   fi
 
   shift  # remove "shell" from args
@@ -814,6 +943,28 @@ cmd_down() {
       if _confirm_no "Remove all?"; then
         echo "$project_containers" | xargs docker rm -f
         echo "Removed all containers for ${PROJECT_NAME}"
+        if [[ "$DOWN_CLEAN" == "true" ]]; then
+          # Clean up copy volumes and worktrees for removed containers
+          while IFS= read -r cname; do
+            docker volume rm "${cname}-src" 2>/dev/null && echo "Removed copy volume ${cname}-src" || true
+            local wt="${CONFIG_DIR}/worktrees/${cname}"
+            if [[ -d "$wt" ]]; then
+              git -C "$PROJECT_DIR" worktree remove "$wt" 2>/dev/null && echo "Removed worktree ${wt}" || true
+            fi
+          done <<< "$project_containers"
+        else
+          # Check if any had isolation resources
+          local has_isolation=false
+          while IFS= read -r cname; do
+            if docker volume inspect "${cname}-src" &>/dev/null || [[ -d "${CONFIG_DIR}/worktrees/${cname}" ]]; then
+              has_isolation=true
+              break
+            fi
+          done <<< "$project_containers"
+          if [[ "$has_isolation" == "true" ]]; then
+            echo "Note: copy volumes / worktrees kept. Use --clean to remove."
+          fi
+        fi
       else
         echo "Aborted."
       fi
@@ -827,6 +978,19 @@ cmd_down() {
     else
       echo "No container found: ${CONTAINER_NAME}"
     fi
+    # Clean up isolation resources (works even if container is already gone)
+    if [[ "$DOWN_CLEAN" == "true" ]]; then
+      if [[ -n "$COPY_VOLUME" ]]; then
+        docker volume rm "$COPY_VOLUME" 2>/dev/null && echo "Removed copy volume ${COPY_VOLUME}" || true
+      fi
+      if [[ -n "$WORKTREE_DIR" && -d "$WORKTREE_DIR" ]]; then
+        git -C "$PROJECT_DIR" worktree remove "$WORKTREE_DIR" 2>/dev/null && echo "Removed worktree ${WORKTREE_DIR}" || true
+      fi
+    elif [[ "$ISOLATION" == "copy" && -n "$COPY_VOLUME" ]] && docker volume inspect "$COPY_VOLUME" &>/dev/null; then
+      echo "Copy volume kept: ${COPY_VOLUME} (use --clean to remove)"
+    elif [[ "$ISOLATION" == "worktree" && -n "$WORKTREE_DIR" && -d "$WORKTREE_DIR" ]]; then
+      echo "Worktree kept: ${WORKTREE_DIR} (use --clean to remove)"
+    fi
   fi
 }
 
@@ -839,17 +1003,25 @@ cmd_status() {
     return
   fi
 
-  printf "%-30s %-10s %-8s %s\n" "CONTAINER" "INSTANCE" "STATUS" "PROJECT PATH"
-  printf "%-30s %-10s %-8s %s\n" "---------" "--------" "------" "------------"
+  printf "%-30s %-10s %-10s %-6s %-8s %s\n" "CONTAINER" "INSTANCE" "ISOLATION" "MODE" "STATUS" "PROJECT PATH"
+  printf "%-30s %-10s %-10s %-6s %-8s %s\n" "---------" "--------" "---------" "----" "------" "------------"
 
   docker ps -a \
     --filter "name=${CONTAINER_PREFIX}-" \
-    --format '{{.Names}}\t{{.Label "aibox.instance"}}\t{{.State}}\t{{.Label "aibox.path"}}' \
-  | while IFS=$'\t' read -r name instance state path; do
-    # Fallback for containers created before labels were added
+    --format '{{.Names}}' \
+  | while IFS= read -r name; do
+    local instance isolation mode state path
+    instance=$(docker inspect "$name" --format '{{index .Config.Labels "aibox.instance"}}' 2>/dev/null || echo "")
+    isolation=$(docker inspect "$name" --format '{{index .Config.Labels "aibox.isolation"}}' 2>/dev/null || echo "")
+    state=$(docker inspect "$name" --format '{{.State.Status}}' 2>/dev/null || echo "")
+    path=$(docker inspect "$name" --format '{{index .Config.Labels "aibox.path"}}' 2>/dev/null || echo "")
+    # Extract AIBOX_MODE from container env
+    mode=$(docker inspect "$name" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null | grep '^AIBOX_MODE=' | cut -d= -f2- || echo "")
     [[ -z "$instance" ]] && instance="-"
+    [[ -z "$isolation" ]] && isolation="-"
+    [[ -z "$mode" ]] && mode="-"
     [[ -z "$path" ]] && path="-"
-    printf "%-30s %-10s %-8s %s\n" "$name" "$instance" "$state" "$path"
+    printf "%-30s %-10s %-10s %-6s %-8s %s\n" "$name" "$instance" "$isolation" "$mode" "$state" "$path"
   done
 }
 
@@ -868,6 +1040,51 @@ cmd_nuke() {
     fi
   else
     echo "No ${SCRIPT_NAME} containers found."
+  fi
+}
+
+cmd_volumes() {
+  # List copy volumes
+  local volumes
+  volumes=$(docker volume ls --format '{{.Name}}' | grep -F "${CONTAINER_PREFIX}-" | grep -- '-src$') || true
+
+  # List worktree dirs
+  local worktree_dir="${CONFIG_DIR}/worktrees"
+  local worktrees=""
+  if [[ -d "$worktree_dir" ]]; then
+    worktrees=$(ls -1 "$worktree_dir" 2>/dev/null) || true
+  fi
+
+  if [[ -z "$volumes" && -z "$worktrees" ]]; then
+    echo "No isolation volumes or worktrees found."
+    return
+  fi
+
+  printf "%-50s %-10s %-8s %s\n" "NAME" "TYPE" "STATUS" "CREATED"
+  printf "%-50s %-10s %-8s %s\n" "----" "----" "------" "-------"
+
+  if [[ -n "$volumes" ]]; then
+    while IFS= read -r vol; do
+      local status="orphan"
+      local container_name="${vol%-src}"
+      if docker ps -a --format '{{.Names}}' | grep -Fxq "$container_name" 2>/dev/null; then
+        status="in use"
+      fi
+      local created
+      created=$(docker volume inspect "$vol" --format '{{.CreatedAt}}' 2>/dev/null | cut -d' ' -f1 || echo "-")
+      printf "%-50s %-10s %-8s %s\n" "$vol" "copy" "$status" "$created"
+    done <<< "$volumes"
+  fi
+
+  if [[ -n "$worktrees" ]]; then
+    while IFS= read -r wt; do
+      local status="orphan"
+      if docker ps -a --format '{{.Names}}' | grep -Fxq "$wt" 2>/dev/null; then
+        status="in use"
+      fi
+      local wt_path="${worktree_dir}/${wt}"
+      printf "%-50s %-10s %-8s %s\n" "$wt_path" "worktree" "$status" "-"
+    done <<< "$worktrees"
   fi
 }
 
@@ -925,6 +1142,7 @@ case "${1:-help}" in
   shell)    cmd_shell "$@" ;;
   down)     cmd_down ;;
   status)   cmd_status ;;
+  volumes)  cmd_volumes ;;
   nuke)     cmd_nuke ;;
   build)    cmd_build ;;
   init)     cmd_init ;;
