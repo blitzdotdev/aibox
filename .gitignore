@@ -3,3 +3,4 @@ node_modules/
 compose.dev.yaml
 .aibox
 .idea/
+.idea/workspace.xml

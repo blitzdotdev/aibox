@@ -57,7 +57,7 @@ set -euo pipefail
 
 # ── Script identity ──────────────────────────────────────────────
 SCRIPT_NAME="$(basename "$0")"
-AIBOX_VERSION="6"
+AIBOX_VERSION="7"
 CONFIG_DIR="${HOME}/.config/aibox"
 DEFAULT_IMAGE="aibox:latest"
 CONTAINER_PREFIX="aibox"
@@ -384,7 +384,7 @@ if ! [[ "$INSTANCE_NAME" =~ ^[a-z0-9_-]+$ ]]; then
   exit 1
 fi
 CONTAINER_NAME="${BASE_CONTAINER_NAME}-${INSTANCE_NAME}"
-WORKSPACE_DIR="/workspace/${PROJECT_NAME}"
+WORKSPACE_DIR="${PROJECT_DIR}"
 
 # ── Isolation mode setup ─────────────────────────────────────────
 COPY_VOLUME=""
@@ -422,7 +422,8 @@ ensure_dockerfile() {
 
   if [[ "$current_version" != "$AIBOX_VERSION" || ! -f "$dockerfile" ]]; then
     if [[ -f "$dockerfile" && "$current_version" != "$AIBOX_VERSION" ]]; then
-      echo "Dockerfile outdated (v${current_version} → v${AIBOX_VERSION}). Regenerating..."
+      echo ""
+      echo "Dockerfile outdated (v${current_version} → v${AIBOX_VERSION}). Regenerating (one-time)..."
     fi
     cat > "$dockerfile" << DOCKERFILE
 FROM node:20-alpine
@@ -472,16 +473,6 @@ set -e
 
 # Fix auth volume ownership (Docker creates volumes as root)
 chown -R aibox:aibox /home/aibox/.claude 2>/dev/null || true
-
-# ── IDE path symlink ─────────────────────────────────────────
-# Create symlink so container paths match host paths for IDE integration.
-# Claude Code reports cwd-based paths to the IDE plugin; if they don't
-# match host paths, diffs break (empty left side, wrong file path).
-if [[ -n "${AIBOX_HOST_DIR:-}" && -n "${AIBOX_WORKSPACE_DIR:-}" \
-      && "$AIBOX_HOST_DIR" != "$AIBOX_WORKSPACE_DIR" ]]; then
-  mkdir -p "$(dirname "$AIBOX_HOST_DIR")"
-  ln -sfn "$AIBOX_WORKSPACE_DIR" "$AIBOX_HOST_DIR"
-fi
 
 # ── Mode-dependent setup ──────────────────────────────────────
 MODE="${AIBOX_MODE:-safe}"
@@ -582,13 +573,14 @@ _prepare_copy_volume() {
 
   # Check if volume already has content (--entrypoint bypasses su-exec drop)
   local has_content
-  has_content=$(docker run --rm --entrypoint sh -v "${COPY_VOLUME}:${WORKSPACE_DIR}" "$IMAGE" -c "ls -A ${WORKSPACE_DIR} 2>/dev/null | head -1" 2>/dev/null || true)
+  has_content=$(docker run --rm --entrypoint sh -v "${COPY_VOLUME}:${WORKSPACE_DIR}" "$IMAGE" -c "ls -A '${WORKSPACE_DIR}' 2>/dev/null | head -1" 2>/dev/null || true)
 
   if [[ -n "$has_content" ]]; then
     echo "Copy volume already populated (${COPY_VOLUME}). Reusing."
     return
   fi
 
+  echo ""
   echo "Copying project into isolated volume (branch: ${branch_name})..."
 
   # Create bundle to a temp file first so we can check for failure
@@ -605,12 +597,12 @@ _prepare_copy_volume() {
       -v "${COPY_VOLUME}:${WORKSPACE_DIR}" \
       "$IMAGE" -c "
         cat > /tmp/repo.bundle
-        mkdir -p ${WORKSPACE_DIR}
-        cd ${WORKSPACE_DIR}
+        mkdir -p '${WORKSPACE_DIR}'
+        cd '${WORKSPACE_DIR}'
         git clone /tmp/repo.bundle .
         rm /tmp/repo.bundle
         git checkout -b '${branch_name}' 2>/dev/null || git checkout '${branch_name}'
-        chown -R aibox:aibox ${WORKSPACE_DIR}
+        chown -R aibox:aibox '${WORKSPACE_DIR}'
       "; then
     rm -f "$bundle_file"
     docker volume rm "$COPY_VOLUME" 2>/dev/null || true
@@ -633,6 +625,7 @@ _prepare_worktree() {
 
   mkdir -p "${CONFIG_DIR}/worktrees"
 
+  echo ""
   echo "Creating worktree (branch: ${branch_name})..."
 
   # Try creating with a new branch, fall back to existing branch
@@ -696,8 +689,6 @@ _environment_yaml() {
   echo "${indent}- CLAUDE_CONFIG_DIR=/home/aibox/.claude"
   echo "${indent}- AIBOX_MODE=\${AIBOX_MODE:-safe}"
   echo "${indent}- AIBOX_EXTRA_DOMAINS=\${AIBOX_EXTRA_DOMAINS:-}"
-  echo "${indent}- AIBOX_HOST_DIR=${PROJECT_DIR}"
-  echo "${indent}- AIBOX_WORKSPACE_DIR=${WORKSPACE_DIR}"
 }
 
 # Build -e flags for docker exec from current terminal environment
@@ -869,15 +860,20 @@ dc() {
 cmd_build() {
   _check_deps
   ensure_dockerfile
+  echo ""
   echo "Building ${IMAGE}..."
+  echo ""
   docker build -t "$IMAGE" "$CONFIG_DIR"
+  echo ""
   echo "Done. Image: ${IMAGE}"
 }
 
 ensure_init() {
   if [[ ! -f "${PROJECT_DIR}/compose.dev.yaml" ]]; then
     _require_safe_dir
-    echo "No ${SCRIPT_NAME} config found. Will create compose.dev.yaml, .aibox, and .idea/workspace.xml."
+    echo ""
+    echo "No ${SCRIPT_NAME} config found. Initializing project (one-time)..."
+    echo "Will create compose.dev.yaml, .aibox, and .idea/workspace.xml."
     if _confirm_yes "Initialize?"; then
       _init_files
       echo ""
@@ -893,14 +889,18 @@ cmd_up() {
   ensure_init
 
   if ! docker image inspect "$IMAGE" &>/dev/null; then
-    echo "Image '${IMAGE}' not found. Building..."
+    echo ""
+    echo "Image '${IMAGE}' not found. Building (one-time)..."
+    echo ""
     cmd_build
   else
     # Check if image version matches script version
     local img_version
     img_version=$(docker inspect "$IMAGE" --format '{{index .Config.Labels "aibox.version"}}' 2>/dev/null || echo "")
     if [[ "$img_version" != "$AIBOX_VERSION" ]]; then
-      echo "Image outdated (v${img_version:-0} → v${AIBOX_VERSION}). Rebuilding..."
+      echo ""
+      echo "Image outdated (v${img_version:-0} → v${AIBOX_VERSION}). Rebuilding (one-time)..."
+      echo ""
       cmd_build
     fi
   fi
@@ -915,9 +915,11 @@ cmd_up() {
   if ! docker ps --format '{{.Names}}' | grep -Fxq "$CONTAINER_NAME"; then
     # Ensure shared auth volume exists (external: true requires it)
     docker volume create "$AUTH_VOLUME" &>/dev/null || true
+    echo ""
     echo "Starting ${CONTAINER_NAME} (image: ${IMAGE})..."
     dc up -d
-    echo "Container running. Workspace: ${WORKSPACE_DIR}"
+    echo "Container running."
+    echo ""
   else
     echo "${CONTAINER_NAME} is already running."
   fi
@@ -967,6 +969,7 @@ cmd_claude() {
     local current_mode
     current_mode=$(docker exec "$CONTAINER_NAME" sh -c 'echo ${AIBOX_MODE:-safe}' 2>/dev/null || echo "unknown")
     if [[ "$current_mode" != "$AIBOX_MODE" ]]; then
+      echo ""
       echo "Restarting container in ${AIBOX_MODE} mode (was: ${current_mode})..."
       dc down --remove-orphans >/dev/null
     fi
