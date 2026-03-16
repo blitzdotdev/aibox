@@ -6,7 +6,7 @@ Run AI coding agents in isolated Docker containers. Mount your project, skip per
 
 ```bash
 # npm
-npm install -g aibox
+npm install -g aibox-cli
 
 # brew
 brew install blitzdotdev/tap/aibox
