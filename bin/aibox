@@ -4,8 +4,8 @@
 # Usage:
 #   aibox up                      Start the container
 #   aibox claude [--yolo|--safe]  Open Claude Code
-#                                 --yolo: skip permission prompts (sandboxed)
-#                                 --safe: keep prompts (no ask)
+#                                 --yolo: skip permissions, full sudo, no firewall
+#                                 --safe: keep permissions, restricted sudo, firewall on
 #                                 default: asks you each time
 #   aibox shell                   Open a zsh shell in the container
 #   aibox shell <command>         Run a command in the container
@@ -22,8 +22,12 @@
 #                         Allows multiple containers per project
 #   --image NAME          Override base Docker image (default: aibox:latest)
 #   --shared-modules      Share node_modules between host and container
-#   --yolo                Skip permission prompts in Claude Code (no ask)
-#   --safe                Keep permission prompts in Claude Code (no ask)
+#   --yolo                Yolo mode: skip permissions, full sudo, no firewall
+#   --safe                Safe mode: keep permissions, restricted sudo, firewall on
+#
+# Network firewall:
+#   Default: only allows Claude API, npm, GitHub, PyPI, SSH, DNS.
+#   Add domains: export AIBOX_EXTRA_DOMAINS="example.com,api.myservice.io"
 #
 # Prerequisites:
 #   brew install colima docker docker-compose docker-buildx
@@ -46,7 +50,7 @@ set -euo pipefail
 
 # ── Script identity ──────────────────────────────────────────────
 SCRIPT_NAME="$(basename "$0")"
-AIBOX_VERSION="4"
+AIBOX_VERSION="5"
 CONFIG_DIR="${HOME}/.config/aibox"
 DEFAULT_IMAGE="aibox:latest"
 CONTAINER_PREFIX="aibox"
@@ -109,8 +113,20 @@ _check_deps() {
           echo "OrbStack started but Docker daemon not ready. Try again in a moment." >&2
           exit 1
         fi
+      elif [[ -d "/Applications/Docker.app" ]]; then
+        echo "Docker daemon not running. Starting Docker Desktop..."
+        open -a Docker
+        local i=0
+        while ! docker info &>/dev/null 2>&1 && [[ $i -lt 60 ]]; do
+          sleep 1
+          i=$((i + 1))
+        done
+        if ! docker info &>/dev/null 2>&1; then
+          echo "Docker Desktop started but daemon not ready. Try again in a moment." >&2
+          exit 1
+        fi
       else
-        echo "Docker daemon not running. Install Colima or OrbStack." >&2
+        echo "Docker daemon not running. Install Docker Desktop, Colima, or OrbStack." >&2
         exit 1
       fi
     fi
@@ -208,6 +224,13 @@ if [[ ${#POSITIONAL[@]} -gt 0 ]]; then
   set -- "${POSITIONAL[@]}"
 else
   set --
+fi
+
+# Set container mode from flags (cmd_claude may override via interactive prompt)
+if [[ "$SKIP_PERMISSIONS" == "true" ]]; then
+  export AIBOX_MODE="yolo"
+elif [[ "$SAFE_MODE" == "true" ]]; then
+  export AIBOX_MODE="safe"
 fi
 
 # ── Per-project config file (.aibox) ─────────────────────────────
@@ -324,20 +347,121 @@ RUN apk add --no-cache \\
     openssh-client \\
     python3 \\
     make \\
-    g++
+    g++ \\
+    iptables \\
+    ip6tables \\
+    bind-tools \\
+    su-exec
 
-# Create non-root user first (native installer goes into ~/.local/bin)
-RUN adduser -D -s /bin/zsh aibox \\
-    && echo "aibox ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+# Create non-root user (sudo configured at runtime by entrypoint based on mode)
+RUN adduser -D -s /bin/zsh aibox
 
+# Copy entrypoint (runs as root, sets up firewall + sudo, drops to aibox)
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+# Install Claude Code as aibox user via native installer
 USER aibox
 ENV PATH="/home/aibox/.local/bin:\$PATH"
-
-# Install Claude Code via native installer (npm method is deprecated)
 RUN curl -fsSL https://claude.ai/install.sh | bash
 
 WORKDIR /workspace
+
+# Entrypoint runs as root, then execs sleep as aibox
+USER root
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+CMD ["sleep", "infinity"]
 DOCKERFILE
+
+    # Generate entrypoint script (runs as root at container start)
+    cat > "${CONFIG_DIR}/entrypoint.sh" << 'ENTRYPOINT'
+#!/bin/bash
+set -e
+
+# Fix auth volume ownership (Docker creates volumes as root)
+chown -R aibox:aibox /home/aibox/.claude 2>/dev/null || true
+
+# ── Mode-dependent setup ──────────────────────────────────────
+MODE="${AIBOX_MODE:-safe}"
+
+if [[ "$MODE" == "yolo" ]]; then
+  # YOLO: full sudo, no firewall
+  echo "aibox ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/aibox
+  echo "[aibox] Mode: yolo (full sudo, no firewall)"
+
+else
+  # SAFE: restricted sudo (chown only), firewall active
+  echo "aibox ALL=(root) NOPASSWD: /bin/chown *" > /etc/sudoers.d/aibox
+
+  # ── Firewall setup ──────────────────────────────────────────
+  ALLOWED_DOMAINS=(
+    # Claude Code / Anthropic
+    "api.anthropic.com"
+    "claude.ai"
+    "statsig.anthropic.com"
+    "statsig.com"
+    "sentry.io"
+    # npm
+    "registry.npmjs.org"
+    # GitHub
+    "github.com"
+    "api.github.com"
+    # PyPI
+    "pypi.org"
+    "files.pythonhosted.org"
+  )
+
+  # Extra domains from env var (comma-separated)
+  if [[ -n "${AIBOX_EXTRA_DOMAINS:-}" ]]; then
+    IFS=',' read -ra EXTRA <<< "$AIBOX_EXTRA_DOMAINS"
+    ALLOWED_DOMAINS+=("${EXTRA[@]}")
+  fi
+
+  echo "Configuring firewall..."
+
+  # Flush existing
+  iptables -F OUTPUT 2>/dev/null || true
+
+  # Allow loopback
+  iptables -A OUTPUT -o lo -j ACCEPT
+
+  # Allow established/related
+  iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+
+  # Allow DNS
+  iptables -A OUTPUT -p udp --dport 53 -j ACCEPT
+  iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT
+
+  # Allow SSH (git over SSH)
+  iptables -A OUTPUT -p tcp --dport 22 -j ACCEPT
+
+  # Resolve and allow each domain
+  for domain in "${ALLOWED_DOMAINS[@]}"; do
+    domain=$(echo "$domain" | xargs)
+    [[ -z "$domain" ]] && continue
+    ips=$(dig +short A "$domain" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' || true)
+    for ip in $ips; do
+      iptables -A OUTPUT -d "$ip" -j ACCEPT
+    done
+  done
+
+  # Allow Docker host (IDE integration)
+  host_ip=$(getent hosts host.docker.internal 2>/dev/null | awk '{print $1}' || true)
+  if [[ -n "$host_ip" ]]; then
+    iptables -A OUTPUT -d "$host_ip" -j ACCEPT
+  fi
+
+  # Default deny
+  iptables -A OUTPUT -j DROP
+
+  echo "[aibox] Mode: safe (firewall active, ${#ALLOWED_DOMAINS[@]} domains allowed)"
+fi
+
+chmod 0440 /etc/sudoers.d/aibox
+
+# Drop to aibox user and exec CMD (su-exec preserves env and properly execs)
+exec su-exec aibox "$@"
+ENTRYPOINT
     echo "$AIBOX_VERSION" > "$version_file"
     echo "Created Dockerfile (v${AIBOX_VERSION})"
   fi
@@ -379,6 +503,8 @@ _environment_yaml() {
   local indent="$1"
   echo "${indent}- ANTHROPIC_API_KEY=\${ANTHROPIC_API_KEY:-}"
   echo "${indent}- CLAUDE_CONFIG_DIR=/home/aibox/.claude"
+  echo "${indent}- AIBOX_MODE=\${AIBOX_MODE:-safe}"
+  echo "${indent}- AIBOX_EXTRA_DOMAINS=\${AIBOX_EXTRA_DOMAINS:-}"
 }
 
 # Build -e flags for docker exec from current terminal environment
@@ -393,19 +519,28 @@ _docker_exec() {
     -e "LANG=${LANG:-C.UTF-8}"
   )
 
-  # Forward API key if set
-  [[ -n "${ANTHROPIC_API_KEY:-}" ]] && env_args+=(-e "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY")
+  # Forward Claude Code env vars if set on host
+  local forward_vars=(
+    ANTHROPIC_MODEL
+    ANTHROPIC_BASE_URL
+    CLAUDE_CODE_USE_BEDROCK
+    CLAUDE_CODE_USE_VERTEX
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+  )
+  for var in "${forward_vars[@]}"; do
+    [[ -n "${!var:-}" ]] && env_args+=(-e "$var=${!var}")
+  done
 
   # Forward JetBrains / VS Code IDE integration env vars
   if [[ "${ENABLE_IDE_INTEGRATION:-}" == "true" ]]; then
     env_args+=(-e "ENABLE_IDE_INTEGRATION=true")
     env_args+=(-e "TERMINAL_EMULATOR=${TERMINAL_EMULATOR:-}")
     [[ -n "${CLAUDE_CODE_SSE_PORT:-}" ]] && env_args+=(-e "CLAUDE_CODE_SSE_PORT=${CLAUDE_CODE_SSE_PORT}")
-    # Redirect WebSocket connections to Docker host instead of container localhost
+    [[ -n "${TERM_SESSION_ID:-}" ]] && env_args+=(-e "TERM_SESSION_ID=${TERM_SESSION_ID}")
     env_args+=(-e "CLAUDE_CODE_IDE_HOST_OVERRIDE=host.docker.internal")
   fi
 
-  docker exec -it "${env_args[@]}" "$container" "$@"
+  docker exec -it -u aibox "${env_args[@]}" "$container" "$@"
 }
 
 _labels_yaml() {
@@ -422,6 +557,8 @@ services:
   dev:
     image: ${IMAGE}
     container_name: ${CONTAINER_NAME}
+    cap_add:
+      - NET_ADMIN
     extra_hosts:
       - "host.docker.internal:host-gateway"
     labels:
@@ -429,7 +566,6 @@ $(_labels_yaml "      ")
     volumes:
 $(_volumes_yaml "      " "$PROJECT_DIR")
     working_dir: ${WORKSPACE_DIR}
-    command: sh -c "sudo chown -R aibox:aibox /home/aibox/.claude 2>/dev/null; exec sleep infinity"
     environment:
 $(_environment_yaml "      ")
     stdin_open: true
@@ -449,6 +585,8 @@ services:
   dev:
     image: ${IMAGE}
     container_name: ${CONTAINER_NAME}
+    cap_add:
+      - NET_ADMIN
     extra_hosts:
       - "host.docker.internal:host-gateway"
     labels:
@@ -456,7 +594,6 @@ $(_labels_yaml "      ")
     volumes:
 $(_volumes_yaml "      " ".")
     working_dir: ${WORKSPACE_DIR}
-    command: sh -c "sudo chown -R aibox:aibox /home/aibox/.claude 2>/dev/null; exec sleep infinity"
     environment:
 $(_environment_yaml "      ")
     stdin_open: true
@@ -586,29 +723,59 @@ cmd_up() {
 }
 
 cmd_claude() {
-  cmd_up
-
   local skip=false
+  local firewall=true
 
   if [[ "$SKIP_PERMISSIONS" == "true" ]]; then
-    # --yolo flag: skip without asking
+    # --yolo: everything loose
     skip=true
+    firewall=false
+    export AIBOX_MODE="yolo"
   elif [[ "$SAFE_MODE" == "true" ]]; then
-    # --safe flag: keep prompts without asking
+    # --safe: everything locked
     skip=false
+    firewall=true
+    export AIBOX_MODE="safe"
   else
-    # No flag: ask
-    echo "The container is sandboxed — skipping permission prompts is safe here."
-    if _confirm_yes "Skip Claude Code permission prompts?"; then
+    # No flag: ask about each setting
+    echo ""
+    echo "Container settings (per-session, not saved):"
+    echo ""
+
+    if _confirm_yes "Skip Claude Code permission prompts? (container is sandboxed)"; then
       skip=true
+    fi
+
+    if _confirm_yes "Enable network firewall? (blocks all except Claude API, npm, GitHub, PyPI)"; then
+      firewall=true
+    else
+      firewall=false
+    fi
+
+    if [[ "$firewall" == "true" ]]; then
+      export AIBOX_MODE="safe"
+    else
+      export AIBOX_MODE="yolo"
+    fi
+
+    echo ""
+  fi
+
+  # If container is running in a different mode, restart it
+  if docker ps --format '{{.Names}}' | grep -Fxq "$CONTAINER_NAME"; then
+    local current_mode
+    current_mode=$(docker exec "$CONTAINER_NAME" sh -c 'echo ${AIBOX_MODE:-safe}' 2>/dev/null || echo "unknown")
+    if [[ "$current_mode" != "$AIBOX_MODE" ]]; then
+      echo "Restarting container in ${AIBOX_MODE} mode (was: ${current_mode})..."
+      dc down --remove-orphans >/dev/null
     fi
   fi
 
+  cmd_up
+
   if [[ "$skip" == "true" ]]; then
-    echo "Launching Claude Code (skipping permission prompts)..."
     _docker_exec "$CONTAINER_NAME" claude --dangerously-skip-permissions
   else
-    echo "Launching Claude Code..."
     _docker_exec "$CONTAINER_NAME" claude
   fi
 }

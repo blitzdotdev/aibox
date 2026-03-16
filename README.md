@@ -24,8 +24,8 @@ aibox build
 
 # in any project directory
 aibox up                    # start container
-aibox claude --yolo         # Claude Code, no permission prompts (sandboxed)
-aibox claude --safe         # Claude Code, keep permission prompts
+aibox claude --yolo         # no prompts, full sudo, no firewall
+aibox claude --safe         # keep prompts, restricted sudo, firewall on
 aibox claude                # asks you each time
 aibox shell                 # zsh inside the container
 aibox shell ls -la          # run a command inline
@@ -101,9 +101,19 @@ Customize the Dockerfile at `~/.config/aibox/Dockerfile`.
 - **Build**: Creates a Docker image with Node.js, Claude Code, and dev tools
 - **Up**: Starts a container with your project bind-mounted
 - **Claude**: Opens Claude Code inside the container, optionally skipping permission prompts
+- **Modes**: `--yolo` gives full access; `--safe` enables firewall + restricted sudo
 - **Auth**: A shared Docker volume persists Claude authentication across containers
 - **Isolation**: Each project gets its own container and isolated `node_modules`
 - **Safety**: Refuses to run in `$HOME`, `/tmp`, or other dangerous directories
+
+## Network Firewall
+
+In safe mode, outbound traffic is restricted to Claude API, npm, GitHub, PyPI, DNS, and SSH. Add extra domains:
+
+```bash
+export AIBOX_EXTRA_DOMAINS="example.com,api.myservice.io"
+aibox claude --safe
+```
 
 ## Config
 
@@ -121,8 +131,8 @@ SHARED_MODULES=false
 | `--name NAME` | Named instance (multiple containers per project) |
 | `--image NAME` | Override base Docker image |
 | `--shared-modules` | Share node_modules between host and container |
-| `--yolo` | Skip permission prompts (no ask) |
-| `--safe` | Keep permission prompts (no ask) |
+| `--yolo` | Skip prompts, full sudo, no firewall |
+| `--safe` | Keep prompts, restricted sudo, firewall on |
 | `--all` | With `down`: stop all project containers |
 
 ## License
