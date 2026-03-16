@@ -1,0 +1,5 @@
+node_modules/
+.DS_Store
+compose.dev.yaml
+.aibox
+.idea/

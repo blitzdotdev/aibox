@@ -1,0 +1,771 @@
+#!/usr/bin/env bash
+# aibox - Run AI coding tools in isolated Docker containers.
+#
+# Usage:
+#   aibox up                      Start the container
+#   aibox claude [--yolo|--safe]  Open Claude Code
+#                                 --yolo: skip permission prompts (sandboxed)
+#                                 --safe: keep prompts (no ask)
+#                                 default: asks you each time
+#   aibox shell                   Open a zsh shell in the container
+#   aibox shell <command>         Run a command in the container
+#   aibox down                    Stop and remove the container
+#   aibox down --all              Stop all containers for this project
+#   aibox status                  List all aibox containers
+#   aibox nuke                    Remove ALL aibox containers (all projects)
+#   aibox build [--image NAME]    Build the base image
+#   aibox init [flags]            Generate compose.dev.yaml + configure WebStorm
+#   aibox help                    Show this help (default)
+#
+# Flags:
+#   --name NAME           Run a named instance (e.g. --name refactor)
+#                         Allows multiple containers per project
+#   --image NAME          Override base Docker image (default: aibox:latest)
+#   --shared-modules      Share node_modules between host and container
+#   --yolo                Skip permission prompts in Claude Code (no ask)
+#   --safe                Keep permission prompts in Claude Code (no ask)
+#
+# Prerequisites:
+#   brew install colima docker docker-compose docker-buildx
+#   (or: brew install orbstack)
+#
+# First-time setup (once ever):
+#   aibox build
+#
+# Per-project:
+#   aibox up                           # start default container
+#   aibox claude                       # open Claude Code
+#   aibox claude --yolo                # skip permission prompts (sandboxed)
+#   aibox --name feat claude           # Claude Code in a second container
+#   aibox shell                        # zsh in the container
+#   aibox shell ls -la                 # run a command inline
+#   aibox down                         # stop default
+#   aibox down --all                   # stop all for this project
+
+set -euo pipefail
+
+# ── Script identity ──────────────────────────────────────────────
+SCRIPT_NAME="$(basename "$0")"
+AIBOX_VERSION="4"
+CONFIG_DIR="${HOME}/.config/aibox"
+DEFAULT_IMAGE="aibox:latest"
+CONTAINER_PREFIX="aibox"
+
+# ── Machine-aware Colima start ───────────────────────────────────
+_colima_start() {
+  local total_cpu total_mem_gb vm_cpu vm_mem vm_disk
+
+  # Detect machine resources
+  if [[ "$(uname)" == "Darwin" ]]; then
+    total_cpu=$(sysctl -n hw.ncpu 2>/dev/null || echo 4)
+    total_mem_gb=$(( $(sysctl -n hw.memsize 2>/dev/null || echo 8589934592) / 1073741824 ))
+  else
+    total_cpu=$(nproc 2>/dev/null || echo 4)
+    total_mem_gb=$(( $(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}' || echo 8388608) / 1048576 ))
+  fi
+
+  # Allocate half CPU (min 2, max 4), half RAM (min 4GB, max 8GB), 100GB disk
+  vm_cpu=$(( total_cpu / 2 ))
+  [[ $vm_cpu -lt 2 ]] && vm_cpu=2
+  [[ $vm_cpu -gt 4 ]] && vm_cpu=4
+  vm_mem=$(( total_mem_gb / 2 ))
+  [[ $vm_mem -lt 4 ]] && vm_mem=4
+  [[ $vm_mem -gt 8 ]] && vm_mem=8
+  vm_disk=100
+
+  echo "Detected: ${total_cpu} CPUs, ${total_mem_gb}GB RAM"
+  echo "Colima VM: ${vm_cpu} CPUs, ${vm_mem}GB RAM, ${vm_disk}GB disk"
+
+  # Try Apple Virtualization framework first (fast), fall back to QEMU
+  colima start \
+    --cpu "$vm_cpu" --memory "$vm_mem" --disk "$vm_disk" \
+    --vm-type vz --vz-rosetta 2>/dev/null \
+  || colima start \
+    --cpu "$vm_cpu" --memory "$vm_mem" --disk "$vm_disk"
+}
+
+# ── Dependency check ─────────────────────────────────────────────
+_check_deps() {
+  local missing=()
+
+  command -v docker &>/dev/null || missing+=("docker")
+  command -v docker-compose &>/dev/null || docker compose version &>/dev/null 2>&1 || missing+=("docker-compose")
+
+  if [[ ${#missing[@]} -eq 0 ]]; then
+    # Docker CLI exists — check if daemon is reachable
+    if ! docker info &>/dev/null 2>&1; then
+      if command -v colima &>/dev/null; then
+        echo "Docker daemon not running. Starting Colima..."
+        _colima_start
+      elif [[ -d "/Applications/OrbStack.app" ]]; then
+        echo "Docker daemon not running. Starting OrbStack..."
+        open -a OrbStack
+        local i=0
+        while ! docker info &>/dev/null 2>&1 && [[ $i -lt 30 ]]; do
+          sleep 1
+          i=$((i + 1))
+        done
+        if ! docker info &>/dev/null 2>&1; then
+          echo "OrbStack started but Docker daemon not ready. Try again in a moment." >&2
+          exit 1
+        fi
+      else
+        echo "Docker daemon not running. Install Colima or OrbStack." >&2
+        exit 1
+      fi
+    fi
+    return
+  fi
+
+  # Something is missing — offer to install
+  if ! command -v brew &>/dev/null; then
+    echo "Homebrew is required to install Docker dependencies."
+    echo "Will run: /bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\""
+    echo ""
+    if _confirm_yes "Install Homebrew?"; then
+      /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+      if [[ -f /opt/homebrew/bin/brew ]]; then
+        eval "$(/opt/homebrew/bin/brew shellenv)"
+      elif [[ -f /usr/local/bin/brew ]]; then
+        eval "$(/usr/local/bin/brew shellenv)"
+      fi
+      if ! command -v brew &>/dev/null; then
+        echo "Homebrew installed but not in PATH. Open a new terminal and re-run ${SCRIPT_NAME}." >&2
+        exit 1
+      fi
+    else
+      echo "Aborted. Install Homebrew (https://brew.sh) then re-run ${SCRIPT_NAME}." >&2
+      exit 1
+    fi
+  fi
+
+  echo "Missing dependencies: ${missing[*]}"
+  echo "Will install via Homebrew: colima docker docker-compose docker-buildx"
+  echo ""
+  if _confirm_yes "Install now?"; then
+    brew install colima docker docker-compose docker-buildx
+
+    mkdir -p ~/.docker/cli-plugins
+    ln -sfn "$(brew --prefix)/opt/docker-compose/bin/docker-compose" ~/.docker/cli-plugins/docker-compose
+
+    echo ""
+    echo "Starting Colima..."
+    _colima_start
+    echo "Docker is ready."
+  else
+    echo "Aborted. Install manually:" >&2
+    echo "  brew install colima docker docker-compose docker-buildx" >&2
+    exit 1
+  fi
+}
+
+# ── Parse global flags ───────────────────────────────────────────
+IMAGE="$DEFAULT_IMAGE"
+SHARED_MODULES=false
+INSTANCE_NAME=""
+DOWN_ALL=false
+SKIP_PERMISSIONS=false
+SAFE_MODE=false
+POSITIONAL=()
+
+parse_flags() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --image)
+        IMAGE="${2:?'--image requires a value'}"
+        shift 2
+        ;;
+      --name)
+        INSTANCE_NAME="${2:?'--name requires a value'}"
+        shift 2
+        ;;
+      --shared-modules)
+        SHARED_MODULES=true
+        shift
+        ;;
+      --all)
+        DOWN_ALL=true
+        shift
+        ;;
+      --yolo)
+        SKIP_PERMISSIONS=true
+        shift
+        ;;
+      --safe)
+        SAFE_MODE=true
+        shift
+        ;;
+      *)
+        POSITIONAL+=("$1")
+        shift
+        ;;
+    esac
+  done
+}
+
+parse_flags "$@"
+if [[ ${#POSITIONAL[@]} -gt 0 ]]; then
+  set -- "${POSITIONAL[@]}"
+else
+  set --
+fi
+
+# ── Per-project config file (.aibox) ─────────────────────────────
+PROJECT_DIR="$(pwd)"
+PROJECT_CONF="${PROJECT_DIR}/.aibox"
+
+# ── Safety: refuse to run in dangerous directories ───────────────
+_is_safe_project_dir() {
+  local dir="$1"
+  case "$dir" in
+    "$HOME"|/|/tmp|/var|/etc|/usr|/opt|/private|/private/tmp)
+      return 1 ;;
+  esac
+  return 0
+}
+
+_require_safe_dir() {
+  if ! _is_safe_project_dir "$PROJECT_DIR"; then
+    echo "Error: refusing to run in ${PROJECT_DIR}" >&2
+    echo "Run ${SCRIPT_NAME} from inside a project directory." >&2
+    exit 1
+  fi
+}
+
+# ── Confirmation prompts ─────────────────────────────────────────
+_confirm_yes() {
+  local msg="$1" reply
+  printf "%s [Y/n] " "$msg" >&2
+  read -r reply
+  [[ ! "$reply" =~ ^[Nn]$ ]]
+}
+
+_confirm_no() {
+  local msg="$1" reply
+  printf "%s [y/N] " "$msg" >&2
+  read -r reply
+  [[ "$reply" =~ ^[Yy]$ ]]
+}
+
+# ── Project config persistence ───────────────────────────────────
+save_project_conf() {
+  cat > "$PROJECT_CONF" << EOF
+# Auto-generated by ${SCRIPT_NAME}. Safe to edit.
+IMAGE=${IMAGE}
+SHARED_MODULES=${SHARED_MODULES}
+EOF
+}
+
+load_project_conf() {
+  if [[ -f "$PROJECT_CONF" ]]; then
+    local conf_image conf_shared
+    conf_image=$(grep '^IMAGE=' "$PROJECT_CONF" | cut -d= -f2- || true)
+    conf_shared=$(grep '^SHARED_MODULES=' "$PROJECT_CONF" | cut -d= -f2- || true)
+    if [[ "$IMAGE" == "$DEFAULT_IMAGE" && -n "$conf_image" ]]; then
+      IMAGE="$conf_image"
+    fi
+    if [[ "$SHARED_MODULES" == "false" && "$conf_shared" == "true" ]]; then
+      SHARED_MODULES=true
+    fi
+  fi
+}
+
+load_project_conf
+
+# ── Validate image name ──────────────────────────────────────────
+if ! [[ "$IMAGE" =~ ^[a-zA-Z0-9._/-]+(:[a-zA-Z0-9._-]+)?$ ]]; then
+  echo "Error: invalid image name: $IMAGE" >&2
+  exit 1
+fi
+
+# ── Derived names ────────────────────────────────────────────────
+PROJECT_NAME="$(basename "$PROJECT_DIR" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]/-/g')"
+PROJECT_HASH="$(printf '%s' "$PROJECT_DIR" | shasum | cut -c1-6)"
+BASE_CONTAINER_NAME="${CONTAINER_PREFIX}-${PROJECT_NAME}-${PROJECT_HASH}"
+
+if [[ -z "$INSTANCE_NAME" ]]; then
+  INSTANCE_NAME="main"
+fi
+if ! [[ "$INSTANCE_NAME" =~ ^[a-z0-9_-]+$ ]]; then
+  echo "Error: --name must be lowercase alphanumeric, dashes, underscores" >&2
+  exit 1
+fi
+CONTAINER_NAME="${BASE_CONTAINER_NAME}-${INSTANCE_NAME}"
+WORKSPACE_DIR="/${PROJECT_NAME}"
+
+# ── Dockerfile management ────────────────────────────────────────
+ensure_dockerfile() {
+  mkdir -p "$CONFIG_DIR"
+  local dockerfile="${CONFIG_DIR}/Dockerfile"
+  local version_file="${CONFIG_DIR}/version"
+  local current_version=""
+
+  # Check if Dockerfile needs regeneration
+  if [[ -f "$version_file" ]]; then
+    current_version=$(cat "$version_file")
+  fi
+
+  if [[ "$current_version" != "$AIBOX_VERSION" || ! -f "$dockerfile" ]]; then
+    if [[ -f "$dockerfile" && "$current_version" != "$AIBOX_VERSION" ]]; then
+      echo "Dockerfile outdated (v${current_version} → v${AIBOX_VERSION}). Regenerating..."
+    fi
+    cat > "$dockerfile" << DOCKERFILE
+FROM node:20-alpine
+
+LABEL aibox.version="${AIBOX_VERSION}"
+
+RUN apk add --no-cache \\
+    git \\
+    curl \\
+    ripgrep \\
+    bash \\
+    zsh \\
+    sudo \\
+    openssh-client \\
+    python3 \\
+    make \\
+    g++
+
+# Create non-root user first (native installer goes into ~/.local/bin)
+RUN adduser -D -s /bin/zsh aibox \\
+    && echo "aibox ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+
+USER aibox
+ENV PATH="/home/aibox/.local/bin:\$PATH"
+
+# Install Claude Code via native installer (npm method is deprecated)
+RUN curl -fsSL https://claude.ai/install.sh | bash
+
+WORKDIR /workspace
+DOCKERFILE
+    echo "$AIBOX_VERSION" > "$version_file"
+    echo "Created Dockerfile (v${AIBOX_VERSION})"
+  fi
+}
+
+# ── Compose YAML generation ──────────────────────────────────────
+# Auth volume shared across all containers using the same base image.
+# name: field prevents docker compose from prefixing with project name.
+AUTH_VOLUME="aibox-auth-$(echo "$IMAGE" | sed 's/[^a-zA-Z0-9]/-/g')"
+
+_volumes_yaml() {
+  local indent="$1"
+  local prefix="$2"
+
+  echo "${indent}- \"${prefix}:${WORKSPACE_DIR}\""
+  echo "${indent}- ${AUTH_VOLUME}:/home/aibox/.claude"
+
+  # Mount host's IDE lock files so Claude Code can discover JetBrains/VS Code plugins
+  local host_ide_dir="${HOME}/.claude/ide"
+  if [[ -d "$host_ide_dir" ]]; then
+    echo "${indent}- \"${host_ide_dir}:/home/aibox/.claude/ide:ro\""
+  fi
+
+  if [[ "$SHARED_MODULES" == "false" ]]; then
+    echo "${indent}- node_modules:${WORKSPACE_DIR}/node_modules"
+  fi
+}
+
+_top_volumes_yaml() {
+  printf "volumes:\n"
+  printf "  ${AUTH_VOLUME}:\n"
+  printf "    external: true\n"
+  if [[ "$SHARED_MODULES" == "false" ]]; then
+    printf "  node_modules:\n"
+  fi
+}
+
+_environment_yaml() {
+  local indent="$1"
+  echo "${indent}- ANTHROPIC_API_KEY=\${ANTHROPIC_API_KEY:-}"
+  echo "${indent}- CLAUDE_CONFIG_DIR=/home/aibox/.claude"
+}
+
+# Build -e flags for docker exec from current terminal environment
+_docker_exec() {
+  # Usage: _docker_exec container command [args...]
+  local container="$1"
+  shift
+
+  local env_args=(
+    -e "TERM=${TERM:-xterm-256color}"
+    -e "COLORTERM=${COLORTERM:-truecolor}"
+    -e "LANG=${LANG:-C.UTF-8}"
+  )
+
+  # Forward API key if set
+  [[ -n "${ANTHROPIC_API_KEY:-}" ]] && env_args+=(-e "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY")
+
+  # Forward JetBrains / VS Code IDE integration env vars
+  if [[ "${ENABLE_IDE_INTEGRATION:-}" == "true" ]]; then
+    env_args+=(-e "ENABLE_IDE_INTEGRATION=true")
+    env_args+=(-e "TERMINAL_EMULATOR=${TERMINAL_EMULATOR:-}")
+    [[ -n "${CLAUDE_CODE_SSE_PORT:-}" ]] && env_args+=(-e "CLAUDE_CODE_SSE_PORT=${CLAUDE_CODE_SSE_PORT}")
+    # Redirect WebSocket connections to Docker host instead of container localhost
+    env_args+=(-e "CLAUDE_CODE_IDE_HOST_OVERRIDE=host.docker.internal")
+  fi
+
+  docker exec -it "${env_args[@]}" "$container" "$@"
+}
+
+_labels_yaml() {
+  local indent="$1"
+  echo "${indent}aibox.project: \"${PROJECT_NAME}\""
+  echo "${indent}aibox.path: \"${PROJECT_DIR}\""
+  echo "${indent}aibox.instance: \"${INSTANCE_NAME}\""
+}
+
+generate_compose() {
+  cat << YAML
+name: "${CONTAINER_NAME}"
+services:
+  dev:
+    image: ${IMAGE}
+    container_name: ${CONTAINER_NAME}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    labels:
+$(_labels_yaml "      ")
+    volumes:
+$(_volumes_yaml "      " "$PROJECT_DIR")
+    working_dir: ${WORKSPACE_DIR}
+    command: sh -c "sudo chown -R aibox:aibox /home/aibox/.claude 2>/dev/null; exec sleep infinity"
+    environment:
+$(_environment_yaml "      ")
+    stdin_open: true
+    tty: true
+$(_top_volumes_yaml)
+YAML
+}
+
+write_project_compose() {
+  local target="${PROJECT_DIR}/compose.dev.yaml"
+
+  cat > "$target" << YAML
+# Generated by ${SCRIPT_NAME} — point WebStorm Node.js interpreter here.
+# Settings → Node.js → Docker Compose → this file → service: dev
+name: "${CONTAINER_NAME}"
+services:
+  dev:
+    image: ${IMAGE}
+    container_name: ${CONTAINER_NAME}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    labels:
+$(_labels_yaml "      ")
+    volumes:
+$(_volumes_yaml "      " ".")
+    working_dir: ${WORKSPACE_DIR}
+    command: sh -c "sudo chown -R aibox:aibox /home/aibox/.claude 2>/dev/null; exec sleep infinity"
+    environment:
+$(_environment_yaml "      ")
+    stdin_open: true
+    tty: true
+$(_top_volumes_yaml)
+YAML
+  echo "Created ${target}"
+}
+
+# ── WebStorm .idea/workspace.xml ─────────────────────────────────
+_sed_inplace() {
+  if sed --version 2>/dev/null | grep -q 'GNU'; then
+    sed -i "$@"
+  else
+    sed -i '' "$@"
+  fi
+}
+
+configure_webstorm() {
+  local idea_dir="${PROJECT_DIR}/.idea"
+  local ws_file="${idea_dir}/workspace.xml"
+  local compose_path="${PROJECT_DIR}/compose.dev.yaml"
+  local interpreter_value="docker-compose://[${compose_path}]:dev//usr/local/bin/node"
+
+  mkdir -p "$idea_dir"
+
+  if [[ -f "$ws_file" ]]; then
+    if grep -q '"nodejs_interpreter_path"' "$ws_file"; then
+      _sed_inplace "s|\"nodejs_interpreter_path\": \"[^\"]*\"|\"nodejs_interpreter_path\": \"${interpreter_value}\"|" "$ws_file"
+      echo "Updated nodejs_interpreter_path in .idea/workspace.xml"
+    elif grep -q '"keyToString"' "$ws_file"; then
+      local tmpfile
+      tmpfile=$(mktemp)
+      awk -v interp="$interpreter_value" '
+        /"keyToString": \{/ {
+          print
+          print "    \"nodejs_interpreter_path\": \"" interp "\","
+          print "    \"nodejs_package_manager_path\": \"npm\","
+          print "    \"javascript.preferred.runtime.type.id\": \"node\","
+          print "    \"credentialsType com.jetbrains.nodejs.remote.NodeJSCreateRemoteSdkForm\": \"Docker Compose\","
+          next
+        }
+        { print }
+      ' "$ws_file" > "$tmpfile"
+      mv "$tmpfile" "$ws_file"
+      echo "Injected Node.js Docker Compose config into .idea/workspace.xml"
+    else
+      echo "Warning: workspace.xml has unexpected format. Configure manually:"
+      echo "  Settings → Node.js → Docker Compose → compose.dev.yaml → service: dev"
+    fi
+  else
+    cat > "$ws_file" << WSXML
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="PropertiesComponent"><![CDATA[{
+  "keyToString": {
+    "nodejs_interpreter_path": "${interpreter_value}",
+    "nodejs_package_manager_path": "npm",
+    "javascript.preferred.runtime.type.id": "node",
+    "credentialsType com.jetbrains.nodejs.remote.NodeJSCreateRemoteSdkForm": "Docker Compose"
+  }
+}]]></component>
+</project>
+WSXML
+    echo "Created .idea/workspace.xml with Docker Compose Node.js runtime"
+  fi
+}
+
+# ── Docker Compose wrapper ───────────────────────────────────────
+dc() {
+  generate_compose | docker compose \
+    -f - \
+    --project-directory "$PROJECT_DIR" \
+    "$@"
+}
+
+# ── Commands ─────────────────────────────────────────────────────
+
+cmd_build() {
+  _check_deps
+  ensure_dockerfile
+  echo "Building ${IMAGE}..."
+  docker build -t "$IMAGE" "$CONFIG_DIR"
+  echo "Done. Image: ${IMAGE}"
+}
+
+ensure_init() {
+  if [[ ! -f "${PROJECT_DIR}/compose.dev.yaml" ]]; then
+    _require_safe_dir
+    echo "No ${SCRIPT_NAME} config found. Will create compose.dev.yaml, .aibox, and .idea/workspace.xml."
+    if _confirm_yes "Initialize?"; then
+      _init_files
+      echo ""
+    else
+      echo "Aborted. Run '${SCRIPT_NAME} init' manually when ready." >&2
+      exit 1
+    fi
+  fi
+}
+
+cmd_up() {
+  _check_deps
+  ensure_init
+
+  if ! docker image inspect "$IMAGE" &>/dev/null; then
+    echo "Image '${IMAGE}' not found. Building..."
+    cmd_build
+  else
+    # Check if image version matches script version
+    local img_version
+    img_version=$(docker inspect "$IMAGE" --format '{{index .Config.Labels "aibox.version"}}' 2>/dev/null || echo "")
+    if [[ "$img_version" != "$AIBOX_VERSION" ]]; then
+      echo "Image outdated (v${img_version:-0} → v${AIBOX_VERSION}). Rebuilding..."
+      cmd_build
+    fi
+  fi
+
+  if ! docker ps --format '{{.Names}}' | grep -Fxq "$CONTAINER_NAME"; then
+    # Ensure shared auth volume exists (external: true requires it)
+    docker volume create "$AUTH_VOLUME" &>/dev/null || true
+    echo "Starting ${CONTAINER_NAME} (image: ${IMAGE})..."
+    dc up -d
+    echo "Container running. Workspace: ${WORKSPACE_DIR}"
+  else
+    echo "${CONTAINER_NAME} is already running."
+  fi
+}
+
+cmd_claude() {
+  cmd_up
+
+  local skip=false
+
+  if [[ "$SKIP_PERMISSIONS" == "true" ]]; then
+    # --yolo flag: skip without asking
+    skip=true
+  elif [[ "$SAFE_MODE" == "true" ]]; then
+    # --safe flag: keep prompts without asking
+    skip=false
+  else
+    # No flag: ask
+    echo "The container is sandboxed — skipping permission prompts is safe here."
+    if _confirm_yes "Skip Claude Code permission prompts?"; then
+      skip=true
+    fi
+  fi
+
+  if [[ "$skip" == "true" ]]; then
+    echo "Launching Claude Code (skipping permission prompts)..."
+    _docker_exec "$CONTAINER_NAME" claude --dangerously-skip-permissions
+  else
+    echo "Launching Claude Code..."
+    _docker_exec "$CONTAINER_NAME" claude
+  fi
+}
+
+cmd_shell() {
+  ensure_init
+
+  if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -Fxq "$CONTAINER_NAME"; then
+    if docker image inspect "$IMAGE" &>/dev/null; then
+      echo "Starting ${CONTAINER_NAME}..." >&2
+      dc up -d >/dev/null
+    else
+      echo "Container '${CONTAINER_NAME}' is not running and image '${IMAGE}' not found." >&2
+      echo "Run: ${SCRIPT_NAME} build && ${SCRIPT_NAME} up" >&2
+      exec "${SHELL:-/bin/bash}"
+    fi
+  fi
+
+  shift  # remove "shell" from args
+  if [[ $# -gt 0 ]]; then
+    # Inline command: aibox shell echo hello
+    _docker_exec "$CONTAINER_NAME" zsh -c "$*"
+  else
+    _docker_exec "$CONTAINER_NAME" zsh
+  fi
+}
+
+cmd_down() {
+  if [[ "$DOWN_ALL" == "true" ]]; then
+    local project_containers
+    project_containers=$(docker ps -a --format '{{.Names}}' | grep -F "$BASE_CONTAINER_NAME") || true
+    if [[ -n "$project_containers" ]]; then
+      echo "Will remove all containers for ${PROJECT_NAME}:"
+      echo "$project_containers" | sed 's/^/  /'
+      echo ""
+      if _confirm_no "Remove all?"; then
+        echo "$project_containers" | xargs docker rm -f
+        echo "Removed all containers for ${PROJECT_NAME}"
+      else
+        echo "Aborted."
+      fi
+    else
+      echo "No containers found for ${PROJECT_NAME}"
+    fi
+  else
+    if docker ps -a --format '{{.Names}}' | grep -Fxq "$CONTAINER_NAME"; then
+      dc down --remove-orphans
+      echo "Removed ${CONTAINER_NAME}"
+    else
+      echo "No container found: ${CONTAINER_NAME}"
+    fi
+  fi
+}
+
+cmd_status() {
+  local containers
+  containers=$(docker ps -a --filter "name=${CONTAINER_PREFIX}-" -q) || true
+
+  if [[ -z "$containers" ]]; then
+    echo "No ${SCRIPT_NAME} containers found."
+    return
+  fi
+
+  printf "%-30s %-10s %-8s %s\n" "CONTAINER" "INSTANCE" "STATUS" "PROJECT PATH"
+  printf "%-30s %-10s %-8s %s\n" "---------" "--------" "------" "------------"
+
+  docker ps -a \
+    --filter "name=${CONTAINER_PREFIX}-" \
+    --format '{{.Names}}\t{{.Label "aibox.instance"}}\t{{.State}}\t{{.Label "aibox.path"}}' \
+  | while IFS=$'\t' read -r name instance state path; do
+    # Fallback for containers created before labels were added
+    [[ -z "$instance" ]] && instance="-"
+    [[ -z "$path" ]] && path="-"
+    printf "%-30s %-10s %-8s %s\n" "$name" "$instance" "$state" "$path"
+  done
+}
+
+cmd_nuke() {
+  local containers
+  containers=$(docker ps -a --filter "name=${CONTAINER_PREFIX}-" -q) || true
+  if [[ -n "$containers" ]]; then
+    echo "This will remove ALL ${SCRIPT_NAME} containers across ALL projects:"
+    docker ps -a --filter "name=${CONTAINER_PREFIX}-" --format "  {{.Names}}  ({{.Status}})"
+    echo ""
+    if _confirm_no "Remove all?"; then
+      docker ps -a --filter "name=${CONTAINER_PREFIX}-" -q | xargs docker rm -f
+      echo "All containers removed."
+    else
+      echo "Aborted."
+    fi
+  else
+    echo "No ${SCRIPT_NAME} containers found."
+  fi
+}
+
+_init_files() {
+  write_project_compose
+  save_project_conf
+  configure_webstorm
+
+  local gitignore="${PROJECT_DIR}/.gitignore"
+  local entries=("compose.dev.yaml" ".aibox" ".idea/workspace.xml")
+  for entry in "${entries[@]}"; do
+    if [[ -f "$gitignore" ]]; then
+      grep -qxF "$entry" "$gitignore" || echo "$entry" >> "$gitignore"
+    else
+      echo "$entry" >> "$gitignore"
+    fi
+  done
+  echo "Updated .gitignore"
+
+  echo ""
+  echo "Done! Open this project in WebStorm — Node.js runtime is configured."
+  echo "  ${SCRIPT_NAME} up       Start the container"
+  echo "  ${SCRIPT_NAME} claude   Open Claude Code"
+  echo "  ${SCRIPT_NAME} shell    Open a shell"
+}
+
+cmd_init() {
+  _require_safe_dir
+
+  echo "Will create/update in ${PROJECT_DIR}:"
+  echo "  compose.dev.yaml, .aibox, .idea/workspace.xml, .gitignore"
+  echo ""
+
+  if ! _confirm_yes "Proceed?"; then
+    echo "Aborted."
+    exit 0
+  fi
+
+  _init_files
+}
+
+cmd_help() {
+  awk '/^# aibox/,/^[^#]/{if(/^#/) print}' "$0" | sed 's/^# \{0,1\}//'
+  echo "Version: ${AIBOX_VERSION}"
+}
+
+cmd_version() {
+  echo "aibox v${AIBOX_VERSION}"
+}
+
+# ── Main ─────────────────────────────────────────────────────────
+case "${1:-help}" in
+  up)       cmd_up ;;
+  claude)   cmd_claude ;;
+  shell)    cmd_shell "$@" ;;
+  down)     cmd_down ;;
+  status)   cmd_status ;;
+  nuke)     cmd_nuke ;;
+  build)    cmd_build ;;
+  init)     cmd_init ;;
+  help|-h)         cmd_help ;;
+  version|-v|--version) cmd_version ;;
+  *)
+    echo "Unknown command: $1"
+    cmd_help
+    exit 1
+    ;;
+esac

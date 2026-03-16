@@ -1,0 +1,39 @@
+{
+  "name": "@blitzdev/aibox",
+  "version": "0.1.0",
+  "description": "Run AI coding agents in isolated Docker containers",
+  "author": "repalash <palash@shaders.app>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/blitzdotdev/aibox.git"
+  },
+  "homepage": "https://github.com/blitzdotdev/aibox",
+  "bugs": {
+    "url": "https://github.com/blitzdotdev/aibox/issues"
+  },
+  "keywords": [
+    "ai",
+    "docker",
+    "sandbox",
+    "claude",
+    "coding-agent",
+    "devtools",
+    "cli"
+  ],
+  "bin": {
+    "aibox": "./bin/aibox"
+  },
+  "files": [
+    "bin/aibox",
+    "README.md",
+    "LICENSE"
+  ],
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}
