@@ -88,7 +88,7 @@ aibox generates a `compose.dev.yaml` and configures your IDE on `aibox init` (or
 2. Run `aibox init` in your project
 3. Set the plugin's startup command to:
    ```
-   /usr/local/bin/aibox claude --yolo
+   npx aibox claude --yolo
    ```
 
 The Node.js interpreter is also configured to use the container, so running/debugging from the IDE uses the same sandboxed environment.
@@ -147,17 +147,18 @@ SHARED_MODULES=false
 
 ## All Flags
 
-| Flag | Description |
-|------|-------------|
-| `--name NAME` | Named instance (multiple containers per project) |
-| `--image NAME` | Override base Docker image |
-| `--shared-modules` | Share node_modules between host and container |
-| `--copy` | Copy repo into Docker volume (full isolation) |
-| `--worktree` | Use git worktree (lightweight isolation) |
-| `--yolo` | Skip prompts, full sudo, no firewall |
-| `--safe` | Keep prompts, restricted sudo, firewall on |
-| `--all` | With `down`: stop all project containers |
-| `--clean` | With `down`: also remove copy volumes / worktrees |
+| Short | Long | Description |
+|-------|------|-------------|
+| `-n` | `--name NAME` | Named instance (multiple containers per project) |
+| `-d` | `--dir PATH` | Run in a different project directory |
+| `-i` | `--image NAME` | Override base Docker image |
+| `-c` | `--copy` | Copy repo into Docker volume (full isolation) |
+| `-w` | `--worktree` | Use git worktree (lightweight isolation) |
+| `-y` | `--yolo` | Skip prompts, full sudo, no firewall |
+| `-s` | `--safe` | Keep prompts, restricted sudo, firewall on |
+| | `--shared-modules` | Share node_modules between host and container |
+| | `--all` | With `down`: stop all project containers |
+| | `--clean` | With `down`: also remove copy volumes / worktrees |
 
 ## License
 

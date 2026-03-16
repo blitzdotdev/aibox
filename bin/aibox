@@ -55,7 +55,7 @@ set -euo pipefail
 
 # ── Script identity ──────────────────────────────────────────────
 SCRIPT_NAME="$(basename "$0")"
-AIBOX_VERSION="5"
+AIBOX_VERSION="6"
 CONFIG_DIR="${HOME}/.config/aibox"
 DEFAULT_IMAGE="aibox:latest"
 CONTAINER_PREFIX="aibox"
@@ -347,7 +347,7 @@ if ! [[ "$INSTANCE_NAME" =~ ^[a-z0-9_-]+$ ]]; then
   exit 1
 fi
 CONTAINER_NAME="${BASE_CONTAINER_NAME}-${INSTANCE_NAME}"
-WORKSPACE_DIR="/${PROJECT_NAME}"
+WORKSPACE_DIR="/workspace/${PROJECT_NAME}"
 
 # ── Isolation mode setup ─────────────────────────────────────────
 COPY_VOLUME=""
@@ -435,6 +435,16 @@ set -e
 
 # Fix auth volume ownership (Docker creates volumes as root)
 chown -R aibox:aibox /home/aibox/.claude 2>/dev/null || true
+
+# ── IDE path symlink ─────────────────────────────────────────
+# Create symlink so container paths match host paths for IDE integration.
+# Claude Code reports cwd-based paths to the IDE plugin; if they don't
+# match host paths, diffs break (empty left side, wrong file path).
+if [[ -n "${AIBOX_HOST_DIR:-}" && -n "${AIBOX_WORKSPACE_DIR:-}" \
+      && "$AIBOX_HOST_DIR" != "$AIBOX_WORKSPACE_DIR" ]]; then
+  mkdir -p "$(dirname "$AIBOX_HOST_DIR")"
+  ln -sfn "$AIBOX_WORKSPACE_DIR" "$AIBOX_HOST_DIR"
+fi
 
 # ── Mode-dependent setup ──────────────────────────────────────
 MODE="${AIBOX_MODE:-safe}"
@@ -535,7 +545,7 @@ _prepare_copy_volume() {
 
   # Check if volume already has content (--entrypoint bypasses su-exec drop)
   local has_content
-  has_content=$(docker run --rm --entrypoint sh -v "${COPY_VOLUME}:/${PROJECT_NAME}" "$IMAGE" -c "ls -A /${PROJECT_NAME} 2>/dev/null | head -1" 2>/dev/null || true)
+  has_content=$(docker run --rm --entrypoint sh -v "${COPY_VOLUME}:${WORKSPACE_DIR}" "$IMAGE" -c "ls -A ${WORKSPACE_DIR} 2>/dev/null | head -1" 2>/dev/null || true)
 
   if [[ -n "$has_content" ]]; then
     echo "Copy volume already populated (${COPY_VOLUME}). Reusing."
@@ -555,14 +565,15 @@ _prepare_copy_volume() {
   fi
 
   if ! cat "$bundle_file" | docker run --rm -i --entrypoint sh \
-      -v "${COPY_VOLUME}:/${PROJECT_NAME}" \
+      -v "${COPY_VOLUME}:${WORKSPACE_DIR}" \
       "$IMAGE" -c "
         cat > /tmp/repo.bundle
-        cd /${PROJECT_NAME}
+        mkdir -p ${WORKSPACE_DIR}
+        cd ${WORKSPACE_DIR}
         git clone /tmp/repo.bundle .
         rm /tmp/repo.bundle
         git checkout -b '${branch_name}' 2>/dev/null || git checkout '${branch_name}'
-        chown -R aibox:aibox /${PROJECT_NAME}
+        chown -R aibox:aibox ${WORKSPACE_DIR}
       "; then
     rm -f "$bundle_file"
     docker volume rm "$COPY_VOLUME" 2>/dev/null || true
@@ -648,6 +659,8 @@ _environment_yaml() {
   echo "${indent}- CLAUDE_CONFIG_DIR=/home/aibox/.claude"
   echo "${indent}- AIBOX_MODE=\${AIBOX_MODE:-safe}"
   echo "${indent}- AIBOX_EXTRA_DOMAINS=\${AIBOX_EXTRA_DOMAINS:-}"
+  echo "${indent}- AIBOX_HOST_DIR=${PROJECT_DIR}"
+  echo "${indent}- AIBOX_WORKSPACE_DIR=${WORKSPACE_DIR}"
 }
 
 # Build -e flags for docker exec from current terminal environment
@@ -709,7 +722,7 @@ services:
 $(_labels_yaml "      ")
     volumes:
 $(_volumes_yaml "      " "$PROJECT_DIR")
-    working_dir: ${WORKSPACE_DIR}
+    working_dir: ${PROJECT_DIR}
     environment:
 $(_environment_yaml "      ")
     stdin_open: true
@@ -737,7 +750,7 @@ services:
 $(_labels_yaml "      ")
     volumes:
 $(_volumes_yaml "      " ".")
-    working_dir: ${WORKSPACE_DIR}
+    working_dir: ${PROJECT_DIR}
     environment:
 $(_environment_yaml "      ")
     stdin_open: true
