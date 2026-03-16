@@ -1,11 +1,24 @@
 name: Release
 
 on:
-  release:
-    types: [published]
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
 
 jobs:
+  github:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: gh release create ${{ github.ref_name }} --generate-notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   npm:
+    needs: github
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -19,6 +32,7 @@ jobs:
       - run: npm publish --access public
 
   homebrew:
+    needs: github
     runs-on: ubuntu-latest
     steps:
       - uses: mislav/bump-homebrew-formula-action@v3

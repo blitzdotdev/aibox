@@ -37,6 +37,6 @@
     "node": ">=18"
   },
   "scripts": {
-    "release": "git tag v$npm_package_version && git push origin v$npm_package_version && gh release create v$npm_package_version --generate-notes"
+    "release": "git tag v$npm_package_version && git push origin v$npm_package_version"
   }
 }
