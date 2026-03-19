@@ -63,7 +63,7 @@ set -euo pipefail
 
 # ── Script identity ──────────────────────────────────────────────
 SCRIPT_NAME="$(basename "$0")"
-AIBOX_VERSION="8"
+AIBOX_VERSION="9"
 CONFIG_DIR="${HOME}/.config/aibox"
 DEFAULT_IMAGE="aibox:latest"
 CONTAINER_PREFIX="aibox"
