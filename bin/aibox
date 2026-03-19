@@ -476,6 +476,13 @@ if [[ -z "$ISOLATION" ]]; then
   fi
 fi
 
+# Set container-side workspace path (short paths for isolated modes, host path for IDE bind mount)
+if [[ "$ISOLATION" == "copy" ]]; then
+  WORKSPACE_DIR="/workspace/${PROJECT_NAME}"
+elif [[ "$ISOLATION" == "worktree" ]]; then
+  WORKSPACE_DIR="/workspace/${PROJECT_NAME}-${INSTANCE_NAME}"
+fi
+
 # ── Dockerfile management ────────────────────────────────────────
 ensure_dockerfile() {
   mkdir -p "$CONFIG_DIR"
@@ -862,9 +869,6 @@ _confirm_size() {
 }
 
 # ── Isolation: copy mode ──────────────────────────────────────────
-# COPY_MOUNT_PATH tracks where the volume is mounted inside the container.
-# Set during _prepare_copy_volume based on what was actually copied.
-COPY_MOUNT_PATH=""
 
 _copy_via_git() {
   local mount_path="$1"
@@ -973,25 +977,15 @@ _prepare_copy_volume() {
 
   if [[ -n "$has_content" ]]; then
     _info "Copy volume already populated ($(_file "$COPY_VOLUME")). Reusing."
-    # Detect what was copied: if .git exists it was a repo copy, otherwise folder
-    local has_git
-    has_git=$(docker run --rm --entrypoint sh -v "${COPY_VOLUME}:/mnt/check" "$IMAGE" -c "test -d /mnt/check/.git && echo yes" 2>/dev/null || true)
-    if [[ "$has_git" == "yes" && -n "$GIT_ROOT" ]]; then
-      COPY_MOUNT_PATH="$GIT_ROOT"
-    else
-      COPY_MOUNT_PATH="$PROJECT_DIR"
-    fi
     return
   fi
 
   if [[ -z "$GIT_ROOT" ]]; then
     # Not a git repo — tar copy of the folder
-    COPY_MOUNT_PATH="$PROJECT_DIR"
-    _copy_via_tar "$COPY_MOUNT_PATH" "$PROJECT_DIR"
+    _copy_via_tar "$WORKSPACE_DIR" "$PROJECT_DIR"
   elif [[ "$GIT_ROOT" == "$PROJECT_DIR" ]]; then
     # At repo root — git bundle
-    COPY_MOUNT_PATH="$GIT_ROOT"
-    _copy_via_git "$COPY_MOUNT_PATH"
+    _copy_via_git "$WORKSPACE_DIR"
   else
     # In a subfolder of a git repo — ask
     echo ""
@@ -1000,11 +994,9 @@ _prepare_copy_volume() {
     echo -e "    Current folder:  $(_file "$PROJECT_DIR")"
     echo ""
     if _confirm_yes "Copy the full repo? (No = copy only this folder)"; then
-      COPY_MOUNT_PATH="$GIT_ROOT"
-      _copy_via_git "$COPY_MOUNT_PATH"
+      _copy_via_git "$WORKSPACE_DIR"
     else
-      COPY_MOUNT_PATH="$PROJECT_DIR"
-      _copy_via_tar "$COPY_MOUNT_PATH" "$PROJECT_DIR"
+      _copy_via_tar "$WORKSPACE_DIR" "$PROJECT_DIR"
     fi
   fi
 
@@ -1060,9 +1052,9 @@ _volumes_yaml() {
   local prefix="$2"
 
   if [[ "$ISOLATION" == "copy" ]]; then
-    echo "${indent}- ${COPY_VOLUME}:${COPY_MOUNT_PATH:-$PROJECT_DIR}"
+    echo "${indent}- ${COPY_VOLUME}:${WORKSPACE_DIR}"
   elif [[ "$ISOLATION" == "worktree" ]]; then
-    echo "${indent}- \"${WORKTREE_DIR}:${GIT_ROOT}\""
+    echo "${indent}- \"${WORKTREE_DIR}:${WORKSPACE_DIR}\""
   else
     echo "${indent}- \"${prefix}:${WORKSPACE_DIR}\""
   fi
@@ -1162,7 +1154,7 @@ services:
 $(_labels_yaml "      ")
     volumes:
 $(_volumes_yaml "      " "$PROJECT_DIR")
-    working_dir: ${PROJECT_DIR}
+    working_dir: ${WORKSPACE_DIR}
     environment:
 $(_environment_yaml "      ")
     stdin_open: true
@@ -1190,7 +1182,7 @@ services:
 $(_labels_yaml "      ")
     volumes:
 $(_volumes_yaml "      " ".")
-    working_dir: ${PROJECT_DIR}
+    working_dir: ${WORKSPACE_DIR}
     environment:
 $(_environment_yaml "      ")
     stdin_open: true
