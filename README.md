@@ -109,6 +109,21 @@ aibox --repo git@github.com:user/project.git --branch dev claude
 
 Repos cached at `~/.config/aibox/repos/` with submodules included.
 
+### Port forwarding
+
+Forward ports from a running container to the host — no restart needed:
+
+```bash
+aibox port-forward 3000              # host:3000 → container:3000
+aibox port-forward 8080:3000         # host:8080 → container:3000
+aibox port-forward 3000 5173         # multiple ports
+aibox port-forward --list            # show active forwards
+aibox port-forward --stop 3000       # stop one
+aibox port-forward --stop-all        # stop all
+```
+
+Uses a lightweight sidecar container (`alpine/socat`) on the same Docker network. Cleaned up automatically on `aibox down`.
+
 ### Management
 
 ```bash

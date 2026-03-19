@@ -13,6 +13,10 @@
 #   aibox down                    Stop and remove the container
 #   aibox down --clean            Also remove copy volumes / worktrees
 #   aibox down --all              Stop all containers for this project
+#   aibox port-forward PORT [PORT] Forward host port(s) to container
+#   aibox port-forward --list     List active port forwards
+#   aibox port-forward --stop P   Stop forwarding a port
+#   aibox port-forward --stop-all Stop all port forwards
 #   aibox status                  List all aibox containers
 #   aibox volumes                 List copy volumes and worktrees
 #   aibox nuke                    Remove ALL aibox containers (all projects)
@@ -1448,15 +1452,201 @@ cmd_shell() {
   fi
 }
 
+# ── Port forwarding ──────────────────────────────────────────────
+PF_PREFIX="aibox-pf"
+
+_pf_container_name() {
+  # aibox-pf-{target_container}-{host_port}
+  echo "${PF_PREFIX}-${CONTAINER_NAME}-${1}"
+}
+
+_pf_list() {
+  local pf_containers
+  pf_containers=$(docker ps -a --filter "name=${PF_PREFIX}-${CONTAINER_NAME}-" --format '{{.Names}} {{.Status}}' 2>/dev/null) || true
+  if [[ -z "$pf_containers" ]]; then
+    echo "No active port forwards for ${CONTAINER_NAME}"
+    return
+  fi
+  printf "%-40s %-8s %-8s %s\n" "FORWARDER" "HOST" "TARGET" "STATUS"
+  printf "%-40s %-8s %-8s %s\n" "---------" "----" "------" "------"
+  while IFS= read -r line; do
+    local name status
+    name=$(echo "$line" | awk '{print $1}')
+    status=$(echo "$line" | cut -d' ' -f2-)
+    local host_port target_port
+    host_port=$(docker inspect "$name" --format '{{index .Config.Labels "aibox.pf.host_port"}}' 2>/dev/null || echo "?")
+    target_port=$(docker inspect "$name" --format '{{index .Config.Labels "aibox.pf.container_port"}}' 2>/dev/null || echo "?")
+    printf "%-40s %-8s %-8s %s\n" "$name" "$host_port" "$target_port" "$status"
+  done <<< "$pf_containers"
+}
+
+_pf_stop() {
+  local host_port="$1"
+  local pf_name
+  pf_name=$(_pf_container_name "$host_port")
+  if docker ps -a --format '{{.Names}}' | grep -Fxq "$pf_name"; then
+    docker rm -f "$pf_name" >/dev/null
+    _ok "Stopped port forward :${host_port}"
+  else
+    _err "No port forward found on host port ${host_port}"
+    return 1
+  fi
+}
+
+_pf_stop_all() {
+  local pf_containers
+  pf_containers=$(docker ps -a --filter "name=${PF_PREFIX}-${CONTAINER_NAME}-" --format '{{.Names}}' 2>/dev/null) || true
+  if [[ -z "$pf_containers" ]]; then
+    echo "No active port forwards for ${CONTAINER_NAME}"
+    return
+  fi
+  echo "$pf_containers" | xargs docker rm -f >/dev/null
+  _ok "Stopped all port forwards for ${CONTAINER_NAME}"
+}
+
+_pf_start() {
+  local spec="$1"
+  local host_port container_port
+
+  if [[ "$spec" == *:* ]]; then
+    host_port="${spec%%:*}"
+    container_port="${spec##*:}"
+  else
+    host_port="$spec"
+    container_port="$spec"
+  fi
+
+  # Validate ports are numbers
+  if ! [[ "$host_port" =~ ^[0-9]+$ ]] || ! [[ "$container_port" =~ ^[0-9]+$ ]]; then
+    _err "Invalid port spec: ${spec} (expected PORT or HOST_PORT:CONTAINER_PORT)"
+    return 1
+  fi
+
+  local pf_name
+  pf_name=$(_pf_container_name "$host_port")
+
+  # Check if already forwarding (running)
+  if docker ps --format '{{.Names}}' | grep -Fxq "$pf_name"; then
+    _info "Already forwarding host:${host_port} → container:${container_port}"
+    return 0
+  fi
+
+  # Remove stale/stopped sidecar with the same name
+  if docker ps -a --format '{{.Names}}' | grep -Fxq "$pf_name"; then
+    docker rm -f "$pf_name" >/dev/null
+  fi
+
+  # Get the compose network name (take first if multiple)
+  local network
+  network=$(docker inspect "$CONTAINER_NAME" --format '{{range $net,$v := .NetworkSettings.Networks}}{{$net}}{{"\n"}}{{end}}' 2>/dev/null | head -1)
+  if [[ -z "$network" ]]; then
+    _err "Cannot determine network for ${CONTAINER_NAME}"
+    return 1
+  fi
+
+  # Pull socat image if needed (only first time)
+  if ! docker image inspect alpine/socat &>/dev/null; then
+    _info "Pulling alpine/socat image..."
+    docker pull alpine/socat >/dev/null
+  fi
+
+  # Start sidecar socat container on the same network
+  # Use container name as DNS target (compose networks register containers by name)
+  if ! docker run -d \
+    --name "$pf_name" \
+    --network "$network" \
+    --publish "${host_port}:${host_port}" \
+    --label "aibox.pf.target=${CONTAINER_NAME}" \
+    --label "aibox.pf.host_port=${host_port}" \
+    --label "aibox.pf.container_port=${container_port}" \
+    --restart unless-stopped \
+    alpine/socat \
+    "TCP-LISTEN:${host_port},fork,reuseaddr" "TCP-CONNECT:${CONTAINER_NAME}:${container_port}" \
+    >/dev/null 2>&1; then
+    _err "Failed to forward port ${host_port} (is it already in use?)"
+    return 1
+  fi
+
+  _ok "Forwarding host:${host_port} → container:${container_port}"
+}
+
+_pf_cleanup() {
+  # Remove all port-forward sidecars for a container
+  local target_name="$1"
+  local pf_containers
+  pf_containers=$(docker ps -a --filter "name=${PF_PREFIX}-${target_name}-" --format '{{.Names}}' 2>/dev/null) || true
+  if [[ -n "$pf_containers" ]]; then
+    echo "$pf_containers" | xargs docker rm -f >/dev/null
+    _ok "Removed port forwards"
+  fi
+}
+
+cmd_port_forward() {
+  shift  # remove "port-forward" from args
+
+  # Handle flags
+  case "${1:-}" in
+    --list|-l)
+      _pf_list
+      return
+      ;;
+    --stop-all)
+      _pf_stop_all
+      return
+      ;;
+    --stop)
+      shift
+      if [[ -z "${1:-}" ]]; then
+        _err "Usage: ${SCRIPT_NAME} port-forward --stop PORT"
+        return 1
+      fi
+      _pf_stop "$1"
+      return
+      ;;
+    "")
+      _err "Usage: ${SCRIPT_NAME} port-forward PORT [PORT...]"
+      echo "  PORT can be HOST_PORT:CONTAINER_PORT or just PORT (same for both)"
+      echo ""
+      echo "  Examples:"
+      echo "    ${SCRIPT_NAME} port-forward 3000"
+      echo "    ${SCRIPT_NAME} port-forward 8080:3000"
+      echo "    ${SCRIPT_NAME} port-forward 3000 5173"
+      echo ""
+      echo "  Management:"
+      echo "    ${SCRIPT_NAME} port-forward --list"
+      echo "    ${SCRIPT_NAME} port-forward --stop 3000"
+      echo "    ${SCRIPT_NAME} port-forward --stop-all"
+      return 1
+      ;;
+  esac
+
+  # Ensure container is running
+  if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -Fxq "$CONTAINER_NAME"; then
+    cmd_up
+  fi
+
+  # Forward each port (don't exit on failure so remaining ports still get tried)
+  local _pf_failed=0
+  for spec in "$@"; do
+    [[ "$spec" == -* ]] && continue
+    _pf_start "$spec" || _pf_failed=1
+  done
+  return "$_pf_failed"
+}
+
 cmd_down() {
   if [[ "$DOWN_ALL" == "true" ]]; then
     local project_containers
-    project_containers=$(docker ps -a --format '{{.Names}}' | grep -F "$BASE_CONTAINER_NAME") || true
+    project_containers=$(docker ps -a --format '{{.Names}}' | grep -F "$BASE_CONTAINER_NAME" | grep -v "^${PF_PREFIX}-") || true
     if [[ -n "$project_containers" ]]; then
       echo "Will remove all containers for ${PROJECT_NAME}:"
       echo "$project_containers" | sed 's/^/  /'
       echo ""
       if _confirm_no "Remove all?"; then
+        # Clean up port-forward sidecars first
+        while IFS= read -r cname; do
+          _pf_cleanup "$cname"
+        done <<< "$project_containers"
         echo "$project_containers" | xargs docker rm -f
         echo "Removed all containers for ${PROJECT_NAME}"
         if [[ "$DOWN_CLEAN" == "true" ]]; then
@@ -1492,6 +1682,7 @@ cmd_down() {
       echo "No containers found for ${PROJECT_NAME}"
     fi
   else
+    _pf_cleanup "$CONTAINER_NAME"
     if docker ps -a --format '{{.Names}}' | grep -Fxq "$CONTAINER_NAME"; then
       dc down --remove-orphans
       _ok "Removed $(_file "$CONTAINER_NAME")"
@@ -1533,6 +1724,7 @@ cmd_status() {
   docker ps -a \
     --filter "name=${CONTAINER_PREFIX}-" \
     --format '{{.Names}}' \
+  | grep -v "^${PF_PREFIX}-" \
   | while IFS= read -r name; do
     local instance isolation mode state path
     instance=$(docker inspect "$name" --format '{{index .Config.Labels "aibox.instance"}}' 2>/dev/null || echo "")
@@ -1664,6 +1856,7 @@ case "${1:-help}" in
   up)       cmd_up ;;
   claude)   shift; cmd_claude "$@" ;;
   shell)    cmd_shell "$@" ;;
+  port-forward) cmd_port_forward "$@" ;;
   down)     cmd_down ;;
   status)   cmd_status ;;
   volumes)  cmd_volumes ;;
