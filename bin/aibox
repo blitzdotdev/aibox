@@ -4,9 +4,10 @@
 # Usage:
 #   aibox up                      Start the container
 #   aibox claude [--yolo|--safe]  Open Claude Code
-#                                 --yolo: skip permissions, full sudo, no firewall
+#                [claude args]    --yolo: skip permissions, full sudo, no firewall
 #                                 --safe: keep permissions, restricted sudo, firewall on
-#                                 default: asks you each time
+#                                 Extra args are passed through to claude
+#                                 (e.g. --resume, --print, --model)
 #   aibox shell                   Open a zsh shell in the container
 #   aibox shell <command>         Run a command in the container
 #   aibox down                    Stop and remove the container
@@ -17,6 +18,7 @@
 #   aibox nuke                    Remove ALL aibox containers (all projects)
 #   aibox build [--image NAME]    Build the base image
 #   aibox init [flags]            Generate compose.dev.yaml + configure WebStorm
+#   aibox version                  Show version
 #   aibox help                    Show this help (default)
 #
 # Flags:
@@ -57,10 +59,24 @@ set -euo pipefail
 
 # ── Script identity ──────────────────────────────────────────────
 SCRIPT_NAME="$(basename "$0")"
-AIBOX_VERSION="7"
+AIBOX_VERSION="8"
 CONFIG_DIR="${HOME}/.config/aibox"
 DEFAULT_IMAGE="aibox:latest"
 CONTAINER_PREFIX="aibox"
+
+# ── Colors ────────────────────────────────────────────────────
+# Disable color if not a terminal or NO_COLOR is set
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  _R='\033[0;31m'    _BR='\033[1;31m'
+  _Y='\033[0;33m'    _BY='\033[1;33m'
+  _G='\033[0;32m'    _BG='\033[1;32m'
+  _C='\033[0;36m'    _BC='\033[1;36m'
+  _M='\033[0;35m'
+  _B='\033[1m'       _D='\033[2m'
+  _N='\033[0m'
+else
+  _R='' _BR='' _Y='' _BY='' _G='' _BG='' _C='' _BC='' _M='' _B='' _D='' _N=''
+fi
 
 # ── Output helpers ─────────────────────────────────────────────
 _step() {
@@ -72,9 +88,15 @@ _step() {
   local line
   line=$(printf '─%.0s' $(seq 1 "$pad"))
   echo ""
-  echo "── ${msg} ${line}"
+  echo -e "${_BC}── ${_B}${msg}${_N}${_BC} ${line}${_N}"
   echo ""
 }
+
+_ok()   { echo -e "  ${_BG}✓${_N} $*"; }
+_warn() { echo -e "  ${_BY}⚠${_N} ${_BY}$1${_N}"; shift || true; if [[ $# -gt 0 ]]; then for line in "$@"; do echo -e "  $line"; done; fi; }
+_err()  { echo -e "  ${_BR}✗ Error:${_N} $*" >&2; }
+_info() { echo -e "  ${_D}ℹ${_N} $*"; }
+_file() { echo -e "${_C}$1${_N}"; }
 
 # ── Machine-aware Colima start ───────────────────────────────────
 _colima_start() {
@@ -114,11 +136,11 @@ _check_deps() {
   local missing=()
 
   command -v docker &>/dev/null || missing+=("docker")
-  command -v docker-compose &>/dev/null || docker compose version &>/dev/null 2>&1 || missing+=("docker-compose")
+  command -v docker-compose &>/dev/null || docker compose version &>/dev/null || missing+=("docker-compose")
 
   if [[ ${#missing[@]} -eq 0 ]]; then
     # Docker CLI exists — check if daemon is reachable
-    if ! docker info &>/dev/null 2>&1; then
+    if ! docker info &>/dev/null; then
       if command -v colima &>/dev/null; then
         echo "Docker daemon not running. Starting Colima..."
         _colima_start
@@ -126,11 +148,11 @@ _check_deps() {
         echo "Docker daemon not running. Starting OrbStack..."
         open -a OrbStack
         local i=0
-        while ! docker info &>/dev/null 2>&1 && [[ $i -lt 30 ]]; do
+        while ! docker info &>/dev/null && [[ $i -lt 30 ]]; do
           sleep 1
           i=$((i + 1))
         done
-        if ! docker info &>/dev/null 2>&1; then
+        if ! docker info &>/dev/null; then
           echo "OrbStack started but Docker daemon not ready. Try again in a moment." >&2
           exit 1
         fi
@@ -138,11 +160,11 @@ _check_deps() {
         echo "Docker daemon not running. Starting Docker Desktop..."
         open -a Docker
         local i=0
-        while ! docker info &>/dev/null 2>&1 && [[ $i -lt 60 ]]; do
+        while ! docker info &>/dev/null && [[ $i -lt 60 ]]; do
           sleep 1
           i=$((i + 1))
         done
-        if ! docker info &>/dev/null 2>&1; then
+        if ! docker info &>/dev/null; then
           echo "Docker Desktop started but daemon not ready. Try again in a moment." >&2
           exit 1
         fi
@@ -321,6 +343,9 @@ else
 fi
 PROJECT_CONF="${PROJECT_DIR}/.aibox"
 
+# Git root may differ from PROJECT_DIR (subfolder of a repo)
+GIT_ROOT=$(git -C "$PROJECT_DIR" rev-parse --show-toplevel 2>/dev/null || true)
+
 # ── Safety: refuse to run in dangerous directories ───────────────
 _is_safe_project_dir() {
   local dir="$1"
@@ -352,6 +377,31 @@ _confirm_no() {
   printf "%s [y/N] " "$msg" >&2
   read -r reply
   [[ "$reply" =~ ^[Yy]$ ]]
+}
+
+# ── Disk space check ──────────────────────────────────────────────
+_check_disk_space() {
+  local required_gb="${1:-5}" context="${2:-operation}"
+  local available_kb
+
+  # Check host filesystem
+  available_kb=$(df -k "$PROJECT_DIR" 2>/dev/null | awk 'NR==2 {print $4}')
+
+  if [[ -z "$available_kb" || ! "$available_kb" =~ ^[0-9]+$ ]]; then
+    return 0  # Can't determine — don't block
+  fi
+
+  local available_gb=$(( available_kb / 1048576 ))
+
+  if (( available_kb < required_gb * 1048576 )); then
+    _err "${context} needs ~${_B}${required_gb}GB${_N} free, but only ${_B}${available_gb}GB${_N} available."
+    echo -e "  Free up disk space and try again." >&2
+    exit 1
+  fi
+
+  if (( available_kb < required_gb * 1048576 * 2 )); then
+    _warn "Low disk space (${available_gb}GB free, ${context} needs ~${required_gb}GB)."
+  fi
 }
 
 # ── Project config persistence ───────────────────────────────────
@@ -445,6 +495,7 @@ LABEL aibox.version="${AIBOX_VERSION}"
 
 RUN apk add --no-cache \\
     git \\
+    git-lfs \\
     curl \\
     ripgrep \\
     bash \\
@@ -458,6 +509,8 @@ RUN apk add --no-cache \\
     ip6tables \\
     bind-tools \\
     su-exec
+
+RUN git lfs install
 
 # Create non-root user (sudo configured at runtime by entrypoint based on mode)
 RUN adduser -D -s /bin/zsh aibox
@@ -573,83 +626,421 @@ ENTRYPOINT
   fi
 }
 
+# ── Uncommitted changes helper ────────────────────────────────────
+# Detects uncommitted changes (tracked + untracked) and offers to include them.
+# Sets INCLUDE_UNCOMMITTED=true and populates temp files if user says yes.
+INCLUDE_UNCOMMITTED=false
+UNCOMMITTED_DIFF=""
+UNCOMMITTED_UNTRACKED_TAR=""
+
+_check_uncommitted() {
+  [[ -z "$GIT_ROOT" ]] && return 0
+
+  local has_tracked_changes=false
+  local has_untracked=false
+
+  if ! git -C "$GIT_ROOT" diff --quiet 2>/dev/null || ! git -C "$GIT_ROOT" diff --cached --quiet 2>/dev/null; then
+    has_tracked_changes=true
+  fi
+
+  local untracked_files
+  untracked_files=$(git -C "$GIT_ROOT" ls-files --others --exclude-standard 2>/dev/null || true)
+  if [[ -n "$untracked_files" ]]; then
+    has_untracked=true
+  fi
+
+  if [[ "$has_tracked_changes" == "false" && "$has_untracked" == "false" ]]; then
+    return 0
+  fi
+
+  echo -e "  Uncommitted changes detected:"
+  [[ "$has_tracked_changes" == "true" ]] && echo -e "    ${_M}Modified/staged files${_N}"
+  [[ "$has_untracked" == "true" ]] && echo -e "    ${_M}Untracked files${_N} (${_B}$(echo "$untracked_files" | wc -l | xargs)${_N} files)"
+  echo ""
+  if _confirm_yes "Include uncommitted changes?"; then
+    INCLUDE_UNCOMMITTED=true
+
+    # Capture diff of all tracked changes (staged + unstaged) against HEAD
+    if [[ "$has_tracked_changes" == "true" ]]; then
+      UNCOMMITTED_DIFF=$(mktemp)
+      git -C "$GIT_ROOT" diff HEAD > "$UNCOMMITTED_DIFF"
+    fi
+
+    # Tar up untracked files (preserving paths relative to project root)
+    if [[ "$has_untracked" == "true" ]]; then
+      UNCOMMITTED_UNTRACKED_TAR=$(mktemp)
+      echo "$untracked_files" | tar -C "$GIT_ROOT" -cf "$UNCOMMITTED_UNTRACKED_TAR" -T -
+    fi
+  else
+    _info "Proceeding without uncommitted changes."
+  fi
+}
+
+_cleanup_uncommitted() {
+  [[ -n "$UNCOMMITTED_DIFF" ]] && rm -f "$UNCOMMITTED_DIFF"
+  [[ -n "$UNCOMMITTED_UNTRACKED_TAR" ]] && rm -f "$UNCOMMITTED_UNTRACKED_TAR"
+}
+
+# Apply uncommitted changes to a local directory (worktree)
+_apply_uncommitted_local() {
+  local target_dir="$1"
+
+  if [[ "$INCLUDE_UNCOMMITTED" != "true" ]]; then
+    return 0
+  fi
+
+  if [[ -n "$UNCOMMITTED_DIFF" && -s "$UNCOMMITTED_DIFF" ]]; then
+    git -C "$target_dir" apply --allow-empty "$UNCOMMITTED_DIFF" 2>/dev/null \
+      && _ok "Applied uncommitted tracked changes." \
+      || _warn "Some tracked changes could not be applied."
+  fi
+
+  if [[ -n "$UNCOMMITTED_UNTRACKED_TAR" && -s "$UNCOMMITTED_UNTRACKED_TAR" ]]; then
+    tar -C "$target_dir" -xf "$UNCOMMITTED_UNTRACKED_TAR" \
+      && _ok "Copied untracked files." \
+      || _warn "Some untracked files could not be copied."
+  fi
+}
+
+# Apply uncommitted changes inside a docker volume
+_apply_uncommitted_volume() {
+  local volume="$1"
+  local workspace="$2"
+
+  if [[ "$INCLUDE_UNCOMMITTED" != "true" ]]; then
+    return 0
+  fi
+
+  if [[ -n "$UNCOMMITTED_DIFF" && -s "$UNCOMMITTED_DIFF" ]]; then
+    cat "$UNCOMMITTED_DIFF" | docker run --rm -i --entrypoint sh \
+      -v "${volume}:${workspace}" \
+      "$IMAGE" -c "
+        cd '${workspace}'
+        cat > /tmp/uncommitted.patch
+        git apply --allow-empty /tmp/uncommitted.patch
+        rm /tmp/uncommitted.patch
+        chown -R aibox:aibox '${workspace}'
+      " 2>/dev/null \
+      && _ok "Applied uncommitted tracked changes." \
+      || _warn "Some tracked changes could not be applied."
+  fi
+
+  if [[ -n "$UNCOMMITTED_UNTRACKED_TAR" && -s "$UNCOMMITTED_UNTRACKED_TAR" ]]; then
+    cat "$UNCOMMITTED_UNTRACKED_TAR" | docker run --rm -i --entrypoint sh \
+      -v "${volume}:${workspace}" \
+      "$IMAGE" -c "
+        cd '${workspace}'
+        tar -xf -
+        chown -R aibox:aibox '${workspace}'
+      " 2>/dev/null \
+      && _ok "Copied untracked files." \
+      || _warn "Some untracked files could not be copied."
+  fi
+}
+
+# ── Submodule / LFS helpers ───────────────────────────────────────
+_has_submodules() {
+  [[ -n "$GIT_ROOT" && -f "${GIT_ROOT}/.gitmodules" ]]
+}
+
+_has_lfs() {
+  [[ -n "$GIT_ROOT" ]] && git -C "$GIT_ROOT" lfs ls-files --size 2>/dev/null | head -1 | grep -q . 2>/dev/null
+}
+
+# Post-checkout for a local directory (worktree)
+_post_checkout_local() {
+  local target_dir="$1"
+
+  if _has_submodules; then
+    _info "Initializing submodules..."
+    git -C "$target_dir" submodule update --init --recursive 2>/dev/null \
+      && _ok "Submodules initialized." \
+      || _warn "Some submodules could not be initialized."
+  fi
+
+  if _has_lfs; then
+    _info "Fetching LFS objects..."
+    git -C "$target_dir" lfs pull 2>/dev/null \
+      && _ok "LFS objects fetched." \
+      || _warn "Some LFS objects could not be fetched."
+  fi
+}
+
+# Post-checkout inside a docker volume
+_post_checkout_volume() {
+  local volume="$1"
+  local workspace="$2"
+
+  if _has_submodules; then
+    _info "Initializing submodules..."
+    docker run --rm --entrypoint sh \
+      -v "${volume}:${workspace}" \
+      "$IMAGE" -c "
+        cd '${workspace}'
+        git submodule update --init --recursive
+        chown -R aibox:aibox '${workspace}'
+      " 2>/dev/null \
+      && _ok "Submodules initialized." \
+      || _warn "Some submodules could not be initialized."
+  fi
+
+  if _has_lfs; then
+    _info "Fetching LFS objects..."
+    docker run --rm --entrypoint sh \
+      -v "${volume}:${workspace}" \
+      "$IMAGE" -c "
+        cd '${workspace}'
+        git lfs pull
+        chown -R aibox:aibox '${workspace}'
+      " 2>/dev/null \
+      && _ok "LFS objects fetched." \
+      || _warn "Some LFS objects could not be fetched."
+  fi
+}
+
+# ── Size estimation ───────────────────────────────────────────────
+_estimate_repo_size() {
+  # Estimate checkout size from git packed objects (rough: ~2x pack size for checkout)
+  local size_kb
+  size_kb=$(git -C "$GIT_ROOT" count-objects -v 2>/dev/null | awk '/size-pack/ {print $2}')
+  if [[ -n "$size_kb" && "$size_kb" =~ ^[0-9]+$ ]]; then
+    echo $(( size_kb * 2 ))  # KB, rough estimate
+  fi
+}
+
+_estimate_dir_size() {
+  local dir="$1"
+  # du -sk: total size in KB
+  # Try GNU du (--exclude), fall back to BSD du (-I), fall back to plain du
+  du -sk --exclude='node_modules' --exclude='.git' "$dir" 2>/dev/null | awk '{print $1}' \
+    || du -sk -I 'node_modules' -I '.git' "$dir" 2>/dev/null | awk '{print $1}' \
+    || du -sk "$dir" 2>/dev/null | awk '{print $1}' \
+    || true
+}
+
+_format_size() {
+  local kb="$1"
+  if [[ -z "$kb" || ! "$kb" =~ ^[0-9]+$ ]]; then
+    echo "unknown size"
+    return
+  fi
+  if (( kb >= 1048576 )); then
+    echo "$(( kb / 1048576 ))GB"
+  elif (( kb >= 1024 )); then
+    echo "$(( kb / 1024 ))MB"
+  else
+    echo "${kb}KB"
+  fi
+}
+
+_confirm_size() {
+  local size_kb="$1" what="$2"
+  if [[ -z "$size_kb" || ! "$size_kb" =~ ^[0-9]+$ ]]; then
+    return 0  # Can't estimate — don't block
+  fi
+  local formatted
+  formatted=$(_format_size "$size_kb")
+  if (( size_kb > 1048576 )); then
+    echo -e "  Estimated size: ${_BY}~${formatted}${_N}"
+  else
+    echo -e "  Estimated size: ${_G}~${formatted}${_N}"
+  fi
+  if (( size_kb > 1048576 )); then
+    # Over 1GB — ask for confirmation
+    if ! _confirm_yes "Continue with ${what}?"; then
+      echo "Aborted."
+      exit 0
+    fi
+  fi
+}
+
 # ── Isolation: copy mode ──────────────────────────────────────────
-_prepare_copy_volume() {
+# COPY_MOUNT_PATH tracks where the volume is mounted inside the container.
+# Set during _prepare_copy_volume based on what was actually copied.
+COPY_MOUNT_PATH=""
+
+_copy_via_git() {
+  local mount_path="$1"
   local branch_name="aibox/${INSTANCE_NAME}"
 
-  # Warn about uncommitted changes
-  if ! git -C "$PROJECT_DIR" diff --quiet 2>/dev/null || ! git -C "$PROJECT_DIR" diff --cached --quiet 2>/dev/null; then
-    echo "Warning: uncommitted changes will NOT be included in the copy."
+  _confirm_size "$(_estimate_repo_size)" "copy"
+  _check_uncommitted
+
+  _step "Copying repo into volume (branch: ${branch_name})"
+
+  local bundle_file
+  bundle_file=$(mktemp)
+  if ! git -C "$GIT_ROOT" bundle create "$bundle_file" --all 2>/dev/null; then
+    rm -f "$bundle_file"
+    _cleanup_uncommitted
+    docker volume rm "$COPY_VOLUME" 2>/dev/null || true
+    _err "git bundle failed. Is this a git repository with commits?"
+    exit 1
   fi
+
+  if ! cat "$bundle_file" | docker run --rm -i --entrypoint sh \
+      -v "${COPY_VOLUME}:${mount_path}" \
+      "$IMAGE" -c "
+        cat > /tmp/repo.bundle
+        mkdir -p '${mount_path}'
+        cd '${mount_path}'
+        git clone /tmp/repo.bundle .
+        rm /tmp/repo.bundle
+        git checkout -b '${branch_name}' 2>/dev/null || git checkout '${branch_name}'
+        chown -R aibox:aibox '${mount_path}'
+      "; then
+    rm -f "$bundle_file"
+    _cleanup_uncommitted
+    docker volume rm "$COPY_VOLUME" 2>/dev/null || true
+    _err "Failed to clone into volume."
+    exit 1
+  fi
+
+  rm -f "$bundle_file"
+
+  _post_checkout_volume "$COPY_VOLUME" "$mount_path"
+  _apply_uncommitted_volume "$COPY_VOLUME" "$mount_path"
+  _cleanup_uncommitted
+}
+
+_copy_via_tar() {
+  local mount_path="$1"
+  local source_dir="$2"
+  local use_git_archive=false
+
+  # If inside a git repo, use git archive (respects .gitignore, excludes .git/)
+  if [[ -n "$GIT_ROOT" ]]; then
+    use_git_archive=true
+  fi
+
+  _confirm_size "$(_estimate_dir_size "$source_dir")" "copy"
+
+  _step "Copying folder into volume"
+
+  if [[ "$use_git_archive" == "true" ]]; then
+    # Use git ls-files to get all tracked + untracked-but-not-ignored files
+    # This copies the live working state while respecting .gitignore
+    _info "Copying files (respects .gitignore, includes uncommitted changes)"
+    if ! (cd "$source_dir" && \
+        { git ls-files -z; git ls-files -z --others --exclude-standard; } | \
+        tar -cf - --null -T - 2>/dev/null) | docker run --rm -i --entrypoint sh \
+        -v "${COPY_VOLUME}:${mount_path}" \
+        "$IMAGE" -c "
+          mkdir -p '${mount_path}'
+          cd '${mount_path}'
+          tar -xf -
+          chown -R aibox:aibox '${mount_path}'
+        "; then
+      docker volume rm "$COPY_VOLUME" 2>/dev/null || true
+      _err "Failed to copy into volume."
+      exit 1
+    fi
+  else
+    _info "Copying files (excluding node_modules, .git)"
+    if ! tar -C "$source_dir" -cf - \
+        --exclude='node_modules' \
+        --exclude='.git' \
+        . | docker run --rm -i --entrypoint sh \
+        -v "${COPY_VOLUME}:${mount_path}" \
+        "$IMAGE" -c "
+          mkdir -p '${mount_path}'
+          cd '${mount_path}'
+          tar -xf -
+          chown -R aibox:aibox '${mount_path}'
+        "; then
+      docker volume rm "$COPY_VOLUME" 2>/dev/null || true
+      _err "Failed to copy into volume."
+      exit 1
+    fi
+  fi
+}
+
+_prepare_copy_volume() {
+  _check_disk_space 2 "copy volume"
 
   docker volume create "$COPY_VOLUME" >/dev/null 2>&1 || true
 
   # Check if volume already has content (--entrypoint bypasses su-exec drop)
   local has_content
-  has_content=$(docker run --rm --entrypoint sh -v "${COPY_VOLUME}:${WORKSPACE_DIR}" "$IMAGE" -c "ls -A '${WORKSPACE_DIR}' 2>/dev/null | head -1" 2>/dev/null || true)
+  has_content=$(docker run --rm --entrypoint sh -v "${COPY_VOLUME}:/mnt/check" "$IMAGE" -c "ls -A /mnt/check 2>/dev/null | head -1" 2>/dev/null || true)
 
   if [[ -n "$has_content" ]]; then
-    echo "Copy volume already populated (${COPY_VOLUME}). Reusing."
+    _info "Copy volume already populated ($(_file "$COPY_VOLUME")). Reusing."
+    # Detect what was copied: if .git exists it was a repo copy, otherwise folder
+    local has_git
+    has_git=$(docker run --rm --entrypoint sh -v "${COPY_VOLUME}:/mnt/check" "$IMAGE" -c "test -d /mnt/check/.git && echo yes" 2>/dev/null || true)
+    if [[ "$has_git" == "yes" && -n "$GIT_ROOT" ]]; then
+      COPY_MOUNT_PATH="$GIT_ROOT"
+    else
+      COPY_MOUNT_PATH="$PROJECT_DIR"
+    fi
     return
   fi
 
-  _step "Copying project into volume (branch: ${branch_name})"
-
-  # Create bundle to a temp file first so we can check for failure
-  local bundle_file
-  bundle_file=$(mktemp)
-  if ! git -C "$PROJECT_DIR" bundle create "$bundle_file" --all 2>/dev/null; then
-    rm -f "$bundle_file"
-    docker volume rm "$COPY_VOLUME" 2>/dev/null || true
-    echo "Error: git bundle failed. Is this a git repository with commits?" >&2
-    exit 1
+  if [[ -z "$GIT_ROOT" ]]; then
+    # Not a git repo — tar copy of the folder
+    COPY_MOUNT_PATH="$PROJECT_DIR"
+    _copy_via_tar "$COPY_MOUNT_PATH" "$PROJECT_DIR"
+  elif [[ "$GIT_ROOT" == "$PROJECT_DIR" ]]; then
+    # At repo root — git bundle
+    COPY_MOUNT_PATH="$GIT_ROOT"
+    _copy_via_git "$COPY_MOUNT_PATH"
+  else
+    # In a subfolder of a git repo — ask
+    echo ""
+    _info "You're in a subfolder of a git repo."
+    echo -e "    Repo root:      $(_file "$GIT_ROOT")"
+    echo -e "    Current folder:  $(_file "$PROJECT_DIR")"
+    echo ""
+    if _confirm_yes "Copy the full repo? (No = copy only this folder)"; then
+      COPY_MOUNT_PATH="$GIT_ROOT"
+      _copy_via_git "$COPY_MOUNT_PATH"
+    else
+      COPY_MOUNT_PATH="$PROJECT_DIR"
+      _copy_via_tar "$COPY_MOUNT_PATH" "$PROJECT_DIR"
+    fi
   fi
 
-  if ! cat "$bundle_file" | docker run --rm -i --entrypoint sh \
-      -v "${COPY_VOLUME}:${WORKSPACE_DIR}" \
-      "$IMAGE" -c "
-        cat > /tmp/repo.bundle
-        mkdir -p '${WORKSPACE_DIR}'
-        cd '${WORKSPACE_DIR}'
-        git clone /tmp/repo.bundle .
-        rm /tmp/repo.bundle
-        git checkout -b '${branch_name}' 2>/dev/null || git checkout '${branch_name}'
-        chown -R aibox:aibox '${WORKSPACE_DIR}'
-      "; then
-    rm -f "$bundle_file"
-    docker volume rm "$COPY_VOLUME" 2>/dev/null || true
-    echo "Error: failed to clone into volume." >&2
-    exit 1
-  fi
-
-  rm -f "$bundle_file"
-  echo "Copied to volume ${COPY_VOLUME}"
+  _ok "Copied to volume $(_file "$COPY_VOLUME")"
 }
 
 # ── Isolation: worktree mode ─────────────────────────────────────
 _prepare_worktree() {
+  if [[ -z "$GIT_ROOT" ]]; then
+    _err "${_B}--worktree${_N} requires a git repository."
+    exit 1
+  fi
+
   local branch_name="aibox/${INSTANCE_NAME}"
 
   if [[ -d "$WORKTREE_DIR" ]]; then
-    echo "Worktree already exists (${WORKTREE_DIR}). Reusing."
+    _info "Worktree already exists ($(_file "$WORKTREE_DIR")). Reusing."
     return
   fi
+
+  _confirm_size "$(_estimate_repo_size)" "worktree"
+  _check_uncommitted
 
   mkdir -p "${CONFIG_DIR}/worktrees"
 
   _step "Creating worktree (branch: ${branch_name})"
 
   # Try creating with a new branch, fall back to existing branch
-  if git -C "$PROJECT_DIR" worktree add "$WORKTREE_DIR" -b "$branch_name" 2>/dev/null; then
+  if git -C "$GIT_ROOT" worktree add "$WORKTREE_DIR" -b "$branch_name" 2>/dev/null; then
     true
-  elif git -C "$PROJECT_DIR" worktree add "$WORKTREE_DIR" "$branch_name" 2>/dev/null; then
+  elif git -C "$GIT_ROOT" worktree add "$WORKTREE_DIR" "$branch_name" 2>/dev/null; then
     true
   else
-    echo "Error: failed to create worktree. Is this a git repository?" >&2
+    _cleanup_uncommitted
+    _err "Failed to create worktree. Is this a git repository?"
     exit 1
   fi
 
-  echo "Created worktree at ${WORKTREE_DIR}"
+  _post_checkout_local "$WORKTREE_DIR"
+  _apply_uncommitted_local "$WORKTREE_DIR"
+  _cleanup_uncommitted
+
+  _ok "Created worktree at $(_file "$WORKTREE_DIR")"
 }
 
 # ── Compose YAML generation ──────────────────────────────────────
@@ -662,9 +1053,9 @@ _volumes_yaml() {
   local prefix="$2"
 
   if [[ "$ISOLATION" == "copy" ]]; then
-    echo "${indent}- ${COPY_VOLUME}:${WORKSPACE_DIR}"
+    echo "${indent}- ${COPY_VOLUME}:${COPY_MOUNT_PATH:-$PROJECT_DIR}"
   elif [[ "$ISOLATION" == "worktree" ]]; then
-    echo "${indent}- \"${WORKTREE_DIR}:${WORKSPACE_DIR}\""
+    echo "${indent}- \"${WORKTREE_DIR}:${GIT_ROOT}\""
   else
     echo "${indent}- \"${prefix}:${WORKSPACE_DIR}\""
   fi
@@ -723,7 +1114,9 @@ _docker_exec() {
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
   )
   for var in "${forward_vars[@]}"; do
-    [[ -n "${!var:-}" ]] && env_args+=(-e "$var=${!var}")
+    local val
+    eval "val=\${$var:-}"
+    [[ -n "$val" ]] && env_args+=(-e "$var=$val")
   done
 
   # Forward JetBrains / VS Code IDE integration env vars
@@ -870,10 +1263,11 @@ dc() {
 
 cmd_build() {
   _check_deps
+  _check_disk_space 5 "Docker build"
   ensure_dockerfile
   _step "Building ${IMAGE}"
   docker build -t "$IMAGE" "$CONFIG_DIR"
-  echo "Done."
+  _ok "Image built."
 }
 
 ensure_init() {
@@ -908,6 +1302,43 @@ cmd_up() {
     fi
   fi
 
+  # Check for sensitive files in bind mount mode (only for new containers)
+  if [[ -z "$ISOLATION" ]] && ! docker ps --format '{{.Names}}' | grep -Fxq "$CONTAINER_NAME" 2>/dev/null; then
+    local sensitive_files=()
+    local sensitive_patterns=(".env" ".env.*"
+      "credentials.json" "service-account*.json"
+      ".npmrc" ".pypirc" "id_rsa" "id_ed25519")
+    for pattern in "${sensitive_patterns[@]}"; do
+      while IFS= read -r -d '' f; do
+        sensitive_files+=("${f#"$PROJECT_DIR"/}")
+      done < <(find "$PROJECT_DIR" -maxdepth 2 -name "$pattern" -not -path '*/node_modules/*' -not -path '*/.git/*' -print0 2>/dev/null || true)
+    done
+
+    if [[ ${#sensitive_files[@]} -gt 0 ]]; then
+      echo ""
+      _warn "Sensitive files found in project directory:"
+      for f in "${sensitive_files[@]}"; do
+        echo -e "    $(_file "$f")"
+      done
+      echo ""
+      echo -e "  These will be visible inside the container (bind mount)."
+      echo -e "  The network firewall (safe mode) limits exfiltration, but for"
+      echo -e "  stronger isolation use ${_B}--copy${_N} or ${_B}--worktree${_N} instead."
+      echo ""
+      if ! _confirm_yes "Continue with bind mount?"; then
+        echo -e "  Re-run with ${_B}--copy${_N} or ${_B}--worktree${_N}."
+        exit 0
+      fi
+    fi
+  fi
+
+  # Warn if bind-mounting a subfolder (no .git in container)
+  if [[ -z "$ISOLATION" && -n "$GIT_ROOT" && "$GIT_ROOT" != "$PROJECT_DIR" ]]; then
+    _info "Mounting subfolder $(_file "${PROJECT_DIR#"$GIT_ROOT"/}")"
+    echo -e "    Git won't work inside the container (.git/ is in the parent)."
+    echo -e "    Use ${_B}--copy${_N} or ${_B}--worktree${_N} for full repo access, or run from the repo root."
+  fi
+
   # Prepare isolation volumes/worktrees if needed
   if [[ "$ISOLATION" == "copy" ]]; then
     _prepare_copy_volume
@@ -920,9 +1351,9 @@ cmd_up() {
     docker volume create "$AUTH_VOLUME" &>/dev/null || true
     _step "Starting ${CONTAINER_NAME}"
     dc up -d
-    echo "Container running."
+    _ok "Container running."
   else
-    echo "${CONTAINER_NAME} is already running."
+    _ok "$(_file "$CONTAINER_NAME") is already running."
   fi
 }
 
@@ -930,8 +1361,14 @@ cmd_claude() {
   local skip=false
   local firewall=true
 
-  if [[ "$SKIP_PERMISSIONS" == "true" ]]; then
-    # --yolo: everything loose
+  # Check if --dangerously-skip-permissions was passed directly as a claude arg
+  local has_skip_flag=false
+  for arg in "$@"; do
+    [[ "$arg" == "--dangerously-skip-permissions" ]] && has_skip_flag=true
+  done
+
+  if [[ "$SKIP_PERMISSIONS" == "true" || "$has_skip_flag" == "true" ]]; then
+    # --yolo or explicit --dangerously-skip-permissions: everything loose
     skip=true
     firewall=false
     export AIBOX_MODE="yolo"
@@ -977,8 +1414,17 @@ cmd_claude() {
 
   cmd_up
 
-  if [[ "$skip" == "true" ]]; then
-    _docker_exec "$CONTAINER_NAME" claude --dangerously-skip-permissions
+  local claude_args=()
+  if [[ "$skip" == "true" && "$has_skip_flag" == "false" ]]; then
+    claude_args+=(--dangerously-skip-permissions)
+  fi
+  # Forward all remaining args to claude (--resume, --print, --model, etc.)
+  if [[ $# -gt 0 ]]; then
+    claude_args+=("$@")
+  fi
+
+  if [[ ${#claude_args[@]} -gt 0 ]]; then
+    _docker_exec "$CONTAINER_NAME" claude "${claude_args[@]}"
   else
     _docker_exec "$CONTAINER_NAME" claude
   fi
@@ -1015,7 +1461,11 @@ cmd_down() {
             docker volume rm "${cname}-src" 2>/dev/null && echo "Removed copy volume ${cname}-src" || true
             local wt="${CONFIG_DIR}/worktrees/${cname}"
             if [[ -d "$wt" ]]; then
-              git -C "$PROJECT_DIR" worktree remove "$wt" 2>/dev/null && echo "Removed worktree ${wt}" || true
+              if [[ -n "$GIT_ROOT" ]]; then
+                git -C "$GIT_ROOT" worktree remove "$wt" 2>/dev/null && echo "Removed worktree ${wt}" || true
+              else
+                echo "Warning: cannot remove worktree ${wt} (not in a git repo). Remove manually."
+              fi
             fi
           done <<< "$project_containers"
         else
@@ -1040,9 +1490,9 @@ cmd_down() {
   else
     if docker ps -a --format '{{.Names}}' | grep -Fxq "$CONTAINER_NAME"; then
       dc down --remove-orphans
-      echo "Removed ${CONTAINER_NAME}"
+      _ok "Removed $(_file "$CONTAINER_NAME")"
     else
-      echo "No container found: ${CONTAINER_NAME}"
+      _info "No container found: $(_file "$CONTAINER_NAME")"
     fi
     # Clean up isolation resources (works even if container is already gone)
     if [[ "$DOWN_CLEAN" == "true" ]]; then
@@ -1050,7 +1500,11 @@ cmd_down() {
         docker volume rm "$COPY_VOLUME" 2>/dev/null && echo "Removed copy volume ${COPY_VOLUME}" || true
       fi
       if [[ -n "$WORKTREE_DIR" && -d "$WORKTREE_DIR" ]]; then
-        git -C "$PROJECT_DIR" worktree remove "$WORKTREE_DIR" 2>/dev/null && echo "Removed worktree ${WORKTREE_DIR}" || true
+        if [[ -n "$GIT_ROOT" ]]; then
+          git -C "$GIT_ROOT" worktree remove "$WORKTREE_DIR" 2>/dev/null && echo "Removed worktree ${WORKTREE_DIR}" || true
+        else
+          echo "Warning: cannot remove worktree ${WORKTREE_DIR} (not in a git repo). Remove manually."
+        fi
       fi
     elif [[ "$ISOLATION" == "copy" && -n "$COPY_VOLUME" ]] && docker volume inspect "$COPY_VOLUME" &>/dev/null; then
       echo "Copy volume kept: ${COPY_VOLUME} (use --clean to remove)"
@@ -1204,7 +1658,7 @@ cmd_version() {
 # ── Main ─────────────────────────────────────────────────────────
 case "${1:-help}" in
   up)       cmd_up ;;
-  claude)   cmd_claude ;;
+  claude)   shift; cmd_claude "$@" ;;
   shell)    cmd_shell "$@" ;;
   down)     cmd_down ;;
   status)   cmd_status ;;

@@ -24,6 +24,8 @@ aibox up                    # start container (auto-builds image on first run)
 aibox claude --yolo         # no prompts, full sudo, no firewall
 aibox claude --safe         # keep prompts, restricted sudo, firewall on
 aibox claude                # asks you each time
+aibox claude --resume       # resume most recent conversation
+aibox claude --print "explain this code"  # extra args passed to claude
 aibox shell                 # zsh inside the container
 aibox shell ls -la          # run a command inline
 aibox down                  # stop and remove
@@ -41,21 +43,24 @@ aibox --name refactor down
 
 ### Isolated Instances
 
-By default, named instances share the project directory. For true isolation:
+By default, named instances share the project directory via bind mount. For true isolation:
 
 ```bash
-# Full isolation — copy repo into a Docker volume
+# Full isolation — copy into a Docker volume
 aibox --name refactor --copy claude --yolo
 
 # Lightweight — git worktree on host
 aibox --name feat --worktree claude --yolo
 ```
 
-`--copy` uses `git bundle` to clone tracked files into a volume (excludes .gitignored files, preserves history). Changes stay inside the container until pushed. Best for automation and parallel agents.
+`--copy` works with or without a git repo:
+- **Git repo**: uses `git bundle` to clone tracked files (preserves history, excludes .gitignored files). Asks if you want to include uncommitted changes.
+- **Git subfolder**: asks whether to copy the full repo or just the current folder. Folder-only copies use `git ls-files` to respect `.gitignore` while including uncommitted changes.
+- **Non-git directory**: tars the folder (excluding `node_modules` and `.git`).
 
-`--worktree` creates a `git worktree` at `~/.config/aibox/worktrees/`. Near-instant, shares remotes with the main repo. Best for feature branches and quick experiments.
+`--worktree` creates a `git worktree` at `~/.config/aibox/worktrees/`. Near-instant, shares remotes with the main repo. Requires a git repository. Asks if you want to include uncommitted changes.
 
-Both create a new branch `aibox/<instance-name>` automatically.
+Both create a new branch `aibox/<instance-name>` automatically. Submodules and Git LFS objects are initialized automatically when detected.
 
 ### Management
 
@@ -66,6 +71,7 @@ aibox down                # stop current container
 aibox down --clean        # also remove copy volumes / worktrees
 aibox down --all          # stop all containers for this project
 aibox nuke                # remove ALL aibox containers
+aibox version             # show version
 ```
 
 ### From a Git Repo
@@ -96,7 +102,7 @@ aibox generates a `compose.dev.yaml` and configures your IDE on `aibox init` (or
 2. Run `aibox init` in your project
 3. Set the plugin's startup command to:
    ```
-   npx aibox claude --yolo
+   aibox claude --yolo
    ```
 
 The Node.js interpreter is also configured to use the container, so running/debugging from the IDE uses the same sandboxed environment.
@@ -113,7 +119,7 @@ Set your agent's startup command to `aibox claude --yolo`. Works anywhere you ca
 
 ## Other Agents
 
-The container ships with Node.js 20, git, ripgrep, zsh, python3, and build tools. Claude Code is pre-installed, but you can run anything:
+The container ships with Node.js 20, git, git-lfs, ripgrep, zsh, python3, and build tools. Claude Code is pre-installed, but you can run anything:
 
 ```bash
 aibox shell
@@ -127,13 +133,13 @@ Customize the Dockerfile at `~/.config/aibox/Dockerfile`.
 
 ## How It Works
 
-- **Build**: Creates a Docker image with Node.js, Claude Code, and dev tools
+- **Build**: Creates a Docker image with Node.js, Claude Code, and dev tools (auto-rebuilds when version changes)
 - **Up**: Starts a container with your project bind-mounted
 - **Claude**: Opens Claude Code inside the container, optionally skipping permission prompts
 - **Modes**: `--yolo` gives full access; `--safe` enables firewall + restricted sudo
 - **Auth**: A shared Docker volume persists Claude authentication across containers
 - **Isolation**: Each project gets its own container and isolated `node_modules`
-- **Safety**: Refuses to run in `$HOME`, `/tmp`, or other dangerous directories
+- **Safety**: Refuses to run in `$HOME`, `/tmp`, or other dangerous directories. Warns about sensitive files (`.env`, credentials) in bind mount mode. Checks disk space before builds and copies.
 
 ## Network Firewall
 
@@ -162,7 +168,7 @@ SHARED_MODULES=false
 | `-r` | `--repo URL` | Clone a git repo and run in it |
 | `-b` | `--branch NAME` | Branch to checkout (with `--repo`) |
 | `-i` | `--image NAME` | Override base Docker image |
-| `-c` | `--copy` | Copy repo into Docker volume (full isolation) |
+| `-c` | `--copy` | Copy project into Docker volume (full isolation) |
 | `-w` | `--worktree` | Use git worktree (lightweight isolation) |
 | `-y` | `--yolo` | Skip prompts, full sudo, no firewall |
 | `-s` | `--safe` | Keep prompts, restricted sudo, firewall on |
