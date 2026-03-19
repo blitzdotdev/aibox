@@ -1,6 +1,24 @@
 # aibox
 
-Run AI coding agents in isolated Docker containers. Mount your project, skip permission prompts safely, run multiple instances in parallel.
+Instant sandbox containers for local files. One command to go from bare project to fully isolated Claude Code session.
+
+AI agents need broad filesystem and network access to be useful — but giving that to an unsandboxed process on your host is risky. aibox runs each agent session inside a Docker container with your current directory bind-mounted in, so changes sync both ways while the agent stays sandboxed. Skip permission prompts safely, let agents run wild, tear everything down when you're done.
+
+- **Zero config** — don't even need Docker installed. Detects your machine, auto-installs Colima/Docker, builds an Alpine image with Claude Code + dev tools, and sets up your project on first run
+- **Safe by default** — network firewall (allowlisted domains only), restricted sudo, sensitive file detection (`.env`, credentials), disk space checks. `--yolo` to unlock everything
+- **Full isolation** — `--copy` snapshots your repo into a Docker volume (works with or without git), `--worktree` creates a lightweight git worktree. Both handle uncommitted changes, submodules, and LFS automatically
+- **Parallel agents** — run multiple named instances on the same project, each with its own container and optional isolation
+- **Editor integration** — generates `compose.dev.yaml`, auto-configures JetBrains Node.js interpreter, forwards IDE plugin connections for VS Code and Cursor
+- **Clone and run** — point at any git URL with `--repo` and aibox clones, sets up, and launches an agent session
+- **Just a shell script** — no daemon, no runtime dependencies beyond Docker, easy to fork and customize
+
+### tldr
+
+```bash
+cd myproject && aibox claude --yolo
+```
+
+That's the whole workflow. Docker handles the rest.
 
 ## Install
 
@@ -133,13 +151,17 @@ Customize the Dockerfile at `~/.config/aibox/Dockerfile`.
 
 ## How It Works
 
-- **Build**: Creates a Docker image with Node.js, Claude Code, and dev tools (auto-rebuilds when version changes)
-- **Up**: Starts a container with your project bind-mounted
-- **Claude**: Opens Claude Code inside the container, optionally skipping permission prompts
-- **Modes**: `--yolo` gives full access; `--safe` enables firewall + restricted sudo
-- **Auth**: A shared Docker volume persists Claude authentication across containers
-- **Isolation**: Each project gets its own container and isolated `node_modules`
-- **Safety**: Refuses to run in `$HOME`, `/tmp`, or other dangerous directories. Warns about sensitive files (`.env`, credentials) in bind mount mode. Checks disk space before builds and copies.
+Run `aibox` from any project directory. It builds a lightweight Alpine container with Node.js, Claude Code, git, and dev tools, then bind-mounts your current directory into it. Changes sync both ways — edits inside the container appear on your host and vice versa. Authentication persists in a shared Docker volume across sessions.
+
+**Two modes** control the security posture:
+
+| | `--yolo` | `--safe` (default) |
+|---|---|---|
+| Permission prompts | Skipped | Kept |
+| Sudo | Full | Restricted (chown only) |
+| Network | Unrestricted | Firewall (allowlist only) |
+
+The container is disposable — `aibox down` removes it completely. Your project files and auth survive.
 
 ## Network Firewall
 
