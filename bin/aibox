@@ -537,8 +537,11 @@ DOCKERFILE
 #!/bin/bash
 set -e
 
-# Fix auth volume ownership (Docker creates volumes as root)
+# Fix volume ownership (Docker creates volumes as root)
 chown -R aibox:aibox /home/aibox/.claude 2>/dev/null || true
+if [[ -n "${AIBOX_WORKSPACE:-}" && -d "${AIBOX_WORKSPACE}/node_modules" ]]; then
+  chown aibox:aibox "${AIBOX_WORKSPACE}/node_modules" 2>/dev/null || true
+fi
 
 # ── Mode-dependent setup ──────────────────────────────────────
 MODE="${AIBOX_MODE:-safe}"
@@ -1091,6 +1094,7 @@ _environment_yaml() {
   echo "${indent}- CLAUDE_CONFIG_DIR=/home/aibox/.claude"
   echo "${indent}- AIBOX_MODE=\${AIBOX_MODE:-safe}"
   echo "${indent}- AIBOX_EXTRA_DOMAINS=\${AIBOX_EXTRA_DOMAINS:-}"
+  echo "${indent}- AIBOX_WORKSPACE=${WORKSPACE_DIR}"
 }
 
 # Build -e flags for docker exec from current terminal environment
