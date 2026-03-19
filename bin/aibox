@@ -22,6 +22,7 @@
 #   aibox nuke                    Remove ALL aibox containers (all projects)
 #   aibox build [--image NAME]    Build the base image
 #   aibox init [flags]            Generate compose.dev.yaml + configure WebStorm
+#   aibox update                   Update aibox to the latest version
 #   aibox version                  Show version
 #   aibox help                    Show this help (default)
 #
@@ -64,6 +65,7 @@ set -euo pipefail
 # ── Script identity ──────────────────────────────────────────────
 SCRIPT_NAME="$(basename "$0")"
 AIBOX_VERSION="9"
+AIBOX_CLI_VERSION="__CLI_VERSION__"
 CONFIG_DIR="${HOME}/.config/aibox"
 DEFAULT_IMAGE="aibox:latest"
 CONTAINER_PREFIX="aibox"
@@ -1840,10 +1842,63 @@ cmd_help() {
 }
 
 cmd_version() {
-  echo "aibox v${AIBOX_VERSION}"
+  echo "aibox v${AIBOX_CLI_VERSION} (image v${AIBOX_VERSION})"
+}
+
+# ── Update check (non-blocking, cached for 24h) ─────────────────
+_check_for_updates() {
+  [[ ! -t 1 || -n "${CI:-}" || "$AIBOX_CLI_VERSION" == "__CLI_VERSION__" ]] && return 0
+
+  local cache_file="${CONFIG_DIR}/update-check"
+  mkdir -p "$CONFIG_DIR"
+
+  if [[ -f "$cache_file" ]]; then
+    local mtime latest
+    mtime=$(stat -c %Y "$cache_file" 2>/dev/null || stat -f %m "$cache_file" 2>/dev/null || echo 0)
+    if (( $(date +%s) - mtime < 86400 )); then
+      latest=$(cat "$cache_file")
+      [[ -n "$latest" && "$latest" != "$AIBOX_CLI_VERSION" ]] && \
+        _warn "aibox ${_B}v${latest}${_N}${_BY} available${_N} (current: v${AIBOX_CLI_VERSION}). Run: ${_B}aibox update${_N}"
+      return 0
+    fi
+  fi
+
+  # Refresh cache in background (silent — notice shown on next run)
+  ( curl -fsSL --max-time 3 "https://registry.npmjs.org/aibox-cli/latest" 2>/dev/null \
+      | grep -o '"version":"[^"]*"' | head -1 | cut -d'"' -f4 > "$cache_file"
+  ) &>/dev/null &
+  disown 2>/dev/null || true
+}
+
+cmd_update() {
+  local script_path
+  script_path="$(realpath "$0" 2>/dev/null || readlink -f "$0" 2>/dev/null || echo "$0")"
+
+  if [[ "$script_path" == */Cellar/* || "$script_path" == */homebrew/* ]]; then
+    if ! command -v brew &>/dev/null; then
+      _err "Installed via Homebrew but ${_B}brew${_N} not found in PATH."
+      echo "  Run: brew upgrade aibox"
+      exit 1
+    fi
+    _step "Updating via Homebrew"
+    brew update && brew upgrade aibox
+  elif command -v npm &>/dev/null && npm list -g aibox-cli &>/dev/null; then
+    _step "Updating via npm"
+    npm update -g aibox-cli
+  else
+    _err "Could not detect install method (Homebrew or npm)."
+    echo "  Update manually:"
+    echo "    Homebrew: brew upgrade aibox"
+    echo "    npm:      npm update -g aibox-cli"
+    exit 1
+  fi
+
+  _ok "Updated. Run ${_B}aibox build${_N} to rebuild the Docker image."
 }
 
 # ── Main ─────────────────────────────────────────────────────────
+_check_for_updates
+
 case "${1:-help}" in
   up)       cmd_up ;;
   claude)   shift; cmd_claude "$@" ;;
@@ -1855,6 +1910,7 @@ case "${1:-help}" in
   nuke)     cmd_nuke ;;
   build)    cmd_build ;;
   init)     cmd_init ;;
+  update)   cmd_update ;;
   help|-h)         cmd_help ;;
   version|-v|--version) cmd_version ;;
   *)

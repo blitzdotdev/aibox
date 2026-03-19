@@ -28,6 +28,8 @@ jobs:
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
+      - name: Stamp CLI version
+        run: sed -i "s/__CLI_VERSION__/$(node -p 'require(\"./package.json\").version')/" bin/aibox
       - run: npm publish --access public --provenance
 
   homebrew:
