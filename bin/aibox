@@ -1804,6 +1804,8 @@ _init_files() {
   configure_webstorm
 
   local gitignore="${PROJECT_DIR}/.gitignore"
+  # Ensure file ends with a newline before appending
+  [[ -f "$gitignore" ]] && echo "" >> "$gitignore"
   local entries=("compose.dev.yaml" ".aibox" ".idea/workspace.xml")
   for entry in "${entries[@]}"; do
     if [[ -f "$gitignore" ]]; then
