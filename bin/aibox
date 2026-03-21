@@ -19,6 +19,13 @@
 #   aibox port-forward --stop-all Stop all port forwards
 #   aibox status                  List all aibox containers
 #   aibox volumes                 List copy volumes and worktrees
+#   aibox disk                    Show disk usage breakdown
+#   aibox clean [DAYS]            Clean everything (default: 30 days)
+#     --containers                  Only stopped containers
+#     --volumes                     Only orphaned volumes
+#     --docker                      Only dangling images + build cache
+#     --sessions                    Only old Claude session data
+#   aibox doctor                  Diagnose common issues
 #   aibox nuke                    Remove ALL aibox containers (all projects)
 #   aibox build [--image NAME]    Build the base image
 #   aibox init [flags]            Generate compose.dev.yaml + configure WebStorm
@@ -38,6 +45,7 @@
 #   -y, --yolo            Yolo mode: skip permissions, full sudo, no firewall
 #   -s, --safe            Safe mode: keep permissions, restricted sudo, firewall on
 #   --shared-modules      Share node_modules between host and container
+#   --force               Skip confirmation prompts (for clean)
 #
 # Network firewall:
 #   Default: only allows Claude API, npm, GitHub, PyPI, SSH, DNS.
@@ -233,6 +241,7 @@ REPO_URL=""
 REPO_BRANCH=""
 DOWN_ALL=false
 DOWN_CLEAN=false
+FORCE_CLEAN=false
 SKIP_PERMISSIONS=false
 SAFE_MODE=false
 ISOLATION=""
@@ -281,6 +290,10 @@ parse_flags() {
         ;;
       --clean)
         DOWN_CLEAN=true
+        shift
+        ;;
+      --force)
+        FORCE_CLEAN=true
         shift
         ;;
       -y|--yolo)
@@ -1133,6 +1146,27 @@ _docker_exec() {
   docker exec -it -u aibox "${env_args[@]}" "$container" "$@"
 }
 
+# Auto-stop container if no active exec sessions remain
+_maybe_stop_container() {
+  local container="$1"
+  # Check if container is still running
+  if ! docker ps --format '{{.Names}}' | grep -Fxq "$container" 2>/dev/null; then
+    return 0
+  fi
+  # Count processes that are NOT "sleep infinity" (the idle CMD)
+  local active
+  active=$(docker top "$container" -o pid,args 2>/dev/null \
+    | tail -n +2 \
+    | grep -v -c 'sleep infinity' || echo "0")
+  active=$(echo "$active" | tr -d '[:space:]')
+
+  if [[ "$active" -le 0 ]]; then
+    _info "No active sessions. Stopping container..."
+    dc down --remove-orphans >/dev/null 2>&1
+    _ok "Container stopped."
+  fi
+}
+
 _labels_yaml() {
   local indent="$1"
   echo "${indent}aibox.project: \"${PROJECT_NAME}\""
@@ -1425,11 +1459,14 @@ cmd_claude() {
     claude_args+=("$@")
   fi
 
+  local _exec_rc=0
   if [[ ${#claude_args[@]} -gt 0 ]]; then
-    _docker_exec "$CONTAINER_NAME" claude "${claude_args[@]}"
+    _docker_exec "$CONTAINER_NAME" claude "${claude_args[@]}" || _exec_rc=$?
   else
-    _docker_exec "$CONTAINER_NAME" claude
+    _docker_exec "$CONTAINER_NAME" claude || _exec_rc=$?
   fi
+  _maybe_stop_container "$CONTAINER_NAME"
+  return "$_exec_rc"
 }
 
 cmd_shell() {
@@ -1437,13 +1474,16 @@ cmd_shell() {
     cmd_up
   fi
 
+  local _exec_rc=0
   shift  # remove "shell" from args
   if [[ $# -gt 0 ]]; then
     # Inline command: aibox shell echo hello
-    _docker_exec "$CONTAINER_NAME" zsh -c "$*"
+    _docker_exec "$CONTAINER_NAME" zsh -c "$*" || _exec_rc=$?
   else
-    _docker_exec "$CONTAINER_NAME" zsh
+    _docker_exec "$CONTAINER_NAME" zsh || _exec_rc=$?
   fi
+  _maybe_stop_container "$CONTAINER_NAME"
+  return "$_exec_rc"
 }
 
 # ── Port forwarding ──────────────────────────────────────────────
@@ -1798,6 +1838,414 @@ cmd_volumes() {
   fi
 }
 
+# ── Volume size helper ───────────────────────────────────────────
+_volume_size() {
+  local vol="$1"
+  docker run --rm -v "${vol}:/mnt/vol" alpine sh -c 'du -sh /mnt/vol 2>/dev/null | cut -f1' 2>/dev/null || echo "?"
+}
+
+cmd_disk() {
+  _check_deps
+
+  _step "Disk usage report"
+
+  # Auth volumes
+  echo -e "  ${_B}Auth volumes:${_N}"
+  local auth_vols
+  auth_vols=$(docker volume ls --format '{{.Name}}' | grep '^aibox-auth-') || true
+  if [[ -n "$auth_vols" ]]; then
+    while IFS= read -r vol; do
+      echo "    ${vol}: $(_volume_size "$vol")"
+    done <<< "$auth_vols"
+  else
+    echo "    (none)"
+  fi
+
+  # Containers
+  echo ""
+  echo -e "  ${_B}Containers:${_N}"
+  local containers
+  containers=$(docker ps -a --filter "name=${CONTAINER_PREFIX}-" --format '{{.Names}}\t{{.Size}}' 2>/dev/null | grep -v "^${PF_PREFIX}-") || true
+  if [[ -n "$containers" ]]; then
+    while IFS= read -r line; do
+      echo "    ${line}"
+    done <<< "$containers"
+  else
+    echo "    (none)"
+  fi
+
+  # Copy volumes
+  echo ""
+  echo -e "  ${_B}Copy volumes:${_N}"
+  local copy_vols
+  copy_vols=$(docker volume ls --format '{{.Name}}' | grep -F "${CONTAINER_PREFIX}-" | grep -- '-src$') || true
+  if [[ -n "$copy_vols" ]]; then
+    while IFS= read -r vol; do
+      echo "    ${vol}: $(_volume_size "$vol")"
+    done <<< "$copy_vols"
+  else
+    echo "    (none)"
+  fi
+
+  # node_modules volumes
+  echo ""
+  echo -e "  ${_B}node_modules volumes:${_N}"
+  local nm_vols
+  nm_vols=$(docker volume ls --format '{{.Name}}' | grep '_node_modules$') || true
+  if [[ -n "$nm_vols" ]]; then
+    while IFS= read -r vol; do
+      echo "    ${vol}: $(_volume_size "$vol")"
+    done <<< "$nm_vols"
+  else
+    echo "    (none)"
+  fi
+
+  # Worktrees
+  echo ""
+  echo -e "  ${_B}Worktrees:${_N}"
+  local worktree_dir="${CONFIG_DIR}/worktrees"
+  if [[ -d "$worktree_dir" ]] && ls -1 "$worktree_dir" 2>/dev/null | head -1 | grep -q .; then
+    du -sh "${worktree_dir}"/* 2>/dev/null | while IFS= read -r line; do
+      echo "    ${line}"
+    done
+  else
+    echo "    (none)"
+  fi
+
+  # Docker system summary
+  echo ""
+  echo -e "  ${_B}Docker system:${_N}"
+  docker system df 2>/dev/null | while IFS= read -r line; do
+    echo "    ${line}"
+  done
+}
+
+cmd_clean() {
+  _check_deps
+
+  shift  # remove "clean" from args
+
+  # Parse clean-specific flags
+  local clean_containers=false clean_volumes=false clean_docker=false clean_sessions=false
+  local days="30"
+  local filter_set=false
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --containers) clean_containers=true; filter_set=true; shift ;;
+      --volumes)    clean_volumes=true;    filter_set=true; shift ;;
+      --docker)     clean_docker=true;     filter_set=true; shift ;;
+      --sessions)   clean_sessions=true;   filter_set=true; shift ;;
+      [0-9]*)       days="$1"; shift ;;
+      *)            shift ;;
+    esac
+  done
+
+  # No filter flags = clean everything
+  if [[ "$filter_set" == "false" ]]; then
+    clean_containers=true; clean_volumes=true; clean_docker=true; clean_sessions=true
+  fi
+
+  _step "Scanning for cleanup targets"
+
+  local has_work=false
+
+  # 1. Stopped/exited aibox containers
+  local stopped=""
+  if [[ "$clean_containers" == "true" ]]; then
+    stopped=$(docker ps -a \
+      --filter "name=${CONTAINER_PREFIX}-" \
+      --filter "status=exited" \
+      --filter "status=created" \
+      --format '{{.Names}}' | grep -v "^${PF_PREFIX}-" | sort -u) || true
+
+    if [[ -n "$stopped" ]]; then
+      has_work=true
+      echo -e "  ${_B}Stopped containers:${_N}"
+      while IFS= read -r c; do echo "    $c"; done <<< "$stopped"
+    fi
+  fi
+
+  # 2. Orphaned volumes
+  local orphan_vols=()
+  if [[ "$clean_volumes" == "true" ]]; then
+    local copy_vols
+    copy_vols=$(docker volume ls --format '{{.Name}}' | grep -F "${CONTAINER_PREFIX}-" | grep -- '-src$') || true
+    if [[ -n "$copy_vols" ]]; then
+      while IFS= read -r vol; do
+        local container_name="${vol%-src}"
+        if ! docker ps -a --format '{{.Names}}' | grep -Fxq "$container_name" 2>/dev/null; then
+          orphan_vols+=("$vol")
+        fi
+      done <<< "$copy_vols"
+    fi
+
+    local nm_vols
+    nm_vols=$(docker volume ls --format '{{.Name}}' | grep '_node_modules$') || true
+    if [[ -n "$nm_vols" ]]; then
+      while IFS= read -r vol; do
+        local mounted_by
+        mounted_by=$(docker ps -a -q --filter "volume=${vol}" 2>/dev/null) || true
+        if [[ -z "$mounted_by" ]]; then
+          orphan_vols+=("$vol")
+        fi
+      done <<< "$nm_vols"
+    fi
+
+    if [[ ${#orphan_vols[@]} -gt 0 ]]; then
+      has_work=true
+      echo -e "  ${_B}Orphaned volumes:${_N}"
+      for v in "${orphan_vols[@]}"; do echo "    $v"; done
+    fi
+  fi
+
+  # 3. Dangling Docker images + build cache
+  local dangling_count=0
+  if [[ "$clean_docker" == "true" ]]; then
+    local dangling
+    dangling=$(docker images -f "dangling=true" -q) || true
+    [[ -n "$dangling" ]] && dangling_count=$(echo "$dangling" | wc -l | tr -d ' ')
+
+    if [[ "$dangling_count" -gt 0 ]]; then
+      has_work=true
+      echo -e "  ${_B}Dangling images:${_N} ${dangling_count}"
+    fi
+
+    local build_cache
+    build_cache=$(docker system df --format '{{.Type}}\t{{.Reclaimable}}' 2>/dev/null | grep '^Build' | cut -f2) || true
+    if [[ -n "$build_cache" && "$build_cache" != "0B" ]]; then
+      has_work=true
+      echo -e "  ${_B}Build cache (reclaimable):${_N} ${build_cache}"
+    fi
+  fi
+
+  # 4. Old Claude sessions in auth volumes
+  local auth_vols_list=""
+  local old_sessions_found=false
+  local sessions_skipped=false
+  if [[ "$clean_sessions" == "true" ]]; then
+    auth_vols_list=$(docker volume ls --format '{{.Name}}' | grep '^aibox-auth-') || true
+
+    if [[ -n "$auth_vols_list" ]]; then
+      while IFS= read -r avol; do
+        # Skip if any running container mounts this volume
+        local running_users
+        running_users=$(docker ps -q --filter "volume=${avol}" 2>/dev/null) || true
+        if [[ -n "$running_users" ]]; then
+          _warn "Skipping ${avol} — mounted by running container(s). Stop them first."
+          sessions_skipped=true
+          continue
+        fi
+
+        local count
+        count=$(docker run --rm -v "${avol}:/mnt/vol" alpine sh -c \
+          "find /mnt/vol/projects /mnt/vol/session-env /mnt/vol/file-history /mnt/vol/shell-snapshots \
+            -type f -mtime +${days} 2>/dev/null | wc -l" 2>/dev/null || echo "0")
+        count=$(echo "$count" | tr -d '[:space:]')
+        if [[ "$count" -gt 0 ]]; then
+          has_work=true
+          old_sessions_found=true
+          echo -e "  ${_B}Old Claude sessions:${_N} ${count} files older than ${days} days in ${avol}"
+        fi
+      done <<< "$auth_vols_list"
+    fi
+  fi
+
+  if [[ "$has_work" == "false" ]]; then
+    _ok "Nothing to clean."
+    return 0
+  fi
+
+  echo ""
+  if [[ "$FORCE_CLEAN" != "true" ]]; then
+    if ! _confirm_no "Proceed with cleanup?"; then
+      echo "Aborted."
+      return 0
+    fi
+  fi
+
+  # Execute cleanup
+  _step "Cleaning up"
+
+  if [[ "$clean_containers" == "true" && -n "$stopped" ]]; then
+    while IFS= read -r c; do
+      _pf_cleanup "$c"
+      docker rm "$c" >/dev/null
+      _ok "Removed container: $c"
+    done <<< "$stopped"
+  fi
+
+  if [[ "$clean_volumes" == "true" ]]; then
+    for v in "${orphan_vols[@]}"; do
+      docker volume rm "$v" >/dev/null 2>&1 \
+        && _ok "Removed volume: $v" \
+        || _warn "Could not remove volume: $v"
+    done
+  fi
+
+  if [[ "$clean_docker" == "true" ]]; then
+    if [[ "$dangling_count" -gt 0 ]]; then
+      docker image prune -f >/dev/null
+      _ok "Removed ${dangling_count} dangling images."
+    fi
+
+    docker builder prune -f >/dev/null 2>&1 \
+      && _ok "Pruned build cache." || true
+  fi
+
+  if [[ "$clean_sessions" == "true" && "$old_sessions_found" == "true" && -n "$auth_vols_list" ]]; then
+    while IFS= read -r avol; do
+      # Re-check: skip if a running container now uses this volume
+      local running_users
+      running_users=$(docker ps -q --filter "volume=${avol}" 2>/dev/null) || true
+      [[ -n "$running_users" ]] && continue
+
+      docker run --rm -v "${avol}:/mnt/vol" alpine sh -c "
+        find /mnt/vol/projects /mnt/vol/session-env /mnt/vol/file-history /mnt/vol/shell-snapshots \
+          -type f -mtime +${days} -delete 2>/dev/null
+        find /mnt/vol/projects /mnt/vol/session-env /mnt/vol/file-history /mnt/vol/shell-snapshots \
+          -type d -empty -delete 2>/dev/null
+      " 2>/dev/null || true
+    done <<< "$auth_vols_list"
+    _ok "Cleaned Claude sessions older than ${days} days."
+  fi
+
+  _ok "Cleanup complete."
+}
+
+cmd_doctor() {
+  _check_deps
+
+  _step "Running diagnostics"
+  local issues=0
+
+  # 1. Stale containers
+  echo -e "  ${_B}Containers...${_N}"
+  local running
+  running=$(docker ps --filter "name=${CONTAINER_PREFIX}-" --format '{{.Names}}' | grep -v "^${PF_PREFIX}-") || true
+  if [[ -n "$running" ]]; then
+    while IFS= read -r c; do
+      local active
+      active=$(docker top "$c" -o pid,args 2>/dev/null \
+        | tail -n +2 \
+        | grep -v -c 'sleep infinity' || echo "0")
+      active=$(echo "$active" | tr -d '[:space:]')
+      if [[ "$active" -le 0 ]]; then
+        _warn "Stale: ${c} (running, no active sessions)"
+        echo -e "    Fix: ${_B}aibox down${_N} or ${_B}aibox clean${_N}"
+        issues=$((issues + 1))
+      else
+        _ok "${c} (${active} active session(s))"
+      fi
+    done <<< "$running"
+  else
+    _ok "No running containers"
+  fi
+
+  # 2. Orphaned volumes
+  echo ""
+  echo -e "  ${_B}Volumes...${_N}"
+  local copy_vols
+  copy_vols=$(docker volume ls --format '{{.Name}}' | grep -F "${CONTAINER_PREFIX}-" | grep -- '-src$') || true
+  if [[ -n "$copy_vols" ]]; then
+    while IFS= read -r vol; do
+      local container_name="${vol%-src}"
+      if ! docker ps -a --format '{{.Names}}' | grep -Fxq "$container_name" 2>/dev/null; then
+        _warn "Orphaned: ${vol}"
+        echo -e "    Fix: ${_B}aibox clean${_N}"
+        issues=$((issues + 1))
+      fi
+    done <<< "$copy_vols"
+  fi
+
+  local nm_vols
+  nm_vols=$(docker volume ls --format '{{.Name}}' | grep '_node_modules$') || true
+  if [[ -n "$nm_vols" ]]; then
+    while IFS= read -r vol; do
+      local mounted_by
+      mounted_by=$(docker ps -a -q --filter "volume=${vol}" 2>/dev/null) || true
+      if [[ -z "$mounted_by" ]]; then
+        _warn "Orphaned: ${vol}"
+        echo -e "    Fix: ${_B}aibox clean${_N}"
+        issues=$((issues + 1))
+      fi
+    done <<< "$nm_vols"
+  fi
+
+  # 3. Disk space
+  echo ""
+  echo -e "  ${_B}Disk space...${_N}"
+  local available_kb
+  available_kb=$(df -k "${HOME}" 2>/dev/null | awk 'NR==2 {print $4}') || true
+  if [[ -n "$available_kb" && "$available_kb" =~ ^[0-9]+$ ]]; then
+    local available_gb=$(( available_kb / 1048576 ))
+    if (( available_gb < 5 )); then
+      _warn "Low disk space: ${available_gb}GB free"
+      echo -e "    Fix: ${_B}aibox clean${_N}"
+      issues=$((issues + 1))
+    else
+      _ok "Disk space: ${available_gb}GB free"
+    fi
+  fi
+
+  docker system df --format '{{.Type}}\t{{.Size}}\t{{.Reclaimable}}' 2>/dev/null | while IFS=$'\t' read -r dtype dsize dreclaimable; do
+    echo -e "    ${dtype}: ${dsize} (reclaimable: ${dreclaimable})"
+  done
+
+  # 4. Image version
+  echo ""
+  echo -e "  ${_B}Image...${_N}"
+  if docker image inspect "$IMAGE" &>/dev/null; then
+    local img_version
+    img_version=$(docker inspect "$IMAGE" --format '{{index .Config.Labels "aibox.version"}}' 2>/dev/null || echo "")
+    if [[ "$img_version" != "$AIBOX_VERSION" ]]; then
+      _warn "Image outdated: v${img_version:-unknown} (script: v${AIBOX_VERSION})"
+      echo -e "    Fix: ${_B}aibox build${_N}"
+      issues=$((issues + 1))
+    else
+      _ok "Image: v${AIBOX_VERSION}"
+    fi
+
+    # Check running containers against current image
+    if [[ -n "$running" ]]; then
+      local latest_id
+      latest_id=$(docker inspect "$IMAGE" --format '{{.Id}}' 2>/dev/null || echo "")
+      while IFS= read -r c; do
+        local c_img_id
+        c_img_id=$(docker inspect "$c" --format '{{.Image}}' 2>/dev/null || echo "")
+        if [[ -n "$c_img_id" && -n "$latest_id" && "$c_img_id" != "$latest_id" ]]; then
+          _warn "Container ${c} uses outdated image"
+          echo -e "    Fix: ${_B}aibox down && aibox up${_N}"
+          issues=$((issues + 1))
+        fi
+      done <<< "$running"
+    fi
+  else
+    _warn "Image '${IMAGE}' not found"
+    echo -e "    Fix: ${_B}aibox build${_N}"
+    issues=$((issues + 1))
+  fi
+
+  # 5. Dependencies
+  echo ""
+  echo -e "  ${_B}Dependencies...${_N}"
+  local deps_ok=true
+  command -v docker &>/dev/null || { _warn "docker not found"; deps_ok=false; issues=$((issues + 1)); }
+  { docker compose version &>/dev/null || command -v docker-compose &>/dev/null; } \
+    || { _warn "docker compose not found"; deps_ok=false; issues=$((issues + 1)); }
+  docker info &>/dev/null \
+    || { _warn "Docker daemon not running"; deps_ok=false; issues=$((issues + 1)); }
+  [[ "$deps_ok" == "true" ]] && _ok "All dependencies present"
+
+  # Summary
+  echo ""
+  if [[ "$issues" -eq 0 ]]; then
+    _ok "No issues found."
+  else
+    _warn "${issues} issue(s) found. Run ${_B}aibox clean${_N} to fix most."
+  fi
+}
+
 _init_files() {
   write_project_compose
   save_project_conf
@@ -1909,6 +2357,9 @@ case "${1:-help}" in
   down)     cmd_down ;;
   status)   cmd_status ;;
   volumes)  cmd_volumes ;;
+  disk)     cmd_disk ;;
+  clean)    cmd_clean "$@" ;;
+  doctor)   cmd_doctor ;;
   nuke)     cmd_nuke ;;
   build)    cmd_build ;;
   init)     cmd_init ;;

@@ -129,10 +129,20 @@ Uses a lightweight sidecar container (`alpine/socat`) on the same Docker network
 ```bash
 aibox status              # list all aibox containers
 aibox volumes             # list copy volumes and worktrees
+aibox disk                # show disk usage breakdown
+aibox clean               # clean everything (containers, volumes, images, sessions)
+aibox clean --volumes     # only orphaned volumes
+aibox clean --containers  # only stopped containers
+aibox clean --sessions 7  # only session data older than 7 days (default: 30)
+aibox clean --docker      # only dangling images + build cache
+aibox clean --force       # skip confirmation
+aibox doctor              # diagnose common issues
 aibox down --clean        # also remove copy volumes / worktrees
 aibox down --all          # stop all containers for this project
 aibox nuke                # remove ALL aibox containers
 ```
+
+Containers auto-stop when the last `claude` or `shell` session exits.
 
 ## Security modes
 
@@ -203,6 +213,7 @@ Customize the Dockerfile at `~/.config/aibox/Dockerfile`.
 | | `--shared-modules` | Share node_modules between host and container |
 | | `--all` | With `down`: stop all project containers |
 | | `--clean` | With `down`: also remove copy volumes / worktrees |
+| | `--force` | With `clean`: skip confirmation prompts |
 
 ## Config
 
