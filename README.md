@@ -210,7 +210,6 @@ Customize the Dockerfile at `~/.config/aibox/Dockerfile`.
 | `-w` | `--worktree` | Use git worktree (lightweight isolation) |
 | `-y` | `--yolo` | Skip prompts, full sudo, no firewall |
 | `-s` | `--safe` | Keep prompts, restricted sudo, firewall on |
-| | `--shared-modules` | Share node_modules between host and container |
 | | `--all` | With `down`: stop all project containers |
 | | `--clean` | With `down`: also remove copy volumes / worktrees |
 | | `--force` | With `clean`: skip confirmation prompts |
@@ -221,7 +220,7 @@ Per-project settings in `.aibox`:
 
 ```
 IMAGE=aibox:latest
-SHARED_MODULES=false
+SHARED_MODULES=true
 ```
 
 ## Contributing

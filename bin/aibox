@@ -44,7 +44,8 @@
 #   -w, --worktree        Use git worktree (lightweight isolation, stays on host)
 #   -y, --yolo            Yolo mode: skip permissions, full sudo, no firewall
 #   -s, --safe            Safe mode: keep permissions, restricted sudo, firewall on
-#   --shared-modules      Share node_modules between host and container
+#   --shared-modules      Share node_modules between host and container (default)
+#   --separate-modules    Isolate node_modules in a Docker volume
 #   --force               Skip confirmation prompts (for clean)
 #
 # Network firewall:
@@ -234,7 +235,7 @@ _check_deps() {
 
 # ── Parse global flags ───────────────────────────────────────────
 IMAGE="$DEFAULT_IMAGE"
-SHARED_MODULES=false
+SHARED_MODULES=true
 INSTANCE_NAME=""
 PROJECT_DIR_FLAG=""
 REPO_URL=""
@@ -272,6 +273,10 @@ parse_flags() {
         ;;
       --shared-modules)
         SHARED_MODULES=true
+        shift
+        ;;
+      --separate-modules)
+        SHARED_MODULES=false
         shift
         ;;
       -c|--copy)
@@ -440,8 +445,8 @@ load_project_conf() {
     if [[ "$IMAGE" == "$DEFAULT_IMAGE" && -n "$conf_image" ]]; then
       IMAGE="$conf_image"
     fi
-    if [[ "$SHARED_MODULES" == "false" && "$conf_shared" == "true" ]]; then
-      SHARED_MODULES=true
+    if [[ -n "$conf_shared" ]]; then
+      SHARED_MODULES="$conf_shared"
     fi
   fi
 }
