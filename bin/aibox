@@ -1,2379 +1,1710 @@
 #!/usr/bin/env bash
-# aibox - Run AI coding tools in isolated Docker containers.
+# aibox — persistent Docker sandboxes for Claude Code.
+#
+# One container per project. One shared home volume (aibox-home) holds all
+# Claude state. Nothing is ever deleted without asking.
 #
 # Usage:
-#   aibox up                      Start the container
-#   aibox claude [--yolo|--safe]  Open Claude Code
-#                [claude args]    --yolo: skip permissions, full sudo, no firewall
-#                                 --safe: keep permissions, restricted sudo, firewall on
-#                                 Extra args are passed through to claude
-#                                 (e.g. --resume, --print, --model)
-#   aibox shell                   Open a zsh shell in the container
-#   aibox shell <command>         Run a command in the container
-#   aibox down                    Stop and remove the container
-#   aibox down --clean            Also remove copy volumes / worktrees
-#   aibox down --all              Stop all containers for this project
-#   aibox port-forward PORT [PORT] Forward host port(s) to container
-#   aibox port-forward --list     List active port forwards
-#   aibox port-forward --stop P   Stop forwarding a port
-#   aibox port-forward --stop-all Stop all port forwards
-#   aibox status                  List all aibox containers
-#   aibox volumes                 List copy volumes and worktrees
-#   aibox disk                    Show disk usage breakdown
-#   aibox clean [DAYS]            Clean everything (default: 30 days)
-#     --containers                  Only stopped containers
-#     --volumes                     Only orphaned volumes
-#     --docker                      Only dangling images + build cache
-#     --sessions                    Only old Claude session data
-#   aibox doctor                  Diagnose common issues
-#   aibox nuke                    Remove ALL aibox containers (all projects)
-#   aibox build [--image NAME]    Build the base image
-#   aibox init [flags]            Generate compose.dev.yaml + configure WebStorm
-#   aibox update                   Update aibox to the latest version
-#   aibox version                  Show version
-#   aibox help                    Show this help (default)
+#   aibox [claude] [args...]  Shorthand for `aibox run claude`: start/attach
+#                             this project's container and run Claude Code.
+#                             Permission prompts are on by default, with
+#                             bypass mode available in-session; pass --yolo
+#                             to skip all prompts from the start. Other args
+#                             pass to claude verbatim (--resume, -p,
+#                             --model, ...). `aibox --resume` works too.
+#   aibox run [--copy] <program> [args...]
+#                             Run any program in the container (e.g.
+#                             aibox run codex). With --copy (also on plain
+#                             aibox/claude), a disposable container on a
+#                             snapshot of the project is used instead — no
+#                             bind mount, the real directory can't be
+#                             touched, and the container is removed on exit
+#                             (commit & push from inside to keep work).
+#                             A `--` ends aibox's own flag parsing, so a
+#                             literal --copy/--yolo can reach the program.
+#   aibox serve               Run the sessions UI on port 45789 (dev-proxy
+#                             URL): start new phone/browser-drivable
+#                             sessions, resume past ones, see and stop live
+#                             ones. Each session is a detached claude
+#                             process in the container — it survives closing
+#                             the terminal and shows up at claude.ai / the
+#                             Claude app. `aibox serve stop` ends the UI and
+#                             every live session.
+#   aibox sessions            All projects' past sessions on one local page
+#                             (opens your browser; loopback-only, runs in
+#                             the foreground until Ctrl-C or its Close
+#                             button). Per session: open in a terminal, copy
+#                             the resume command, or make it phone-drivable.
+#   aibox rc-resume <id>      Make one past session of this project
+#                             drivable from claude.ai / the Claude app.
+#   aibox shell [cmd...]      zsh in the container. One argument runs as a
+#                             shell string (pipes/globs work); several run
+#                             as a safely-quoted command.
+#   aibox stop [--all]        Stop this project's container
+#                             (--all: every aibox container + proxy).
+#                             Never deletes anything; next run re-attaches.
+#   aibox status              Containers with live memory + disk use,
+#                             dev-server URLs, Docker disk totals, home
+#                             volume size
+#   aibox backup [dir]        Snapshot the aibox-home volume to a tar.gz
+#                             (default dir: ~/aibox-backups)
+#   aibox restore <file>      Restore a backup into aibox-home
+#                             (auto safety-backup of current state first)
+#   aibox update              Update the CLI; image rebuilds on next run
+#   aibox version             Show versions
+#   aibox help                Show this help
 #
-# Flags:
-#   -n, --name NAME       Run a named instance (e.g. -n refactor)
-#                         Allows multiple containers per project
-#   -d, --dir PATH        Run in a different project directory
-#   -r, --repo URL        Clone a git repo and run in it
-#   -b, --branch NAME     Branch to checkout (with --repo)
-#   -i, --image NAME      Override base Docker image (default: aibox:latest)
-#   -c, --copy            Copy project into container (full isolation, no host sync)
-#   -w, --worktree        Use git worktree (lightweight isolation, stays on host)
-#   -y, --yolo            Yolo mode: skip permissions, full sudo, no firewall
-#   -s, --safe            Safe mode: keep permissions, restricted sudo, firewall on
-#   --shared-modules      Share node_modules between host and container (default)
-#   --separate-modules    Isolate node_modules in a Docker volume
-#   --force               Skip confirmation prompts (for clean)
+# Dev servers: anything listening on any port inside the container is
+# reachable from the host browser at
+#   http://<port>.<project>.aibox.localhost
+# (Chrome/Edge/Firefox out of the box; Safari needs macOS 26+. No ports to
+# publish, no restarts — the proxy reaches the container over the Docker
+# network.) Inside the container, $AIBOX_URL_BASE holds
+# "<project>.aibox.localhost[:port]", and exported ANTHROPIC_* host vars
+# are forwarded.
 #
-# Network firewall:
-#   Default: only allows Claude API, npm, GitHub, PyPI, SSH, DNS.
-#   Add domains: export AIBOX_EXTRA_DOMAINS="example.com,api.myservice.io"
+# Config (~/.aibox/config, key=value, all optional):
+#   node_version=24           # base image: node:<this>-bookworm
+#   proxy_port=80             # host port for the dev-server proxy
+#   backup_dir=~/aibox-backups
+# Extra image layers: ~/.aibox/Dockerfile.extra is appended to the generated
+# Dockerfile (survives image rebuilds; plain apt installs survive stop/start
+# but reset when the image changes).
 #
-# Prerequisites:
-#   brew install colima docker docker-compose docker-buildx
-#   (or: brew install orbstack)
+# All Claude state lives in one Docker volume (aibox-home), sliced per
+# project: login, settings, and the claude binary are shared; each project
+# gets a private home (ssh keys, shell history, its own sessions) that other
+# projects' containers never mount. Needs Docker Engine 26+. Volumes from
+# older aibox versions are migrated automatically (safety backup first).
+# Containers are disposable; the volume is what `aibox backup` protects.
 #
-# First-time setup (once ever):
-#   aibox build
-#
-# Per-project:
-#   aibox up                           # start default container
-#   aibox claude                       # open Claude Code
-#   aibox claude --yolo                # skip permission prompts (sandboxed)
-#   aibox --name feat claude           # Claude Code in a second container
-#   aibox shell                        # zsh in the container
-#   aibox shell ls -la                 # run a command inline
-#   aibox down                         # stop default
-#   aibox down --all                   # stop all for this project
+# (This header is the output of `aibox help` — keep it accurate.)
 
 set -euo pipefail
+unset CDPATH
 
-# ── Script identity ──────────────────────────────────────────────
-SCRIPT_NAME="$(basename "$0")"
-AIBOX_VERSION="9"
-AIBOX_CLI_VERSION="__CLI_VERSION__"
-CONFIG_DIR="${HOME}/.config/aibox"
-DEFAULT_IMAGE="aibox:latest"
-CONTAINER_PREFIX="aibox"
+# Replaced by the release workflow; left as-is = running from a git
+# checkout, which behaves as version "dev".
+CLI_VERSION="__CLI_VERSION__"
+CONFIG_DIR="${HOME}/.aibox"
+VOLUME="aibox-home"
+NETWORK="aibox"
+PROXY="aibox-proxy"
+PROXY_IMAGE="caddy:2-alpine"
+HELPER_IMAGE="alpine:3.20"
 
-# ── Colors ────────────────────────────────────────────────────
-# Disable color if not a terminal or NO_COLOR is set
+# ── Output helpers ───────────────────────────────────────────────
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
-  _R='\033[0;31m'    _BR='\033[1;31m'
-  _Y='\033[0;33m'    _BY='\033[1;33m'
-  _G='\033[0;32m'    _BG='\033[1;32m'
-  _C='\033[0;36m'    _BC='\033[1;36m'
-  _M='\033[0;35m'
-  _B='\033[1m'       _D='\033[2m'
-  _N='\033[0m'
+  _G='\033[1;32m' _Y='\033[1;33m' _R='\033[1;31m' _D='\033[2m' _B='\033[1m' _N='\033[0m'
 else
-  _R='' _BR='' _Y='' _BY='' _G='' _BG='' _C='' _BC='' _M='' _B='' _D='' _N=''
+  _G='' _Y='' _R='' _D='' _B='' _N=''
 fi
+_ok()   { echo -e "${_G}✓${_N} $*"; }
+_info() { echo -e "${_D}·${_N} $*"; }
+_warn() { echo -e "${_Y}⚠${_N} $*"; }
+_die()  { echo -e "${_R}✗${_N} $*" >&2; exit 1; }
 
-# ── Output helpers ─────────────────────────────────────────────
-_step() {
-  local msg="$1"
-  local width=60
-  local pad
-  pad=$(( width - ${#msg} - 5 ))  # 5 = "── " + " ─"
-  [[ $pad -lt 3 ]] && pad=3
-  local line
-  line=$(printf '─%.0s' $(seq 1 "$pad"))
-  echo ""
-  echo -e "${_BC}── ${_B}${msg}${_N}${_BC} ${line}${_N}"
-  echo ""
-}
-
-_ok()   { echo -e "  ${_BG}✓${_N} $*"; }
-_warn() { echo -e "  ${_BY}⚠${_N} ${_BY}$1${_N}"; shift || true; if [[ $# -gt 0 ]]; then for line in "$@"; do echo -e "  $line"; done; fi; }
-_err()  { echo -e "  ${_BR}✗ Error:${_N} $*" >&2; }
-_info() { echo -e "  ${_D}ℹ${_N} $*"; }
-_file() { echo -e "${_C}$1${_N}"; }
-
-# ── Machine-aware Colima start ───────────────────────────────────
-_colima_start() {
-  local total_cpu total_mem_gb vm_cpu vm_mem vm_disk
-
-  # Detect machine resources
-  if [[ "$(uname)" == "Darwin" ]]; then
-    total_cpu=$(sysctl -n hw.ncpu 2>/dev/null || echo 4)
-    total_mem_gb=$(( $(sysctl -n hw.memsize 2>/dev/null || echo 8589934592) / 1073741824 ))
-  else
-    total_cpu=$(nproc 2>/dev/null || echo 4)
-    total_mem_gb=$(( $(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}' || echo 8388608) / 1048576 ))
-  fi
-
-  # Allocate half CPU (min 2, max 4), half RAM (min 4GB, max 8GB), 100GB disk
-  vm_cpu=$(( total_cpu / 2 ))
-  [[ $vm_cpu -lt 2 ]] && vm_cpu=2
-  [[ $vm_cpu -gt 4 ]] && vm_cpu=4
-  vm_mem=$(( total_mem_gb / 2 ))
-  [[ $vm_mem -lt 4 ]] && vm_mem=4
-  [[ $vm_mem -gt 8 ]] && vm_mem=8
-  vm_disk=100
-
-  echo "Detected: ${total_cpu} CPUs, ${total_mem_gb}GB RAM"
-  echo "Colima VM: ${vm_cpu} CPUs, ${vm_mem}GB RAM, ${vm_disk}GB disk"
-
-  # Try Apple Virtualization framework first (fast), fall back to QEMU
-  colima start \
-    --cpu "$vm_cpu" --memory "$vm_mem" --disk "$vm_disk" \
-    --vm-type vz --vz-rosetta 2>/dev/null \
-  || colima start \
-    --cpu "$vm_cpu" --memory "$vm_mem" --disk "$vm_disk"
-}
-
-# ── Dependency check ─────────────────────────────────────────────
-_check_deps() {
-  local missing=()
-
-  command -v docker &>/dev/null || missing+=("docker")
-  command -v docker-compose &>/dev/null || docker compose version &>/dev/null || missing+=("docker-compose")
-
-  if [[ ${#missing[@]} -eq 0 ]]; then
-    # Docker CLI exists — check if daemon is reachable
-    if ! docker info &>/dev/null; then
-      if command -v colima &>/dev/null; then
-        echo "Docker daemon not running. Starting Colima..."
-        _colima_start
-      elif [[ -d "/Applications/OrbStack.app" ]]; then
-        echo "Docker daemon not running. Starting OrbStack..."
-        open -a OrbStack
-        local i=0
-        while ! docker info &>/dev/null && [[ $i -lt 30 ]]; do
-          sleep 1
-          i=$((i + 1))
-        done
-        if ! docker info &>/dev/null; then
-          echo "OrbStack started but Docker daemon not ready. Try again in a moment." >&2
-          exit 1
-        fi
-      elif [[ -d "/Applications/Docker.app" ]]; then
-        echo "Docker daemon not running. Starting Docker Desktop..."
-        open -a Docker
-        local i=0
-        while ! docker info &>/dev/null && [[ $i -lt 60 ]]; do
-          sleep 1
-          i=$((i + 1))
-        done
-        if ! docker info &>/dev/null; then
-          echo "Docker Desktop started but daemon not ready. Try again in a moment." >&2
-          exit 1
-        fi
-      else
-        echo "Docker daemon not running. Install Docker Desktop, Colima, or OrbStack." >&2
-        exit 1
-      fi
-    fi
-    return
-  fi
-
-  # Something is missing — offer to install
-  if ! command -v brew &>/dev/null; then
-    echo "Homebrew is required to install Docker dependencies."
-    echo "Will run: /bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\""
-    echo ""
-    if _confirm_yes "Install Homebrew?"; then
-      /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-      if [[ -f /opt/homebrew/bin/brew ]]; then
-        eval "$(/opt/homebrew/bin/brew shellenv)"
-      elif [[ -f /usr/local/bin/brew ]]; then
-        eval "$(/usr/local/bin/brew shellenv)"
-      fi
-      if ! command -v brew &>/dev/null; then
-        echo "Homebrew installed but not in PATH. Open a new terminal and re-run ${SCRIPT_NAME}." >&2
-        exit 1
-      fi
-    else
-      echo "Aborted. Install Homebrew (https://brew.sh) then re-run ${SCRIPT_NAME}." >&2
-      exit 1
-    fi
-  fi
-
-  echo "Missing dependencies: ${missing[*]}"
-  echo "Will install via Homebrew: colima docker docker-compose docker-buildx"
-  echo ""
-  if _confirm_yes "Install now?"; then
-    brew install colima docker docker-compose docker-buildx
-
-    mkdir -p ~/.docker/cli-plugins
-    ln -sfn "$(brew --prefix)/opt/docker-compose/bin/docker-compose" ~/.docker/cli-plugins/docker-compose
-
-    echo ""
-    echo "Starting Colima..."
-    _colima_start
-    echo "Docker is ready."
-  else
-    echo "Aborted. Install manually:" >&2
-    echo "  brew install colima docker docker-compose docker-buildx" >&2
-    exit 1
-  fi
-}
-
-# ── Parse global flags ───────────────────────────────────────────
-IMAGE="$DEFAULT_IMAGE"
-SHARED_MODULES=true
-INSTANCE_NAME=""
-PROJECT_DIR_FLAG=""
-REPO_URL=""
-REPO_BRANCH=""
-DOWN_ALL=false
-DOWN_CLEAN=false
-FORCE_CLEAN=false
-SKIP_PERMISSIONS=false
-SAFE_MODE=false
-ISOLATION=""
-POSITIONAL=()
-
-parse_flags() {
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      -i|--image)
-        IMAGE="${2:?'--image requires a value'}"
-        shift 2
-        ;;
-      -n|--name)
-        INSTANCE_NAME="${2:?'--name requires a value'}"
-        shift 2
-        ;;
-      -d|--dir)
-        PROJECT_DIR_FLAG="${2:?'--dir requires a value'}"
-        shift 2
-        ;;
-      -r|--repo)
-        REPO_URL="${2:?'--repo requires a value'}"
-        shift 2
-        ;;
-      -b|--branch)
-        REPO_BRANCH="${2:?'--branch requires a value'}"
-        shift 2
-        ;;
-      --shared-modules)
-        SHARED_MODULES=true
-        shift
-        ;;
-      --separate-modules)
-        SHARED_MODULES=false
-        shift
-        ;;
-      -c|--copy)
-        [[ -n "$ISOLATION" ]] && { echo "Error: --copy and --worktree are mutually exclusive" >&2; exit 1; }
-        ISOLATION="copy"
-        shift
-        ;;
-      -w|--worktree)
-        [[ -n "$ISOLATION" ]] && { echo "Error: --copy and --worktree are mutually exclusive" >&2; exit 1; }
-        ISOLATION="worktree"
-        shift
-        ;;
-      --all)
-        DOWN_ALL=true
-        shift
-        ;;
-      --clean)
-        DOWN_CLEAN=true
-        shift
-        ;;
-      --force)
-        FORCE_CLEAN=true
-        shift
-        ;;
-      -y|--yolo)
-        SKIP_PERMISSIONS=true
-        shift
-        ;;
-      -s|--safe)
-        SAFE_MODE=true
-        shift
-        ;;
-      *)
-        POSITIONAL+=("$1")
-        shift
-        ;;
+# ── Config ───────────────────────────────────────────────────────
+NODE_VERSION=24
+PROXY_PORT=80
+BACKUP_DIR="${HOME}/aibox-backups"
+if [[ -f "${CONFIG_DIR}/config" ]]; then
+  # `|| [[ -n "$k" ]]`: don't drop the last line when the file has no
+  # trailing newline.
+  while IFS='=' read -r k v || [[ -n "$k" ]]; do
+    [[ "$k" == \#* || -z "$k" || -z "$v" ]] && continue
+    v="${v/#\~/$HOME}"
+    case "$k" in
+      node_version) NODE_VERSION="$v" ;;
+      proxy_port)   PROXY_PORT="$v" ;;
+      backup_dir)   BACKUP_DIR="$v" ;;
     esac
-  done
-}
-
-parse_flags "$@"
-if [[ ${#POSITIONAL[@]} -gt 0 ]]; then
-  set -- "${POSITIONAL[@]}"
-else
-  set --
+  done < "${CONFIG_DIR}/config"
 fi
+mkdir -p "$CONFIG_DIR"
 
-# Set container mode from flags (cmd_claude may override via interactive prompt)
-if [[ "$SKIP_PERMISSIONS" == "true" ]]; then
-  export AIBOX_MODE="yolo"
-elif [[ "$SAFE_MODE" == "true" ]]; then
-  export AIBOX_MODE="safe"
-fi
+# ── Derived names ────────────────────────────────────────────────
+PROJECT_DIR="$(pwd -P)"
+SLUG="$(basename "$PROJECT_DIR" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]/-/g; s/_/-/g')"
+HASH6="$(printf '%s' "$PROJECT_DIR" | { sha256sum || shasum -a 256; } 2>/dev/null | cut -c1-6)"
+# Name format aibox-<slug>-<hash6> is load-bearing: _proxy_pairs extracts
+# the trailing hash6 with ${name##*-} for slug-collision URLs.
+CONTAINER="aibox-${SLUG}-${HASH6}"
+VERSION_TAG="$CLI_VERSION"
+[[ "$VERSION_TAG" == "__CLI_VERSION__" ]] && VERSION_TAG="dev"
+# VERSION_TAG also names backups (aibox-home-<tag>-<time>.tar.gz).
+IMAGE="aibox:${VERSION_TAG}-node${NODE_VERSION}"
 
-# ── Repo clone ───────────────────────────────────────────────────
-if [[ -n "$REPO_URL" ]]; then
-  # Derive a directory name from the repo URL (hash prevents collisions)
-  _repo_name=$(basename "$REPO_URL" .git)
-  _repo_hash=$(printf '%s' "$REPO_URL" | shasum | cut -c1-6)
-  _repo_dir="${CONFIG_DIR}/repos/${_repo_name}-${_repo_hash}"
-
-  if [[ -d "$_repo_dir/.git" ]]; then
-    echo "Repo already cloned (${_repo_dir}). Reusing."
-    # Fetch latest and checkout branch if specified
-    if [[ -n "$REPO_BRANCH" ]]; then
-      git -C "$_repo_dir" fetch --all --quiet 2>/dev/null || true
-      git -C "$_repo_dir" checkout "$REPO_BRANCH" 2>/dev/null || true
-    fi
-  else
-    echo "Cloning ${REPO_URL}..."
-    mkdir -p "${CONFIG_DIR}/repos"
-    _clone_args=(--recursive)
-    [[ -n "$REPO_BRANCH" ]] && _clone_args+=(--branch "$REPO_BRANCH")
-    git clone "${_clone_args[@]}" "$REPO_URL" "$_repo_dir"
-  fi
-
-  PROJECT_DIR_FLAG="$_repo_dir"
-fi
-
-# ── Per-project config file (.aibox) ─────────────────────────────
-if [[ -n "$PROJECT_DIR_FLAG" ]]; then
-  PROJECT_DIR="$(cd "$PROJECT_DIR_FLAG" 2>/dev/null && pwd)" || {
-    echo "Error: directory not found: $PROJECT_DIR_FLAG" >&2
-    exit 1
-  }
-else
-  PROJECT_DIR="$(pwd)"
-fi
-PROJECT_CONF="${PROJECT_DIR}/.aibox"
-
-# Git root may differ from PROJECT_DIR (subfolder of a repo)
-GIT_ROOT=$(git -C "$PROJECT_DIR" rev-parse --show-toplevel 2>/dev/null || true)
-
-# ── Safety: refuse to run in dangerous directories ───────────────
-_is_safe_project_dir() {
-  local dir="$1"
-  case "$dir" in
-    "$HOME"|/|/tmp|/var|/etc|/usr|/opt|/private|/private/tmp)
-      return 1 ;;
-  esac
-  return 0
-}
-
+# ── Small helpers ────────────────────────────────────────────────
 _require_safe_dir() {
-  if ! _is_safe_project_dir "$PROJECT_DIR"; then
-    echo "Error: refusing to run in ${PROJECT_DIR}" >&2
-    echo "Run ${SCRIPT_NAME} from inside a project directory." >&2
-    exit 1
-  fi
+  case "$PROJECT_DIR" in
+    "$HOME"|/|/tmp|/var|/etc|/usr|/opt|/private|/private/tmp)
+      _die "Refusing to sandbox ${PROJECT_DIR} — run aibox from inside a project directory." ;;
+    *:*)
+      _die "Project path contains ':' — docker cannot bind-mount it. Rename the directory." ;;
+  esac
 }
 
-# ── Confirmation prompts ─────────────────────────────────────────
-_confirm_yes() {
-  local msg="$1" reply
-  printf "%s [Y/n] " "$msg" >&2
-  read -r reply
-  [[ ! "$reply" =~ ^[Nn]$ ]]
-}
-
-_confirm_no() {
-  local msg="$1" reply
-  printf "%s [y/N] " "$msg" >&2
+_confirm() {
+  local reply
+  printf '%s [y/N] ' "$1" >&2
   read -r reply
   [[ "$reply" =~ ^[Yy]$ ]]
 }
 
-# ── Disk space check ──────────────────────────────────────────────
-_check_disk_space() {
-  local required_gb="${1:-5}" context="${2:-operation}"
-  local available_kb
-
-  # Check host filesystem
-  available_kb=$(df -k "$PROJECT_DIR" 2>/dev/null | awk 'NR==2 {print $4}')
-
-  if [[ -z "$available_kb" || ! "$available_kb" =~ ^[0-9]+$ ]]; then
-    return 0  # Can't determine — don't block
-  fi
-
-  local available_gb=$(( available_kb / 1048576 ))
-
-  if (( available_kb < required_gb * 1048576 )); then
-    _err "${context} needs ~${_B}${required_gb}GB${_N} free, but only ${_B}${available_gb}GB${_N} available."
-    echo -e "  Free up disk space and try again." >&2
-    exit 1
-  fi
-
-  if (( available_kb < required_gb * 1048576 * 2 )); then
-    _warn "Low disk space (${available_gb}GB free, ${context} needs ~${required_gb}GB)."
-  fi
+# Container state, or "absent". (docker inspect emits a stray newline on
+# stdout for missing objects, so trim before defaulting.)
+_state() {
+  local s
+  s="$(docker inspect "$1" --format '{{.State.Status}}' 2>/dev/null | tr -d '[:space:]')"
+  echo "${s:-absent}"
 }
 
-# ── Project config persistence ───────────────────────────────────
-save_project_conf() {
-  cat > "$PROJECT_CONF" << EOF
-# Auto-generated by ${SCRIPT_NAME}. Safe to edit.
-IMAGE=${IMAGE}
-SHARED_MODULES=${SHARED_MODULES}
-EOF
+# ── Docker runtime ───────────────────────────────────────────────
+_ensure_docker() {
+  command -v docker >/dev/null 2>&1 \
+    || _die "docker CLI not found. Install a runtime first, e.g.: brew install colima docker && colima start"
+  docker info >/dev/null 2>&1 && return 0
+  if command -v colima >/dev/null 2>&1; then
+    _info "Docker daemon not running. Starting Colima..."
+    colima start
+  elif [[ -d /Applications/OrbStack.app ]]; then
+    _info "Docker daemon not running. Starting OrbStack..."
+    open -a OrbStack
+  elif [[ -d /Applications/Docker.app ]]; then
+    _info "Docker daemon not running. Starting Docker Desktop..."
+    open -a Docker
+  else
+    _die "Docker daemon not running. Start it (Linux: sudo systemctl start docker; macOS: open your Docker app) and retry."
+  fi
+  local i=0
+  until docker info >/dev/null 2>&1; do
+    (( i++ >= 60 )) && _die "Docker daemon did not come up. Try again in a moment."   # 60s
+    sleep 1
+  done
 }
 
-load_project_conf() {
-  if [[ -f "$PROJECT_CONF" ]]; then
-    local conf_image conf_shared
-    conf_image=$(grep '^IMAGE=' "$PROJECT_CONF" | cut -d= -f2- || true)
-    conf_shared=$(grep '^SHARED_MODULES=' "$PROJECT_CONF" | cut -d= -f2- || true)
-    if [[ "$IMAGE" == "$DEFAULT_IMAGE" && -n "$conf_image" ]]; then
-      IMAGE="$conf_image"
-    fi
-    if [[ -n "$conf_shared" ]]; then
-      SHARED_MODULES="$conf_shared"
-    fi
-  fi
-}
+# ── Image ────────────────────────────────────────────────────────
+_build_image() {
+  # Unquoted heredoc so ${NODE_VERSION} interpolates — hence the \\ and
+  # \$PATH escapes. Don't quote the delimiter.
+  cat > "${CONFIG_DIR}/Dockerfile" <<DOCKERFILE
+FROM node:${NODE_VERSION}-bookworm
 
-load_project_conf
+RUN apt-get update \\
+ && apt-get install -y --no-install-recommends zsh sudo ripgrep fzf jq less procps curl \\
+ && rm -rf /var/lib/apt/lists/*
 
-# ── Validate image name ──────────────────────────────────────────
-if ! [[ "$IMAGE" =~ ^[a-zA-Z0-9._/-]+(:[a-zA-Z0-9._-]+)?$ ]]; then
-  echo "Error: invalid image name: $IMAGE" >&2
-  exit 1
-fi
+# The base image ships user 'node' at uid 1000; replace it with 'aibox'
+RUN userdel -r node 2>/dev/null || true \\
+ && useradd -m -u 1000 -s /usr/bin/zsh aibox \\
+ && echo "aibox ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/aibox \\
+ && chmod 0440 /etc/sudoers.d/aibox
 
-# ── Derived names ────────────────────────────────────────────────
-PROJECT_NAME="$(basename "$PROJECT_DIR" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]/-/g')"
-PROJECT_HASH="$(printf '%s' "$PROJECT_DIR" | shasum | cut -c1-6)"
-BASE_CONTAINER_NAME="${CONTAINER_PREFIX}-${PROJECT_NAME}-${PROJECT_HASH}"
-
-if [[ -z "$INSTANCE_NAME" ]]; then
-  INSTANCE_NAME="main"
-fi
-if ! [[ "$INSTANCE_NAME" =~ ^[a-z0-9_-]+$ ]]; then
-  echo "Error: --name must be lowercase alphanumeric, dashes, underscores" >&2
-  exit 1
-fi
-CONTAINER_NAME="${BASE_CONTAINER_NAME}-${INSTANCE_NAME}"
-WORKSPACE_DIR="${PROJECT_DIR}"
-
-# ── Isolation mode setup ─────────────────────────────────────────
-COPY_VOLUME=""
-WORKTREE_DIR=""
-
-if [[ "$ISOLATION" == "copy" ]]; then
-  COPY_VOLUME="${CONTAINER_NAME}-src"
-elif [[ "$ISOLATION" == "worktree" ]]; then
-  WORKTREE_DIR="${CONFIG_DIR}/worktrees/${CONTAINER_NAME}"
-fi
-
-# Detect isolation mode from existing container label (reconnect support)
-if [[ -z "$ISOLATION" ]]; then
-  _existing_isolation=$(docker inspect "$CONTAINER_NAME" --format '{{index .Config.Labels "aibox.isolation"}}' 2>/dev/null || echo "")
-  if [[ "$_existing_isolation" == "copy" ]]; then
-    ISOLATION="copy"
-    COPY_VOLUME="${CONTAINER_NAME}-src"
-  elif [[ "$_existing_isolation" == "worktree" ]]; then
-    ISOLATION="worktree"
-    WORKTREE_DIR="${CONFIG_DIR}/worktrees/${CONTAINER_NAME}"
-  fi
-fi
-
-# Set container-side workspace path (short paths for isolated modes, host path for IDE bind mount)
-if [[ "$ISOLATION" == "copy" ]]; then
-  WORKSPACE_DIR="/workspace/${PROJECT_NAME}"
-elif [[ "$ISOLATION" == "worktree" ]]; then
-  WORKSPACE_DIR="/workspace/${PROJECT_NAME}-${INSTANCE_NAME}"
-fi
-
-# ── Dockerfile management ────────────────────────────────────────
-ensure_dockerfile() {
-  mkdir -p "$CONFIG_DIR"
-  local dockerfile="${CONFIG_DIR}/Dockerfile"
-  local version_file="${CONFIG_DIR}/version"
-  local current_version=""
-
-  # Check if Dockerfile needs regeneration
-  if [[ -f "$version_file" ]]; then
-    current_version=$(cat "$version_file")
-  fi
-
-  if [[ "$current_version" != "$AIBOX_VERSION" || ! -f "$dockerfile" ]]; then
-    if [[ -f "$dockerfile" && "$current_version" != "$AIBOX_VERSION" ]]; then
-      echo "Dockerfile outdated (v${current_version} → v${AIBOX_VERSION}). Regenerating (one-time)..."
-    fi
-    cat > "$dockerfile" << DOCKERFILE
-FROM node:20-alpine
-
-LABEL aibox.version="${AIBOX_VERSION}"
-
-RUN apk add --no-cache \\
-    git \\
-    git-lfs \\
-    curl \\
-    ripgrep \\
-    bash \\
-    zsh \\
-    sudo \\
-    openssh-client \\
-    python3 \\
-    make \\
-    g++ \\
-    iptables \\
-    ip6tables \\
-    bind-tools \\
-    su-exec
-
-RUN git lfs install
-
-# Create non-root user (sudo configured at runtime by entrypoint based on mode)
-RUN adduser -D -s /bin/zsh aibox
-
-# Copy entrypoint (runs as root, sets up firewall + sudo, drops to aibox)
-COPY entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh
-
-# Install Claude Code as aibox user via native installer
-USER aibox
 ENV PATH="/home/aibox/.local/bin:\$PATH"
-RUN curl -fsSL https://claude.ai/install.sh | bash
 
-WORKDIR /workspace
-
-# Entrypoint runs as root, then execs sleep as aibox
-USER root
-ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+COPY entrypoint.sh /usr/local/bin/aibox-entrypoint
+RUN chmod +x /usr/local/bin/aibox-entrypoint
+ENTRYPOINT ["/usr/local/bin/aibox-entrypoint"]
 CMD ["sleep", "infinity"]
 DOCKERFILE
-
-    # Generate entrypoint script (runs as root at container start)
-    cat > "${CONFIG_DIR}/entrypoint.sh" << 'ENTRYPOINT'
+  [[ -f "${CONFIG_DIR}/Dockerfile.extra" ]] && cat "${CONFIG_DIR}/Dockerfile.extra" >> "${CONFIG_DIR}/Dockerfile"
+  # Keep stray files in ~/.aibox (config, Caddyfile, caches) out of the build
+  # context.
+  printf '*\n!Dockerfile\n!entrypoint.sh\n' > "${CONFIG_DIR}/.dockerignore"
+  cat > "${CONFIG_DIR}/entrypoint.sh" <<'ENTRYPOINT'
 #!/bin/bash
 set -e
-
-# Fix volume ownership (Docker creates volumes as root)
-chown -R aibox:aibox /home/aibox/.claude 2>/dev/null || true
-if [[ -n "${AIBOX_WORKSPACE:-}" && -d "${AIBOX_WORKSPACE}/node_modules" ]]; then
-  chown aibox:aibox "${AIBOX_WORKSPACE}/node_modules" 2>/dev/null || true
+rm -f /tmp/aibox-ready
+# /home/aibox is a named volume; normalize ownership on every container start
+# (data migrated from v1 or restored from backups may carry other UIDs).
+chown -R aibox:aibox /home/aibox 2>/dev/null || true
+# A fresh volume has no .zshrc — without one, the first interactive zsh
+# opens the zsh-newuser-install questionnaire.
+if [[ ! -e /home/aibox/.zshrc ]]; then
+  printf 'autoload -Uz compinit && compinit\nPROMPT="%%F{cyan}%%1~%%f %%# "\n' > /home/aibox/.zshrc
+  chown aibox:aibox /home/aibox/.zshrc
 fi
+# Claude Code deletes transcripts idle >30 days by default; raise that once
+# so session history is permanent. Never touches an existing value, skips
+# an unparseable file.
+node -e '
+const fs=require("fs"),p="/home/aibox/.claude/settings.json";
+let s={};
+if(fs.existsSync(p)){try{s=JSON.parse(fs.readFileSync(p,"utf8"))}catch(e){process.exit(0)}}
+if(s.cleanupPeriodDays==null){s.cleanupPeriodDays=3650;fs.writeFileSync(p,JSON.stringify(s,null,2));}
+' 2>/dev/null || true
+chown aibox:aibox /home/aibox/.claude/settings.json 2>/dev/null || true
+# Teach every session how to find and revive this project's past sessions.
+CM=/home/aibox/.claude/CLAUDE.md
+if ! grep -q 'aibox:sessions' "$CM" 2>/dev/null; then
+  cat >> "$CM" <<'NOTES'
 
-# ── Mode-dependent setup ──────────────────────────────────────
-MODE="${AIBOX_MODE:-safe}"
-
-if [[ "$MODE" == "yolo" ]]; then
-  # YOLO: full sudo, no firewall
-  echo "aibox ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/aibox
-  echo "[aibox] Mode: yolo (full sudo, no firewall)"
-
-else
-  # SAFE: restricted sudo (chown only), firewall active
-  echo "aibox ALL=(root) NOPASSWD: /bin/chown *" > /etc/sudoers.d/aibox
-
-  # ── Firewall setup ──────────────────────────────────────────
-  ALLOWED_DOMAINS=(
-    # Claude Code / Anthropic
-    "api.anthropic.com"
-    "claude.ai"
-    "statsig.anthropic.com"
-    "statsig.com"
-    "sentry.io"
-    # npm
-    "registry.npmjs.org"
-    # GitHub
-    "github.com"
-    "api.github.com"
-    # PyPI
-    "pypi.org"
-    "files.pythonhosted.org"
-  )
-
-  # Extra domains from env var (comma-separated)
-  if [[ -n "${AIBOX_EXTRA_DOMAINS:-}" ]]; then
-    IFS=',' read -ra EXTRA <<< "$AIBOX_EXTRA_DOMAINS"
-    ALLOWED_DOMAINS+=("${EXTRA[@]}")
-  fi
-
-  echo "Configuring firewall..."
-
-  # Flush existing
-  iptables -F OUTPUT 2>/dev/null || true
-
-  # Allow loopback
-  iptables -A OUTPUT -o lo -j ACCEPT
-
-  # Allow established/related
-  iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
-
-  # Allow DNS
-  iptables -A OUTPUT -p udp --dport 53 -j ACCEPT
-  iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT
-
-  # Allow SSH (git over SSH)
-  iptables -A OUTPUT -p tcp --dport 22 -j ACCEPT
-
-  # Resolve and allow each domain
-  for domain in "${ALLOWED_DOMAINS[@]}"; do
-    domain=$(echo "$domain" | xargs)
-    [[ -z "$domain" ]] && continue
-    ips=$(dig +short A "$domain" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' || true)
-    for ip in $ips; do
-      iptables -A OUTPUT -d "$ip" -j ACCEPT
-    done
-  done
-
-  # Allow Docker host (IDE integration)
-  host_ip=$(getent hosts host.docker.internal 2>/dev/null | awk '{print $1}' || true)
-  if [[ -n "$host_ip" ]]; then
-    iptables -A OUTPUT -d "$host_ip" -j ACCEPT
-  fi
-
-  # Default deny
-  iptables -A OUTPUT -j DROP
-
-  echo "[aibox] Mode: safe (firewall active, ${#ALLOWED_DOMAINS[@]} domains allowed)"
+<!-- aibox:sessions -->
+- Past Claude sessions of this project are JSONL files under `~/.claude/projects/*/` — grep them to find one; the filename (minus .jsonl) is the session id.
+- To make a past session controllable from claude.ai / the Claude phone app: `nohup script -qfc "claude --resume <session-id> --remote-control" /dev/null >/dev/null 2>&1 &` — it appears in the claude.ai session list within seconds.
+- To start a brand-new session there instead: same command with `--session-id $(cat /proc/sys/kernel/random/uuid)` in place of `--resume <session-id>`.
+NOTES
+  chown aibox:aibox "$CM" 2>/dev/null || true
 fi
-
-chmod 0440 /etc/sudoers.d/aibox
-
-# Drop to aibox user and exec CMD (su-exec preserves env and properly execs)
-exec su-exec aibox "$@"
+# First start with an empty home volume: install Claude Code into the volume
+# so the binary and its self-updates persist across container recreation.
+# (Anything baked into the image's home dir would be shadowed by the mount.)
+if [[ ! -x /home/aibox/.local/bin/claude ]]; then
+  runuser -u aibox -- bash -c 'curl -fsSL --connect-timeout 15 https://claude.ai/install.sh | bash' || true
+fi
+# Signals "start-up work finished" to the CLI (see _ensure_claude_bin).
+touch /tmp/aibox-ready
+exec "$@"
 ENTRYPOINT
-    echo "$AIBOX_VERSION" > "$version_file"
-    echo "Created Dockerfile (v${AIBOX_VERSION})"
-  fi
+  _info "Building ${IMAGE} (one-time; rebuilt only when aibox is updated or node_version changes)..."
+  docker build --pull -t "$IMAGE" "$CONFIG_DIR"
+  _ok "Image built."
 }
 
-# ── Uncommitted changes helper ────────────────────────────────────
-# Detects uncommitted changes (tracked + untracked) and offers to include them.
-# Sets INCLUDE_UNCOMMITTED=true and populates temp files if user says yes.
-INCLUDE_UNCOMMITTED=false
-UNCOMMITTED_DIFF=""
-UNCOMMITTED_UNTRACKED_TAR=""
+_ensure_image() {
+  docker image inspect "$IMAGE" >/dev/null 2>&1 || _build_image
+}
 
-_check_uncommitted() {
-  [[ -z "$GIT_ROOT" ]] && return 0
+# ── Dev-server proxy (Caddy) ─────────────────────────────────────
+# One shared reverse proxy on the aibox network. Any request to
+# <port>.<slug>.aibox.localhost is proxied to <container>:<port> over the
+# Docker network — no ports are ever published on project containers.
+# (These helpers run inside $(...) where set -e is off — keep them
+# read-only.)
 
-  local has_tracked_changes=false
-  local has_untracked=false
+# All v2 project containers, oldest first (stable UTC creation time):
+# "slug name" per line. Space-separated: docker inspect --format passes \t
+# through literally (unlike docker ps), and none of the fields contain
+# spaces.
+_project_rows() {
+  local ids
+  ids="$(docker ps -aq --filter label=aibox.slug 2>/dev/null | tr '\n' ' ')"
+  [[ -z "${ids// /}" ]] && return 0
+  # shellcheck disable=SC2086
+  docker inspect --format '{{.Created}} {{index .Config.Labels "aibox.slug"}} {{.Name}}' $ids 2>/dev/null \
+    | sort | cut -d' ' -f2,3
+}
 
-  if ! git -C "$GIT_ROOT" diff --quiet 2>/dev/null || ! git -C "$GIT_ROOT" diff --cached --quiet 2>/dev/null; then
-    has_tracked_changes=true
+# Emit "publiclabel name" pairs; the oldest project keeps the bare slug,
+# later slug collisions get slug-hash6.
+_proxy_pairs() {
+  local slug name key seen=" "   # space-delimited set (bash 3.2: no assoc arrays)
+  while read -r slug name; do
+    name="${name#/}"   # docker inspect .Name has a leading slash
+    [[ -z "$name" ]] && continue
+    key="$slug"
+    [[ "$seen" == *" $slug "* ]] && key="${slug}-${name##*-}"
+    seen="${seen}${slug} "
+    echo "$key $name"
+  done < <(_project_rows)
+}
+
+_pub_label() {
+  local key name
+  while read -r key name; do
+    [[ "$name" == "$CONTAINER" ]] && { echo "$key"; return; }
+  done < <(_proxy_pairs)
+  echo "$SLUG"
+}
+
+_gen_caddyfile() {
+  echo "# Generated by aibox — do not edit (regenerated on every run)."
+  echo "http://*.*.aibox.localhost {"
+  # Caddy indexes host labels right-to-left from zero:
+  # <port>.<project>.aibox.localhost → labels.3=port, labels.2=project.
+  echo "    map {http.request.host.labels.2} {upstream} {"
+  local key name
+  while read -r key name; do
+    echo "        ${key} ${name}"
+  done < <(_proxy_pairs)
+  echo "        default invalid-project"
+  echo "    }"
+  echo "    reverse_proxy {upstream}:{http.request.host.labels.3}"
+  echo "}"
+}
+
+# Host port the proxy actually publishes; ":port" suffix, empty when 80.
+_proxy_suffix() {
+  local p
+  p="$(docker port "$PROXY" 80/tcp 2>/dev/null | head -1)"
+  p="${p##*:}"
+  [[ -n "$p" && "$p" != "80" ]] && echo ":${p}" || true
+}
+
+# The user-facing dev-server URL pattern for $CONTAINER ($1: concrete port,
+# default the "<port>" placeholder).
+_dev_url() { echo "http://${1:-<port>}.$(_pub_label).aibox.localhost$(_proxy_suffix)"; }
+
+_start_proxy_on() {  # $1 = host port; returns docker run's status
+  docker run -d --name "$PROXY" --network "$NETWORK" --restart unless-stopped \
+    -p "127.0.0.1:${1}:80" \
+    -v "${CONFIG_DIR}/Caddyfile:/etc/caddy/Caddyfile:ro" \
+    "$PROXY_IMAGE" >/dev/null 2>&1
+}
+
+# Branches: running → reload config; absent → create (handling both a
+# parallel-creation race and a busy host port); stopped → start.
+_ensure_proxy() {
+  local file="${CONFIG_DIR}/Caddyfile" tmp="${CONFIG_DIR}/Caddyfile.$$"
+  # Truncate-write in place: the running proxy bind-mounts this exact inode,
+  # so replacing the file (mv) would detach it. Per-PID temp file: parallel
+  # aibox invocations each generate their own (identical) copy.
+  _gen_caddyfile > "$tmp"
+  if ! cmp -s "$tmp" "$file" 2>/dev/null; then
+    cat "$tmp" > "$file"
   fi
+  rm -f "$tmp"
 
-  local untracked_files
-  untracked_files=$(git -C "$GIT_ROOT" ls-files --others --exclude-standard 2>/dev/null || true)
-  if [[ -n "$untracked_files" ]]; then
-    has_untracked=true
-  fi
+  case "$(_state "$PROXY")" in
+    running)
+      docker exec "$PROXY" caddy reload --config /etc/caddy/Caddyfile >/dev/null 2>&1 \
+        || docker restart "$PROXY" >/dev/null 2>&1 || true
+      ;;
+    absent)
+      _info "Starting dev-server proxy (first run pulls a small Caddy image)..."
+      if ! _start_proxy_on "$PROXY_PORT"; then
+        # Two look-alike failures: a parallel invocation won the creation
+        # race (its proxy reaches "running"; the name-conflict loser leaves
+        # nothing), or the host port is busy (docker leaves a dead Created-
+        # state container holding the name — must be removed before retry).
+        sleep 1
+        if [[ "$(_state "$PROXY")" != "running" ]]; then
+          docker rm -f "$PROXY" >/dev/null 2>&1 || true
+          if [[ "$PROXY_PORT" == "80" ]] && _start_proxy_on 8080; then
+            _warn "Host port 80 unavailable — proxy on 8080 instead (URLs get :8080)."
+          else
+            _warn "Dev-server proxy failed to start on port ${PROXY_PORT}; containers still work."
+          fi
+        fi
+      fi
+      ;;
+    *)
+      docker start "$PROXY" >/dev/null 2>&1 || true   # caddy re-reads the config on start
+      ;;
+  esac
+}
 
-  if [[ "$has_tracked_changes" == "false" && "$has_untracked" == "false" ]]; then
+# ── Container ────────────────────────────────────────────────────
+CREATED=false   # set by _ensure_container, read by _ensure_all's first-run banner
+
+_ensure_net_vol() {
+  docker network create "$NETWORK" >/dev/null 2>&1 || true
+  docker volume create "$VOLUME" >/dev/null 2>&1 || true
+}
+
+# Shared run-spec for project containers. Per-mode flags (restart policy,
+# bind mount, labels) come as args and land before "$IMAGE" — docker flag
+# order before the image is irrelevant.
+#
+# The home volume is mounted in slices (volume-subpath, Engine 26+): a
+# private per-project home, with the shared Claude login/settings, binary,
+# and this project's own transcripts mounted over it at their normal paths.
+# Other projects' homes and transcripts are simply not mounted — that is the
+# isolation boundary (in-volume permissions are meaningless with full sudo).
+# todos/file-history/shell-snapshots stay inside the shared .claude mount.
+_docker_run() {
+  docker run -d --name "$CONTAINER" \
+    --network "$NETWORK" \
+    --hostname "${SLUG:0:63}" \
+    --init \
+    --add-host host.docker.internal:host-gateway \
+    --mount "type=volume,src=${VOLUME},dst=/home/aibox,volume-subpath=projects/${HASH6}/home" \
+    --mount "type=volume,src=${VOLUME},dst=/home/aibox/.claude,volume-subpath=shared/claude-cfg" \
+    --mount "type=volume,src=${VOLUME},dst=/home/aibox/.claude/projects,volume-subpath=projects/${HASH6}/claude-projects" \
+    --mount "type=volume,src=${VOLUME},dst=/home/aibox/.local/bin,volume-subpath=shared/local-bin" \
+    --mount "type=volume,src=${VOLUME},dst=/home/aibox/.local/share/claude,volume-subpath=shared/claude-app" \
+    -w "$PROJECT_DIR" \
+    -e CLAUDE_CONFIG_DIR=/home/aibox/.claude \
+    -l "aibox.path=${PROJECT_DIR}" \
+    -l "aibox.layout=2" \
+    "$@" "$IMAGE"
+}
+
+# Poll until $CONTAINER runs (kicking a stopped one); die with $1 after 5s.
+_wait_running() {
+  local i=0
+  until [[ "$(docker inspect "$CONTAINER" --format '{{.State.Running}}' 2>/dev/null)" == "true" ]]; do
+    (( i++ >= 25 )) && _die "$1"
+    docker start "$CONTAINER" >/dev/null 2>&1 || true
+    sleep 0.2
+  done
+}
+
+# ── Volume layout (v2: per-project isolation) ────────────────────
+# aibox-home layout: shared/{claude-cfg,local-bin,claude-app} for the Claude
+# login/settings and binary, projects/<hash6>/{home,claude-projects} per
+# project. Marker file .aibox-layout at the volume root says the shape is
+# current; a volume with old flat data and no marker is migrated in place
+# (safety backup first). Unrecognized files are never moved or deleted.
+
+# The migration body. AIBOX_MIG_ROOT lets it run against a plain directory
+# instead of the mounted volume, for testing outside docker.
+# POSIX sh — it runs under busybox in the helper image. $1 = hash6 of the
+# project being started, so its slice exists even if it's new.
+# Everything is driven by the absolute-path keys in .claude.json: the
+# transcript dir names are lossy encodings (all punctuation → "-"), so the
+# real paths are the only way to compute each project's hash.
+_MIGRATE_SH='
+set -e
+cd "${AIBOX_MIG_ROOT:-/v}"
+[ -f .aibox-layout ] && exit 0
+mkdir -p shared/claude-cfg projects
+if [ -d .claude ]; then
+  for f in .claude/* .claude/.[!.]*; do
+    [ -e "$f" ] || [ -L "$f" ] || continue
+    case "$(basename "$f")" in projects) continue ;; esac
+    mv "$f" shared/claude-cfg/
+  done
+fi
+if [ -d .local/bin ] && [ ! -e shared/local-bin ]; then mv .local/bin shared/local-bin; fi
+if [ -d .local/share/claude ] && [ ! -e shared/claude-app ]; then mv .local/share/claude shared/claude-app; fi
+mkdir -p shared/local-bin shared/claude-app
+# copy_home <hash6>: seed a project home from the old root dotfiles.
+# Copies are staged then renamed, so a crash mid-copy leaves only a temp
+# dir that the re-run redoes — never a half .ssh that looks complete.
+copy_home() {
+  mkdir -p "projects/$1/home" "projects/$1/claude-projects"
+  for d in .ssh .config .gitconfig .zshrc .zsh_history .zshenv .zprofile .netrc; do
+    [ -e "$d" ] || continue
+    [ -e "projects/$1/home/$d" ] && continue
+    rm -rf "projects/$1/home/.aibox-mig-tmp"
+    cp -a "$d" "projects/$1/home/.aibox-mig-tmp"
+    mv "projects/$1/home/.aibox-mig-tmp" "projects/$1/home/$d"
+  done
+}
+CJ=shared/claude-cfg/.claude.json
+if [ -f "$CJ" ]; then
+  # Project paths appear as JSON KEYS ("/abs/path": ...). Value-position
+  # path strings (MCP args, history entries) must never claim a transcript
+  # dir — a stray match would strand sessions in a slice nothing mounts.
+  grep -o "\"/[^\"]*\":" "$CJ" | sed "s/\":\$//; s/^\"//" | sort -u | while read -r p; do
+    h="$(printf %s "$p" | sha256sum | cut -c1-6)"
+    copy_home "$h"
+    # The slice sentinel: the sessions page lists a slice only through it,
+    # and container creation checks it for hash collisions.
+    [ -e "projects/$h/.aibox-path" ] || printf %s "$p" > "projects/$h/.aibox-path"
+    enc="$(printf %s "$p" | sed "s/[^A-Za-z0-9]/-/g")"
+    if [ -d ".claude/projects/$enc" ] && [ ! -e "projects/$h/claude-projects/$enc" ]; then
+      mv ".claude/projects/$enc" "projects/$h/claude-projects/$enc"
+    fi
+  done
+fi
+copy_home "$1"
+# Anything path-matching could not claim stays put (non-ASCII or >200-char
+# encodings, dirs with no .claude.json key) — but say so loudly.
+if [ -d .claude/projects ] && [ -n "$(ls -A .claude/projects 2>/dev/null)" ]; then
+  echo "aibox migrate: transcript dirs left unclaimed (kept in the volume at .claude/projects/):" >&2
+  ls .claude/projects >&2
+fi
+chown -R 1000:1000 shared projects 2>/dev/null || true
+echo 2 > .aibox-layout
+'
+
+_migrate_layout() {
+  # Anything with the volume mounted (labels or not — the oldest containers
+  # carry none) would race the file moves under a live claude.
+  local running
+  running="$(docker ps -q --filter "volume=${VOLUME}" | head -1)"
+  [[ -n "$running" ]] && _die "The home volume needs a one-time migration to the per-project layout, but containers are still using it. Exit sessions, run: aibox stop --all, then retry."
+  # Serialize concurrent invocations. The steal threshold must exceed the
+  # safety backup of a large volume (minutes), so it is deliberately huge;
+  # a genuinely stale lock (Ctrl-C at the wrong moment) gets a hint instead.
+  local lock="${CONFIG_DIR}/.lock-migrate" waited=0
+  until mkdir "$lock" 2>/dev/null; do
+    (( waited % 600 == 599 )) && _info "Waiting for another aibox migration to finish... (if none is running, remove the stale lock: rmdir ${lock})"
+    (( waited++ >= 36000 )) && { rmdir "$lock" 2>/dev/null || true; waited=0; }   # 1h
+    sleep 0.1
+  done
+  # Another invocation may have finished the migration while we waited.
+  if [[ "$(docker run --rm -v "${VOLUME}:/v" "$HELPER_IMAGE" sh -c '[ -f /v/.aibox-layout ] && echo done || true')" == "done" ]]; then
+    rmdir "$lock" 2>/dev/null || true
     return 0
   fi
+  _info "Migrating ${VOLUME} to the per-project layout (one-time; old files stay in the volume untouched)..."
+  local safety
+  safety="$(_do_backup "$BACKUP_DIR" "aibox-home-pre-migrate")" \
+    || { rmdir "$lock" 2>/dev/null || true; _die "Safety backup failed — migration aborted, the volume is untouched."; }
+  _ok "Safety backup: ${safety}"
+  if ! printf '%s' "$_MIGRATE_SH" | docker run -i --rm -v "${VOLUME}:/v" "$HELPER_IMAGE" sh -s "$HASH6"; then
+    rmdir "$lock" 2>/dev/null || true
+    _die "Migration failed — restore the safety backup above with: aibox restore <file>"
+  fi
+  rmdir "$lock" 2>/dev/null || true
+  _ok "Migrated. Each project now has a private home; login, settings, and the claude binary stay shared."
+}
 
-  echo -e "  Uncommitted changes detected:"
-  [[ "$has_tracked_changes" == "true" ]] && echo -e "    ${_M}Modified/staged files${_N}"
-  [[ "$has_untracked" == "true" ]] && echo -e "    ${_M}Untracked files${_N} (${_B}$(echo "$untracked_files" | wc -l | xargs)${_N} files)"
-  echo ""
-  if _confirm_yes "Include uncommitted changes?"; then
-    INCLUDE_UNCOMMITTED=true
+# Detect the volume's shape, create/migrate as needed, and make sure this
+# project's slices exist. Called right before every container create.
+_ensure_layout() {
+  local ver maj
+  ver="$(docker version --format '{{.Server.Version}}' 2>/dev/null)"
+  maj="${ver%%.*}"
+  if [[ "$maj" =~ ^[0-9]+$ ]] && (( maj < 26 )); then
+    _die "aibox needs Docker Engine 26+ (volume subpath mounts); found ${ver}. Update your runtime (brew upgrade colima / update OrbStack or Docker Desktop)."
+  fi
+  # Fresh means EMPTY: any other marker-less content (even just an .ssh dir
+  # from an odd v1 life) goes through migration, which backs up first and
+  # only moves what it recognizes. Detection failing (offline first pull,
+  # daemon hiccup) must fail closed — creating containers against wrong
+  # slices produces far worse errors than stopping here.
+  local state
+  state="$(docker run --rm -v "${VOLUME}:/v" "$HELPER_IMAGE" sh -c '
+    if [ -f /v/.aibox-layout ]; then echo current
+    elif [ -z "$(ls -A /v 2>/dev/null)" ]; then
+      mkdir -p /v/shared/claude-cfg /v/shared/local-bin /v/shared/claude-app /v/projects
+      echo 2 > /v/.aibox-layout
+      echo current
+    else echo legacy
+    fi' | tail -1)"
+  case "$state" in
+    current) ;;
+    legacy)  _migrate_layout ;;
+    *)       _die "Could not inspect the ${VOLUME} volume layout (docker error above). Retry once docker/network is healthy." ;;
+  esac
+  # This project's slices. The .aibox-path sentinel catches the (rare)
+  # 6-hex-digit path-hash collision between two projects, which would
+  # otherwise silently merge their private homes.
+  local slice
+  slice="$(docker run --rm -e "P=${PROJECT_DIR}" -v "${VOLUME}:/v" "$HELPER_IMAGE" sh -c '
+    d="/v/projects/'"${HASH6}"'"
+    mkdir -p "$d/home" "$d/claude-projects"
+    if [ -f "$d/.aibox-path" ]; then
+      [ "$(cat "$d/.aibox-path")" = "$P" ] || { echo COLLISION; exit 0; }
+    else printf %s "$P" > "$d/.aibox-path"; fi
+    chown -R 1000:1000 "$d"
+    echo OK' | tail -1)"
+  case "$slice" in
+    OK) ;;
+    COLLISION) _die "Path-hash collision: another project already owns slice projects/${HASH6}. Rename this project directory to resolve it." ;;
+    *)  _die "Could not prepare the volume slices for ${SLUG} (docker error above)." ;;
+  esac
+}
 
-    # Capture diff of all tracked changes (staged + unstaged) against HEAD
-    if [[ "$has_tracked_changes" == "true" ]]; then
-      UNCOMMITTED_DIFF=$(mktemp)
-      git -C "$GIT_ROOT" diff HEAD > "$UNCOMMITTED_DIFF"
+_ensure_container() {
+  _ensure_net_vol
+
+  # Serialize create/recreate across concurrent invocations (mkdir is
+  # atomic): without this, two new-version invocations could both decide to
+  # recreate and the second would rm the first's fresh container. A lock
+  # older than ~15s is presumed dead and stolen.
+  local lock="${CONFIG_DIR}/.lock-${CONTAINER}" waited=0
+  until mkdir "$lock" 2>/dev/null; do
+    (( waited++ >= 150 )) && { rmdir "$lock" 2>/dev/null || true; waited=0; }
+    sleep 0.1
+  done
+  trap 'rmdir "$lock" 2>/dev/null || true' EXIT
+
+  local state cur_img cur_layout
+  read -r state cur_img cur_layout < <(docker inspect "$CONTAINER" \
+    --format '{{.State.Status}} {{.Config.Image}} {{index .Config.Labels "aibox.layout"}}' 2>/dev/null) || true
+  state="${state:-absent}"
+
+  # Recreate when the image changed (new aibox version or node_version), the
+  # container predates the current volume layout (its mounts are stale), or
+  # it never got past Created (a failed docker run leaves the name wedged —
+  # docker start can never succeed, and there are no processes to protect).
+  # The home volume and project bind survive by construction.
+  if [[ "$state" != "absent" && -n "${cur_img:-}" && ( "$cur_img" != "$IMAGE" || "${cur_layout:-}" != "2" || "$state" == "created" ) ]]; then
+    local active=0
+    if [[ "$state" == "running" ]]; then
+      active="$(docker top "$CONTAINER" -o pid,args 2>/dev/null | tail -n +2 | grep -vc 'sleep infinity' || true)"
+      active="${active//[^0-9]/}"   # arithmetic-safe
     fi
-
-    # Tar up untracked files (preserving paths relative to project root)
-    if [[ "$has_untracked" == "true" ]]; then
-      UNCOMMITTED_UNTRACKED_TAR=$(mktemp)
-      echo "$untracked_files" | tar -C "$GIT_ROOT" -cf "$UNCOMMITTED_UNTRACKED_TAR" -T -
-    fi
-  else
-    _info "Proceeding without uncommitted changes."
-  fi
-}
-
-_cleanup_uncommitted() {
-  [[ -n "$UNCOMMITTED_DIFF" ]] && rm -f "$UNCOMMITTED_DIFF"
-  [[ -n "$UNCOMMITTED_UNTRACKED_TAR" ]] && rm -f "$UNCOMMITTED_UNTRACKED_TAR"
-}
-
-# Apply uncommitted changes to a local directory (worktree)
-_apply_uncommitted_local() {
-  local target_dir="$1"
-
-  if [[ "$INCLUDE_UNCOMMITTED" != "true" ]]; then
-    return 0
-  fi
-
-  if [[ -n "$UNCOMMITTED_DIFF" && -s "$UNCOMMITTED_DIFF" ]]; then
-    git -C "$target_dir" apply --allow-empty "$UNCOMMITTED_DIFF" 2>/dev/null \
-      && _ok "Applied uncommitted tracked changes." \
-      || _warn "Some tracked changes could not be applied."
-  fi
-
-  if [[ -n "$UNCOMMITTED_UNTRACKED_TAR" && -s "$UNCOMMITTED_UNTRACKED_TAR" ]]; then
-    tar -C "$target_dir" -xf "$UNCOMMITTED_UNTRACKED_TAR" \
-      && _ok "Copied untracked files." \
-      || _warn "Some untracked files could not be copied."
-  fi
-}
-
-# Apply uncommitted changes inside a docker volume
-_apply_uncommitted_volume() {
-  local volume="$1"
-  local workspace="$2"
-
-  if [[ "$INCLUDE_UNCOMMITTED" != "true" ]]; then
-    return 0
-  fi
-
-  if [[ -n "$UNCOMMITTED_DIFF" && -s "$UNCOMMITTED_DIFF" ]]; then
-    cat "$UNCOMMITTED_DIFF" | docker run --rm -i --entrypoint sh \
-      -v "${volume}:${workspace}" \
-      "$IMAGE" -c "
-        cd '${workspace}'
-        cat > /tmp/uncommitted.patch
-        git apply --allow-empty /tmp/uncommitted.patch
-        rm /tmp/uncommitted.patch
-        chown -R aibox:aibox '${workspace}'
-      " 2>/dev/null \
-      && _ok "Applied uncommitted tracked changes." \
-      || _warn "Some tracked changes could not be applied."
-  fi
-
-  if [[ -n "$UNCOMMITTED_UNTRACKED_TAR" && -s "$UNCOMMITTED_UNTRACKED_TAR" ]]; then
-    cat "$UNCOMMITTED_UNTRACKED_TAR" | docker run --rm -i --entrypoint sh \
-      -v "${volume}:${workspace}" \
-      "$IMAGE" -c "
-        cd '${workspace}'
-        tar -xf -
-        chown -R aibox:aibox '${workspace}'
-      " 2>/dev/null \
-      && _ok "Copied untracked files." \
-      || _warn "Some untracked files could not be copied."
-  fi
-}
-
-# ── Submodule / LFS helpers ───────────────────────────────────────
-_has_submodules() {
-  [[ -n "$GIT_ROOT" && -f "${GIT_ROOT}/.gitmodules" ]]
-}
-
-_has_lfs() {
-  [[ -n "$GIT_ROOT" ]] && git -C "$GIT_ROOT" lfs ls-files --size 2>/dev/null | head -1 | grep -q . 2>/dev/null
-}
-
-# Post-checkout for a local directory (worktree)
-_post_checkout_local() {
-  local target_dir="$1"
-
-  if _has_submodules; then
-    _info "Initializing submodules..."
-    git -C "$target_dir" submodule update --init --recursive 2>/dev/null \
-      && _ok "Submodules initialized." \
-      || _warn "Some submodules could not be initialized."
-  fi
-
-  if _has_lfs; then
-    _info "Fetching LFS objects..."
-    git -C "$target_dir" lfs pull 2>/dev/null \
-      && _ok "LFS objects fetched." \
-      || _warn "Some LFS objects could not be fetched."
-  fi
-}
-
-# Post-checkout inside a docker volume
-_post_checkout_volume() {
-  local volume="$1"
-  local workspace="$2"
-
-  if _has_submodules; then
-    _info "Initializing submodules..."
-    docker run --rm --entrypoint sh \
-      -v "${volume}:${workspace}" \
-      "$IMAGE" -c "
-        cd '${workspace}'
-        git submodule update --init --recursive
-        chown -R aibox:aibox '${workspace}'
-      " 2>/dev/null \
-      && _ok "Submodules initialized." \
-      || _warn "Some submodules could not be initialized."
-  fi
-
-  if _has_lfs; then
-    _info "Fetching LFS objects..."
-    docker run --rm --entrypoint sh \
-      -v "${volume}:${workspace}" \
-      "$IMAGE" -c "
-        cd '${workspace}'
-        git lfs pull
-        chown -R aibox:aibox '${workspace}'
-      " 2>/dev/null \
-      && _ok "LFS objects fetched." \
-      || _warn "Some LFS objects could not be fetched."
-  fi
-}
-
-# ── Size estimation ───────────────────────────────────────────────
-_estimate_repo_size() {
-  # Estimate checkout size from git packed objects (rough: ~2x pack size for checkout)
-  local size_kb
-  size_kb=$(git -C "$GIT_ROOT" count-objects -v 2>/dev/null | awk '/size-pack/ {print $2}')
-  if [[ -n "$size_kb" && "$size_kb" =~ ^[0-9]+$ ]]; then
-    echo $(( size_kb * 2 ))  # KB, rough estimate
-  fi
-}
-
-_estimate_dir_size() {
-  local dir="$1"
-  # du -sk: total size in KB
-  # Try GNU du (--exclude), fall back to BSD du (-I), fall back to plain du
-  du -sk --exclude='node_modules' --exclude='.git' "$dir" 2>/dev/null | awk '{print $1}' \
-    || du -sk -I 'node_modules' -I '.git' "$dir" 2>/dev/null | awk '{print $1}' \
-    || du -sk "$dir" 2>/dev/null | awk '{print $1}' \
-    || true
-}
-
-_format_size() {
-  local kb="$1"
-  if [[ -z "$kb" || ! "$kb" =~ ^[0-9]+$ ]]; then
-    echo "unknown size"
-    return
-  fi
-  if (( kb >= 1048576 )); then
-    echo "$(( kb / 1048576 ))GB"
-  elif (( kb >= 1024 )); then
-    echo "$(( kb / 1024 ))MB"
-  else
-    echo "${kb}KB"
-  fi
-}
-
-_confirm_size() {
-  local size_kb="$1" what="$2"
-  if [[ -z "$size_kb" || ! "$size_kb" =~ ^[0-9]+$ ]]; then
-    return 0  # Can't estimate — don't block
-  fi
-  local formatted
-  formatted=$(_format_size "$size_kb")
-  if (( size_kb > 1048576 )); then
-    echo -e "  Estimated size: ${_BY}~${formatted}${_N}"
-  else
-    echo -e "  Estimated size: ${_G}~${formatted}${_N}"
-  fi
-  if (( size_kb > 1048576 )); then
-    # Over 1GB — ask for confirmation
-    if ! _confirm_yes "Continue with ${what}?"; then
-      echo "Aborted."
-      exit 0
-    fi
-  fi
-}
-
-# ── Isolation: copy mode ──────────────────────────────────────────
-
-_copy_via_git() {
-  local mount_path="$1"
-  local branch_name="aibox/${INSTANCE_NAME}"
-
-  _confirm_size "$(_estimate_repo_size)" "copy"
-  _check_uncommitted
-
-  _step "Copying repo into volume (branch: ${branch_name})"
-
-  local bundle_file
-  bundle_file=$(mktemp)
-  if ! git -C "$GIT_ROOT" bundle create "$bundle_file" --all 2>/dev/null; then
-    rm -f "$bundle_file"
-    _cleanup_uncommitted
-    docker volume rm "$COPY_VOLUME" 2>/dev/null || true
-    _err "git bundle failed. Is this a git repository with commits?"
-    exit 1
-  fi
-
-  if ! cat "$bundle_file" | docker run --rm -i --entrypoint sh \
-      -v "${COPY_VOLUME}:${mount_path}" \
-      "$IMAGE" -c "
-        cat > /tmp/repo.bundle
-        mkdir -p '${mount_path}'
-        cd '${mount_path}'
-        git clone /tmp/repo.bundle .
-        rm /tmp/repo.bundle
-        git checkout -b '${branch_name}' 2>/dev/null || git checkout '${branch_name}'
-        chown -R aibox:aibox '${mount_path}'
-      "; then
-    rm -f "$bundle_file"
-    _cleanup_uncommitted
-    docker volume rm "$COPY_VOLUME" 2>/dev/null || true
-    _err "Failed to clone into volume."
-    exit 1
-  fi
-
-  rm -f "$bundle_file"
-
-  _post_checkout_volume "$COPY_VOLUME" "$mount_path"
-  _apply_uncommitted_volume "$COPY_VOLUME" "$mount_path"
-  _cleanup_uncommitted
-}
-
-_copy_via_tar() {
-  local mount_path="$1"
-  local source_dir="$2"
-  local use_git_archive=false
-
-  # If inside a git repo, use git archive (respects .gitignore, excludes .git/)
-  if [[ -n "$GIT_ROOT" ]]; then
-    use_git_archive=true
-  fi
-
-  _confirm_size "$(_estimate_dir_size "$source_dir")" "copy"
-
-  _step "Copying folder into volume"
-
-  if [[ "$use_git_archive" == "true" ]]; then
-    # Use git ls-files to get all tracked + untracked-but-not-ignored files
-    # This copies the live working state while respecting .gitignore
-    _info "Copying files (respects .gitignore, includes uncommitted changes)"
-    if ! (cd "$source_dir" && \
-        { git ls-files -z; git ls-files -z --others --exclude-standard; } | \
-        tar -cf - --null -T - 2>/dev/null) | docker run --rm -i --entrypoint sh \
-        -v "${COPY_VOLUME}:${mount_path}" \
-        "$IMAGE" -c "
-          mkdir -p '${mount_path}'
-          cd '${mount_path}'
-          tar -xf -
-          chown -R aibox:aibox '${mount_path}'
-        "; then
-      docker volume rm "$COPY_VOLUME" 2>/dev/null || true
-      _err "Failed to copy into volume."
-      exit 1
-    fi
-  else
-    _info "Copying files (excluding node_modules, .git)"
-    if ! tar -C "$source_dir" -cf - \
-        --exclude='node_modules' \
-        --exclude='.git' \
-        . | docker run --rm -i --entrypoint sh \
-        -v "${COPY_VOLUME}:${mount_path}" \
-        "$IMAGE" -c "
-          mkdir -p '${mount_path}'
-          cd '${mount_path}'
-          tar -xf -
-          chown -R aibox:aibox '${mount_path}'
-        "; then
-      docker volume rm "$COPY_VOLUME" 2>/dev/null || true
-      _err "Failed to copy into volume."
-      exit 1
-    fi
-  fi
-}
-
-_prepare_copy_volume() {
-  _check_disk_space 2 "copy volume"
-
-  docker volume create "$COPY_VOLUME" >/dev/null 2>&1 || true
-
-  # Check if volume already has content (--entrypoint bypasses su-exec drop)
-  local has_content
-  has_content=$(docker run --rm --entrypoint sh -v "${COPY_VOLUME}:/mnt/check" "$IMAGE" -c "ls -A /mnt/check 2>/dev/null | head -1" 2>/dev/null || true)
-
-  if [[ -n "$has_content" ]]; then
-    _info "Copy volume already populated ($(_file "$COPY_VOLUME")). Reusing."
-    return
-  fi
-
-  if [[ -z "$GIT_ROOT" ]]; then
-    # Not a git repo — tar copy of the folder
-    _copy_via_tar "$WORKSPACE_DIR" "$PROJECT_DIR"
-  elif [[ "$GIT_ROOT" == "$PROJECT_DIR" ]]; then
-    # At repo root — git bundle
-    _copy_via_git "$WORKSPACE_DIR"
-  else
-    # In a subfolder of a git repo — ask
-    echo ""
-    _info "You're in a subfolder of a git repo."
-    echo -e "    Repo root:      $(_file "$GIT_ROOT")"
-    echo -e "    Current folder:  $(_file "$PROJECT_DIR")"
-    echo ""
-    if _confirm_yes "Copy the full repo? (No = copy only this folder)"; then
-      _copy_via_git "$WORKSPACE_DIR"
+    if [[ "${active:-0}" -gt 0 ]]; then
+      _warn "Container needs recreating (image or layout updated) but ${active} process(es) still running in the old one — keeping it for now. To update: exit sessions / stop dev servers, then run: aibox stop && aibox"
     else
-      _copy_via_tar "$WORKSPACE_DIR" "$PROJECT_DIR"
+      _info "Recreating container (image or layout updated) — sessions/login/project files persist; apt-installed packages reset (use ~/.aibox/Dockerfile.extra to keep them)."
+      docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+      state=absent
     fi
   fi
 
-  _ok "Copied to volume $(_file "$COPY_VOLUME")"
+  if [[ "$state" == "absent" ]]; then
+    _require_safe_dir
+    _ensure_layout
+    local run_err=""
+    # 2>&1 >/dev/null captures stderr only (order matters) — shown by
+    # _wait_running if the container never comes up.
+    run_err="$(_docker_run \
+      --restart unless-stopped \
+      -v "${PROJECT_DIR}:${PROJECT_DIR}" \
+      -l "aibox.slug=${SLUG}" \
+      2>&1 >/dev/null)" || true   # || true: parallel tab may have created it
+    CREATED=true
+  elif [[ "$state" != "running" ]]; then
+    docker start "$CONTAINER" >/dev/null 2>&1 || true
+  fi
+
+  rmdir "$lock" 2>/dev/null || true
+  trap - EXIT
+
+  _wait_running "Container failed to start.${run_err:+ ${run_err}}"
 }
 
-# ── Isolation: worktree mode ─────────────────────────────────────
-_prepare_worktree() {
-  if [[ -z "$GIT_ROOT" ]]; then
-    _err "${_B}--worktree${_N} requires a git repository."
-    exit 1
-  fi
-
-  local branch_name="aibox/${INSTANCE_NAME}"
-
-  if [[ -d "$WORKTREE_DIR" ]]; then
-    _info "Worktree already exists ($(_file "$WORKTREE_DIR")). Reusing."
-    return
-  fi
-
-  _confirm_size "$(_estimate_repo_size)" "worktree"
-  _check_uncommitted
-
-  mkdir -p "${CONFIG_DIR}/worktrees"
-
-  _step "Creating worktree (branch: ${branch_name})"
-
-  # Try creating with a new branch, fall back to existing branch
-  if git -C "$GIT_ROOT" worktree add "$WORKTREE_DIR" -b "$branch_name" 2>/dev/null; then
-    true
-  elif git -C "$GIT_ROOT" worktree add "$WORKTREE_DIR" "$branch_name" 2>/dev/null; then
-    true
-  else
-    _cleanup_uncommitted
-    _err "Failed to create worktree. Is this a git repository?"
-    exit 1
-  fi
-
-  _post_checkout_local "$WORKTREE_DIR"
-  _apply_uncommitted_local "$WORKTREE_DIR"
-  _cleanup_uncommitted
-
-  _ok "Created worktree at $(_file "$WORKTREE_DIR")"
+_ensure_claude_bin() {
+  # Wait (in-container, one exec) until the entrypoint's start-up work is
+  # done — the marker appears even if its install attempt failed. The
+  # binary test doubles as the exit path for containers from older images
+  # that never write a marker. Up to 180s: the first install downloads the
+  # binary.
+  docker exec -u aibox "$CONTAINER" sh -c '
+    i=0
+    until [ -e /tmp/aibox-ready ] || [ -x "$HOME/.local/bin/claude" ]; do
+      i=$((i+1)); [ "$i" -ge 180 ] && break
+      [ "$i" -eq 3 ] && echo "Waiting for first-time container setup (claude install)..." >&2
+      sleep 1
+    done
+    [ -x "$HOME/.local/bin/claude" ]' && return 0
+  _info "Installing Claude Code into the shared home volume (one-time)..."
+  docker exec -u aibox "$CONTAINER" bash -c 'curl -fsSL https://claude.ai/install.sh | bash' || true
+  docker exec -u aibox "$CONTAINER" test -x /home/aibox/.local/bin/claude 2>/dev/null \
+    || _die "Claude Code install failed — see the curl output above. Retry, or run: aibox shell 'curl -fsSL https://claude.ai/install.sh | bash'"
 }
 
-# ── Compose YAML generation ──────────────────────────────────────
-# Auth volume shared across all containers using the same base image.
-# name: field prevents docker compose from prefixing with project name.
-AUTH_VOLUME="aibox-auth-$(echo "$IMAGE" | sed 's/[^a-zA-Z0-9]/-/g')"
-
-_volumes_yaml() {
-  local indent="$1"
-  local prefix="$2"
-
-  if [[ "$ISOLATION" == "copy" ]]; then
-    echo "${indent}- ${COPY_VOLUME}:${WORKSPACE_DIR}"
-  elif [[ "$ISOLATION" == "worktree" ]]; then
-    echo "${indent}- \"${WORKTREE_DIR}:${WORKSPACE_DIR}\""
-  else
-    echo "${indent}- \"${prefix}:${WORKSPACE_DIR}\""
-  fi
-  echo "${indent}- ${AUTH_VOLUME}:/home/aibox/.claude"
-
-  # Mount host's IDE lock files so Claude Code can discover JetBrains/VS Code plugins
-  local host_ide_dir="${HOME}/.claude/ide"
-  if [[ -d "$host_ide_dir" ]]; then
-    echo "${indent}- \"${host_ide_dir}:/home/aibox/.claude/ide:ro\""
-  fi
-
-  if [[ "$SHARED_MODULES" == "false" && -z "$ISOLATION" ]]; then
-    echo "${indent}- node_modules:${WORKSPACE_DIR}/node_modules"
+_ensure_all() {
+  _ensure_docker
+  _ensure_image
+  _ensure_container
+  _ensure_proxy   # after _ensure_container: the Caddyfile must include the new container
+  if [[ "$CREATED" == "true" ]]; then
+    _ok "Container ready. Dev servers: $(_dev_url)"
   fi
 }
 
-_top_volumes_yaml() {
-  printf "volumes:\n"
-  printf "  ${AUTH_VOLUME}:\n"
-  printf "    external: true\n"
-  if [[ "$ISOLATION" == "copy" ]]; then
-    printf "  ${COPY_VOLUME}:\n"
-    printf "    external: true\n"
-  fi
-  if [[ "$SHARED_MODULES" == "false" && -z "$ISOLATION" ]]; then
-    printf "  node_modules:\n"
-  fi
-}
-
-_environment_yaml() {
-  local indent="$1"
-  echo "${indent}- ANTHROPIC_API_KEY=\${ANTHROPIC_API_KEY:-}"
-  echo "${indent}- CLAUDE_CONFIG_DIR=/home/aibox/.claude"
-  echo "${indent}- AIBOX_MODE=\${AIBOX_MODE:-safe}"
-  echo "${indent}- AIBOX_EXTRA_DOMAINS=\${AIBOX_EXTRA_DOMAINS:-}"
-  echo "${indent}- AIBOX_WORKSPACE=${WORKSPACE_DIR}"
-}
-
-# Build -e flags for docker exec from current terminal environment
-_docker_exec() {
-  # Usage: _docker_exec container command [args...]
-  local container="$1"
-  shift
-
+# ── exec plumbing ────────────────────────────────────────────────
+_dexec() {
+  local tty_args=(-i)
+  [[ -t 0 && -t 1 ]] && tty_args=(-it)
   local env_args=(
     -e "TERM=${TERM:-xterm-256color}"
     -e "COLORTERM=${COLORTERM:-truecolor}"
     -e "LANG=${LANG:-C.UTF-8}"
+    -e "AIBOX_URL_BASE=$(_pub_label).aibox.localhost$(_proxy_suffix)"
   )
-
-  # Forward Claude Code env vars if set on host
-  local forward_vars=(
-    ANTHROPIC_MODEL
-    ANTHROPIC_BASE_URL
-    CLAUDE_CODE_USE_BEDROCK
-    CLAUDE_CODE_USE_VERTEX
-    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
-  )
-  for var in "${forward_vars[@]}"; do
-    local val
-    eval "val=\${$var:-}"
-    [[ -n "$val" ]] && env_args+=(-e "$var=$val")
+  # Forward exported ANTHROPIC_* vars (compgen, not `env` parsing — multiline
+  # values in unrelated vars must not fabricate variable names).
+  local var
+  for var in $(compgen -A export | grep '^ANTHROPIC_' || true); do
+    env_args+=(-e "${var}=${!var}")
   done
-
-  # Forward JetBrains / VS Code IDE integration env vars
-  if [[ "${ENABLE_IDE_INTEGRATION:-}" == "true" ]]; then
-    env_args+=(-e "ENABLE_IDE_INTEGRATION=true")
-    env_args+=(-e "TERMINAL_EMULATOR=${TERMINAL_EMULATOR:-}")
-    [[ -n "${CLAUDE_CODE_SSE_PORT:-}" ]] && env_args+=(-e "CLAUDE_CODE_SSE_PORT=${CLAUDE_CODE_SSE_PORT}")
-    [[ -n "${TERM_SESSION_ID:-}" ]] && env_args+=(-e "TERM_SESSION_ID=${TERM_SESSION_ID}")
-    env_args+=(-e "CLAUDE_CODE_IDE_HOST_OVERRIDE=host.docker.internal")
-  fi
-
-  docker exec -it -u aibox "${env_args[@]}" "$container" "$@"
+  docker exec "${tty_args[@]}" -u aibox -w "$PROJECT_DIR" "${env_args[@]}" "$CONTAINER" "$@"
 }
 
-# Auto-stop container if no active exec sessions remain
-_maybe_stop_container() {
-  local container="$1"
-  # Check if container is still running
-  if ! docker ps --format '{{.Names}}' | grep -Fxq "$container" 2>/dev/null; then
-    return 0
-  fi
-  # Count processes that are NOT "sleep infinity" (the idle CMD)
-  local active
-  active=$(docker top "$container" -o pid,args 2>/dev/null \
-    | tail -n +2 \
-    | grep -v -c 'sleep infinity' || echo "0")
-  active=$(echo "$active" | tr -d '[:space:]')
+# ── Disposable copy container (--copy) ───────────────────────────
+# A fresh container per run on a snapshot of the project — no bind mount, so
+# the real directory cannot be touched from inside. Shares the home volume
+# (login, sessions, claude binary) and gets its own dev URLs under
+# <slug>-copy. Removed when the session exits; work is kept by committing
+# and pushing from inside before exiting.
 
-  if [[ "$active" -le 0 ]]; then
-    _info "No active sessions. Stopping container..."
-    dc down --remove-orphans >/dev/null 2>&1
-    _ok "Container stopped."
-  fi
+_cleanup_copy() {
+  docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+  # Drop the copy's proxy route; only touch a proxy that is already running.
+  [[ "$(_state "$PROXY")" == "running" ]] && _ensure_proxy >/dev/null 2>&1 || true
 }
 
-_labels_yaml() {
-  local indent="$1"
-  echo "${indent}aibox.project: \"${PROJECT_NAME}\""
-  echo "${indent}aibox.path: \"${PROJECT_DIR}\""
-  echo "${indent}aibox.instance: \"${INSTANCE_NAME}\""
-  echo "${indent}aibox.isolation: \"${ISOLATION}\""
-}
-
-generate_compose() {
-  cat << YAML
-name: "${CONTAINER_NAME}"
-services:
-  dev:
-    image: ${IMAGE}
-    container_name: ${CONTAINER_NAME}
-    cap_add:
-      - NET_ADMIN
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    labels:
-$(_labels_yaml "      ")
-    volumes:
-$(_volumes_yaml "      " "$PROJECT_DIR")
-    working_dir: ${WORKSPACE_DIR}
-    environment:
-$(_environment_yaml "      ")
-    stdin_open: true
-    tty: true
-$(_top_volumes_yaml)
-YAML
-}
-
-write_project_compose() {
-  local target="${PROJECT_DIR}/compose.dev.yaml"
-
-  cat > "$target" << YAML
-# Generated by ${SCRIPT_NAME} — point WebStorm Node.js interpreter here.
-# Settings → Node.js → Docker Compose → this file → service: dev
-name: "${CONTAINER_NAME}"
-services:
-  dev:
-    image: ${IMAGE}
-    container_name: ${CONTAINER_NAME}
-    cap_add:
-      - NET_ADMIN
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    labels:
-$(_labels_yaml "      ")
-    volumes:
-$(_volumes_yaml "      " ".")
-    working_dir: ${WORKSPACE_DIR}
-    environment:
-$(_environment_yaml "      ")
-    stdin_open: true
-    tty: true
-$(_top_volumes_yaml)
-YAML
-  echo "Created ${target}"
-}
-
-# ── WebStorm .idea/workspace.xml ─────────────────────────────────
-_sed_inplace() {
-  if sed --version 2>/dev/null | grep -q 'GNU'; then
-    sed -i "$@"
-  else
-    sed -i '' "$@"
-  fi
-}
-
-configure_webstorm() {
-  local idea_dir="${PROJECT_DIR}/.idea"
-  local ws_file="${idea_dir}/workspace.xml"
-  local compose_path="${PROJECT_DIR}/compose.dev.yaml"
-  local interpreter_value="docker-compose://[${compose_path}]:dev//usr/local/bin/node"
-
-  mkdir -p "$idea_dir"
-
-  if [[ -f "$ws_file" ]]; then
-    if grep -q '"nodejs_interpreter_path"' "$ws_file"; then
-      _sed_inplace "s|\"nodejs_interpreter_path\": \"[^\"]*\"|\"nodejs_interpreter_path\": \"${interpreter_value}\"|" "$ws_file"
-      echo "Updated nodejs_interpreter_path in .idea/workspace.xml"
-    elif grep -q '"keyToString"' "$ws_file"; then
-      local tmpfile
-      tmpfile=$(mktemp)
-      awk -v interp="$interpreter_value" '
-        /"keyToString": \{/ {
-          print
-          print "    \"nodejs_interpreter_path\": \"" interp "\","
-          print "    \"nodejs_package_manager_path\": \"npm\","
-          print "    \"javascript.preferred.runtime.type.id\": \"node\","
-          print "    \"credentialsType com.jetbrains.nodejs.remote.NodeJSCreateRemoteSdkForm\": \"Docker Compose\","
-          next
-        }
-        { print }
-      ' "$ws_file" > "$tmpfile"
-      mv "$tmpfile" "$ws_file"
-      echo "Injected Node.js Docker Compose config into .idea/workspace.xml"
-    else
-      echo "Warning: workspace.xml has unexpected format. Configure manually:"
-      echo "  Settings → Node.js → Docker Compose → compose.dev.yaml → service: dev"
-    fi
-  else
-    cat > "$ws_file" << WSXML
-<?xml version="1.0" encoding="UTF-8"?>
-<project version="4">
-  <component name="PropertiesComponent"><![CDATA[{
-  "keyToString": {
-    "nodejs_interpreter_path": "${interpreter_value}",
-    "nodejs_package_manager_path": "npm",
-    "javascript.preferred.runtime.type.id": "node",
-    "credentialsType com.jetbrains.nodejs.remote.NodeJSCreateRemoteSdkForm": "Docker Compose"
-  }
-}]]></component>
-</project>
-WSXML
-    echo "Created .idea/workspace.xml with Docker Compose Node.js runtime"
-  fi
-}
-
-# ── Docker Compose wrapper ───────────────────────────────────────
-dc() {
-  generate_compose | docker compose \
-    -f - \
-    --project-directory "$PROJECT_DIR" \
-    "$@"
+_ensure_copy_all() {
+  _ensure_docker
+  _ensure_image
+  _require_safe_dir
+  _ensure_net_vol
+  _ensure_layout
+  # Unique name per run: concurrent --copy sessions are separate sandboxes.
+  # The trailing random segment doubles as the URL suffix if slugs collide
+  # (see _proxy_pairs). No --restart policy: disposable by design.
+  CONTAINER="${CONTAINER}-copy-$(printf '%04x%04x' "$RANDOM" "$RANDOM")"
+  trap _cleanup_copy EXIT
+  _docker_run -l "aibox.slug=${SLUG}-copy" -l "aibox.copy=1" >/dev/null
+  _wait_running "Copy container failed to start."
+  _ensure_proxy   # independent of the snapshot — do it before the slow part
+  _info "Snapshotting project into the container (the real ${PROJECT_DIR} is not mounted)..."
+  # Stream the tree and extract as the container user, so files are born
+  # owned by aibox — no second full-tree chown pass. Only the workdir itself
+  # (auto-created root-owned by docker run -w) needs its owner fixed first.
+  # COPYFILE_DISABLE stops macOS tar from adding AppleDouble ._* entries.
+  docker exec -u root "$CONTAINER" chown aibox:aibox "$PROJECT_DIR"
+  COPYFILE_DISABLE=1 tar -cf - -C "$PROJECT_DIR" . \
+    | docker exec -i -u aibox "$CONTAINER" tar -xpf - -C "$PROJECT_DIR" \
+    || _die "Project snapshot failed."
+  _ok "Disposable copy ready — removed on exit; commit & push from inside to keep work. Dev servers: $(_dev_url)"
 }
 
 # ── Commands ─────────────────────────────────────────────────────
-
-cmd_build() {
-  _check_deps
-  _check_disk_space 5 "Docker build"
-  ensure_dockerfile
-  _step "Building ${IMAGE}"
-  docker build -t "$IMAGE" "$CONFIG_DIR"
-  _ok "Image built."
-}
-
-ensure_init() {
-  if [[ ! -f "${PROJECT_DIR}/compose.dev.yaml" ]]; then
-    _require_safe_dir
-    _step "Initializing project (one-time)"
-    echo "Will create compose.dev.yaml, .aibox, and .idea/workspace.xml."
-    if _confirm_yes "Initialize?"; then
-      _init_files
-      echo ""
-    else
-      echo "Aborted. Run '${SCRIPT_NAME} init' manually when ready." >&2
-      exit 1
-    fi
-  fi
-}
-
-cmd_up() {
-  _check_deps
-  ensure_init
-
-  if ! docker image inspect "$IMAGE" &>/dev/null; then
-    echo "Image '${IMAGE}' not found. Building (one-time)..."
-    cmd_build
-  else
-    # Check if image version matches script version
-    local img_version
-    img_version=$(docker inspect "$IMAGE" --format '{{index .Config.Labels "aibox.version"}}' 2>/dev/null || echo "")
-    if [[ "$img_version" != "$AIBOX_VERSION" ]]; then
-      echo "Image outdated (v${img_version:-0} → v${AIBOX_VERSION}). Rebuilding (one-time)..."
-      cmd_build
-    fi
-  fi
-
-  # Check for sensitive files in bind mount mode (only for new containers)
-  if [[ -z "$ISOLATION" ]] && ! docker ps --format '{{.Names}}' | grep -Fxq "$CONTAINER_NAME" 2>/dev/null; then
-    local sensitive_files=()
-    local sensitive_patterns=(".env" ".env.*"
-      "credentials.json" "service-account*.json"
-      ".npmrc" ".pypirc" "id_rsa" "id_ed25519")
-    for pattern in "${sensitive_patterns[@]}"; do
-      while IFS= read -r -d '' f; do
-        sensitive_files+=("${f#"$PROJECT_DIR"/}")
-      done < <(find "$PROJECT_DIR" -maxdepth 2 -name "$pattern" -not -path '*/node_modules/*' -not -path '*/.git/*' -print0 2>/dev/null || true)
-    done
-
-    if [[ ${#sensitive_files[@]} -gt 0 ]]; then
-      echo ""
-      _warn "Sensitive files found in project directory:"
-      for f in "${sensitive_files[@]}"; do
-        echo -e "    $(_file "$f")"
-      done
-      echo ""
-      echo -e "  These will be visible inside the container (bind mount)."
-      echo -e "  The network firewall (safe mode) limits exfiltration, but for"
-      echo -e "  stronger isolation use ${_B}--copy${_N} or ${_B}--worktree${_N} instead."
-      echo ""
-      if ! _confirm_yes "Continue with bind mount?"; then
-        echo -e "  Re-run with ${_B}--copy${_N} or ${_B}--worktree${_N}."
-        exit 0
-      fi
-    fi
-  fi
-
-  # Warn if bind-mounting a subfolder (no .git in container)
-  if [[ -z "$ISOLATION" && -n "$GIT_ROOT" && "$GIT_ROOT" != "$PROJECT_DIR" ]]; then
-    _info "Mounting subfolder $(_file "${PROJECT_DIR#"$GIT_ROOT"/}")"
-    echo -e "    Git won't work inside the container (.git/ is in the parent)."
-    echo -e "    Use ${_B}--copy${_N} or ${_B}--worktree${_N} for full repo access, or run from the repo root."
-  fi
-
-  # Prepare isolation volumes/worktrees if needed
-  if [[ "$ISOLATION" == "copy" ]]; then
-    _prepare_copy_volume
-  elif [[ "$ISOLATION" == "worktree" ]]; then
-    _prepare_worktree
-  fi
-
-  if ! docker ps --format '{{.Names}}' | grep -Fxq "$CONTAINER_NAME"; then
-    # Ensure shared auth volume exists (external: true requires it)
-    docker volume create "$AUTH_VOLUME" &>/dev/null || true
-    _step "Starting ${CONTAINER_NAME}"
-    dc up -d
-    _ok "Container running."
-  else
-    _ok "$(_file "$CONTAINER_NAME") is already running."
-  fi
-}
-
-cmd_claude() {
-  local skip=false
-  local firewall=true
-
-  # Check if --dangerously-skip-permissions was passed directly as a claude arg
-  local has_skip_flag=false
-  for arg in "$@"; do
-    [[ "$arg" == "--dangerously-skip-permissions" ]] && has_skip_flag=true
+# Run any program in the sandbox. `aibox` / `aibox claude` is just
+# `aibox run claude` (see dispatch). aibox's own flags (--copy, --yolo —
+# semantics in the usage header) are consumed wherever they appear; the
+# first `--` ends that, everything after it passes through verbatim.
+cmd_run() {
+  local copy=false yolo=false passthru=false args=() a
+  for a in "$@"; do
+    if [[ "$passthru" == "true" ]]; then args+=("$a"); continue; fi
+    case "$a" in
+      --copy) copy=true ;;
+      --yolo) yolo=true ;;
+      --)     passthru=true ;;
+      *)      args+=("$a") ;;
+    esac
   done
+  [[ ${#args[@]} -ge 1 ]] || _die "Usage: aibox run [--copy] <program> [args...]"
+  if [[ "$yolo" == "true" && "${args[0]}" != "claude" ]]; then
+    _die "--yolo maps to claude's permission flags — pass ${args[0]}'s own approval flags as normal args."
+  fi
 
-  if [[ "$SKIP_PERMISSIONS" == "true" || "$has_skip_flag" == "true" ]]; then
-    # --yolo or explicit --dangerously-skip-permissions: everything loose
-    skip=true
-    firewall=false
-    export AIBOX_MODE="yolo"
-  elif [[ "$SAFE_MODE" == "true" ]]; then
-    # --safe: everything locked
-    skip=false
-    firewall=true
-    export AIBOX_MODE="safe"
+  if [[ "$copy" == "true" ]]; then
+    _ensure_copy_all
   else
-    # No flag: ask about each setting
-    echo ""
-    echo "Container settings (per-session, not saved):"
-    echo ""
-
-    if _confirm_yes "Skip Claude Code permission prompts? (container is sandboxed)"; then
-      skip=true
-    fi
-
-    if _confirm_yes "Enable network firewall? (blocks all except Claude API, npm, GitHub, PyPI)"; then
-      firewall=true
-    else
-      firewall=false
-    fi
-
-    if [[ "$firewall" == "true" ]]; then
-      export AIBOX_MODE="safe"
-    else
-      export AIBOX_MODE="yolo"
-    fi
-
-    echo ""
+    _ensure_all
   fi
 
-  # If container is running in a different mode, restart it
-  if docker ps --format '{{.Names}}' | grep -Fxq "$CONTAINER_NAME"; then
-    local current_mode
-    current_mode=$(docker exec "$CONTAINER_NAME" sh -c 'echo ${AIBOX_MODE:-safe}' 2>/dev/null || echo "unknown")
-    if [[ "$current_mode" != "$AIBOX_MODE" ]]; then
-      _step "Restarting container in ${AIBOX_MODE} mode (was: ${current_mode})"
-      dc down --remove-orphans >/dev/null
-    fi
-  fi
-
-  cmd_up
-
-  local claude_args=()
-  if [[ "$skip" == "true" && "$has_skip_flag" == "false" ]]; then
-    claude_args+=(--dangerously-skip-permissions)
-  fi
-  # Forward all remaining args to claude (--resume, --print, --model, etc.)
-  if [[ $# -gt 0 ]]; then
-    claude_args+=("$@")
-  fi
-
-  local _exec_rc=0
-  if [[ ${#claude_args[@]} -gt 0 ]]; then
-    _docker_exec "$CONTAINER_NAME" claude "${claude_args[@]}" || _exec_rc=$?
+  if [[ "${args[0]}" == "claude" ]]; then
+    _ensure_claude_bin
+    local perm_flag=--allow-dangerously-skip-permissions
+    [[ "$yolo" == "true" ]] && perm_flag=--dangerously-skip-permissions
+    set -- "${args[@]}"; shift   # program args without the leading "claude"
+    _dexec claude "$perm_flag" "$@"
   else
-    _docker_exec "$CONTAINER_NAME" claude || _exec_rc=$?
+    _dexec "${args[@]}"
   fi
-  _maybe_stop_container "$CONTAINER_NAME"
-  return "$_exec_rc"
 }
 
 cmd_shell() {
-  if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -Fxq "$CONTAINER_NAME"; then
-    cmd_up
-  fi
-
-  local _exec_rc=0
-  shift  # remove "shell" from args
-  if [[ $# -gt 0 ]]; then
-    # Inline command: aibox shell echo hello
-    _docker_exec "$CONTAINER_NAME" zsh -c "$*" || _exec_rc=$?
+  _ensure_all
+  if [[ $# -eq 0 ]]; then
+    _dexec zsh
+  elif [[ $# -eq 1 ]]; then
+    _dexec zsh -lc "$1"                      # one arg = shell string: pipes/globs work
   else
-    _docker_exec "$CONTAINER_NAME" zsh || _exec_rc=$?
-  fi
-  _maybe_stop_container "$CONTAINER_NAME"
-  return "$_exec_rc"
-}
-
-# ── Port forwarding ──────────────────────────────────────────────
-PF_PREFIX="aibox-pf"
-
-_pf_container_name() {
-  # aibox-pf-{target_container}-{host_port}
-  echo "${PF_PREFIX}-${CONTAINER_NAME}-${1}"
-}
-
-_pf_list() {
-  local pf_containers
-  pf_containers=$(docker ps -a --filter "name=${PF_PREFIX}-${CONTAINER_NAME}-" --format '{{.Names}} {{.Status}}' 2>/dev/null) || true
-  if [[ -z "$pf_containers" ]]; then
-    echo "No active port forwards for ${CONTAINER_NAME}"
-    return
-  fi
-  printf "%-40s %-8s %-8s %s\n" "FORWARDER" "HOST" "TARGET" "STATUS"
-  printf "%-40s %-8s %-8s %s\n" "---------" "----" "------" "------"
-  while IFS= read -r line; do
-    local name status
-    name=$(echo "$line" | awk '{print $1}')
-    status=$(echo "$line" | cut -d' ' -f2-)
-    local host_port target_port
-    host_port=$(docker inspect "$name" --format '{{index .Config.Labels "aibox.pf.host_port"}}' 2>/dev/null || echo "?")
-    target_port=$(docker inspect "$name" --format '{{index .Config.Labels "aibox.pf.container_port"}}' 2>/dev/null || echo "?")
-    printf "%-40s %-8s %-8s %s\n" "$name" "$host_port" "$target_port" "$status"
-  done <<< "$pf_containers"
-}
-
-_pf_stop() {
-  local host_port="$1"
-  local pf_name
-  pf_name=$(_pf_container_name "$host_port")
-  if docker ps -a --format '{{.Names}}' | grep -Fxq "$pf_name"; then
-    docker rm -f "$pf_name" >/dev/null
-    _ok "Stopped port forward :${host_port}"
-  else
-    _err "No port forward found on host port ${host_port}"
-    return 1
+    _dexec zsh -lc "$(printf '%q ' "$@")"    # several = safely-quoted argv
   fi
 }
 
-_pf_stop_all() {
-  local pf_containers
-  pf_containers=$(docker ps -a --filter "name=${PF_PREFIX}-${CONTAINER_NAME}-" --format '{{.Names}}' 2>/dev/null) || true
-  if [[ -z "$pf_containers" ]]; then
-    echo "No active port forwards for ${CONTAINER_NAME}"
-    return
-  fi
-  echo "$pf_containers" | xargs docker rm -f >/dev/null
-  _ok "Stopped all port forwards for ${CONTAINER_NAME}"
-}
-
-_pf_start() {
-  local spec="$1"
-  local host_port container_port
-
-  if [[ "$spec" == *:* ]]; then
-    host_port="${spec%%:*}"
-    container_port="${spec##*:}"
-  else
-    host_port="$spec"
-    container_port="$spec"
-  fi
-
-  # Validate ports are numbers
-  if ! [[ "$host_port" =~ ^[0-9]+$ ]] || ! [[ "$container_port" =~ ^[0-9]+$ ]]; then
-    _err "Invalid port spec: ${spec} (expected PORT or HOST_PORT:CONTAINER_PORT)"
-    return 1
-  fi
-
-  local pf_name
-  pf_name=$(_pf_container_name "$host_port")
-
-  # Check if already forwarding (running)
-  if docker ps --format '{{.Names}}' | grep -Fxq "$pf_name"; then
-    _info "Already forwarding host:${host_port} → container:${container_port}"
+# ── Serve: phone/browser sessions (remote control) ───────────────
+# One model: every live session — brand new or revived — is one detached
+# `claude ... --remote-control` process in the project container, spawned
+# from the sessions UI (port 45789, via the dev proxy) or by any Claude
+# session (the shared CLAUDE.md teaches the command). No server mode and no
+# resume windows: a dead process's conversation is just a transcript on
+# disk, and Resume is the recovery. Registration is outbound HTTPS only.
+# `aibox serve` runs the UI; `aibox serve stop` also kills every session.
+cmd_serve() {
+  if [[ "${1:-}" == "stop" ]]; then
+    _ensure_docker
+    if [[ "$(_state "$CONTAINER")" == "running" ]]; then
+      # Each pkill as direct exec argv: a sh -c wrapper would carry the
+      # pattern in its own cmdline and be pkill's first victim, aborting
+      # the rest. pkill always excludes itself.
+      docker exec -u aibox "$CONTAINER" pkill -f aibox-serve-ui >/dev/null 2>&1 || true
+      docker exec -u aibox "$CONTAINER" pkill -f -- --remote-control >/dev/null 2>&1 || true
+      _ok "Stopped the sessions UI and all remote-control sessions for ${SLUG}."
+    else
+      _info "Not running: ${SLUG}"
+    fi
     return 0
   fi
+  [[ $# -eq 0 ]] || _die "Usage: aibox serve [stop]"
 
-  # Remove stale/stopped sidecar with the same name
-  if docker ps -a --format '{{.Names}}' | grep -Fxq "$pf_name"; then
-    docker rm -f "$pf_name" >/dev/null
+  _ensure_all
+  _ensure_claude_bin
+
+  # Sessions UI (idempotent: rewrite the file, start only if not running).
+  docker exec -i -u aibox "$CONTAINER" sh -c 'mkdir -p "$HOME/.aibox-serve" && cat > "$HOME/.aibox-serve/ui.js"' <<'UIJS'
+// aibox sessions UI — generated by aibox (rewritten on every `aibox serve`).
+// Lists this project's transcripts; a click revives one as a remote session.
+const http = require("http"), fs = require("fs"), path = require("path"), cp = require("child_process");
+const PORT = 45789;
+const HOME = process.env.HOME || "/home/aibox";
+const DIR = path.join(HOME, ".claude", "projects", process.cwd().replace(/[^A-Za-z0-9]/g, "-"));
+const esc = s => s.replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+const PROJECT = esc(path.basename(process.cwd()));
+
+function firstUserText(file) {
+  try {
+    const fd = fs.openSync(file, "r"), buf = Buffer.alloc(262144);
+    const n = fs.readSync(fd, buf, 0, buf.length, 0);
+    fs.closeSync(fd);
+    for (const line of buf.slice(0, n).toString("utf8").split("\n")) {
+      if (!line.trim()) continue;
+      let j; try { j = JSON.parse(line); } catch (e) { continue; }
+      if (j.type === "user" && j.message && !j.isMeta) {
+        const c = j.message.content;
+        let t = typeof c === "string" ? c : Array.isArray(c) ? c.map(x => x.text || "").join(" ") : "";
+        t = t.replace(/\s+/g, " ").trim();
+        if (!t || t.startsWith("Caveat:") || t.startsWith("<command-")) continue;
+        return t.slice(0, 90);
+      }
+    }
+  } catch (e) {}
+  return "Untitled session";
+}
+// Conversation turns only (transcripts also carry tool results and other
+// bookkeeping lines); cached by size+mtime — transcripts can be many MB and
+// this runs on every poll.
+const countCache = {};
+function messageCount(file, st) {
+  const c = countCache[file];
+  if (c && c.size === st.size && c.mtimeMs === st.mtimeMs) return c.n;
+  let n = 0;
+  try {
+    for (const l of fs.readFileSync(file, "utf8").split("\n"))
+      if (l.includes("\"type\":\"user\"") || l.includes("\"type\":\"assistant\"")) n++;
+  } catch (e) { return 0; }
+  countCache[file] = { size: st.size, mtimeMs: st.mtimeMs, n: n };
+  return n;
+}
+function liveIds(cb) {
+  cp.exec("pgrep -fa -- --remote-control || true", (e, out) => {
+    const ids = new Set();
+    String(out || "").split("\n").forEach(l => {
+      const m = l.match(/(?:--resume|--session-id)[= ]([0-9a-f-]{36})/);
+      if (m) ids.add(m[1]);
+    });
+    cb(ids);
+  });
+}
+function sessions(cb) {
+  let files = [];
+  try { files = fs.readdirSync(DIR).filter(f => f.endsWith(".jsonl")); } catch (e) {}
+  liveIds(live => {
+    const list = [];
+    files.forEach(f => {
+      // Per-file guard: a transcript can vanish between readdir and stat
+      // (Claude Code cleanup, manual rm) — that must not kill the server.
+      try {
+        const p = path.join(DIR, f), st = fs.statSync(p), id = f.slice(0, -6);
+        list.push({ id, mtime: st.mtimeMs, title: firstUserText(p), messages: messageCount(p, st), live: live.has(id) });
+      } catch (e) {}
+    });
+    list.sort((a, b) => b.mtime - a.mtime);
+    // Live processes whose transcript has not appeared yet (a session
+    // spawned moments ago) still deserve a row.
+    const known = new Set(list.map(s => s.id));
+    live.forEach(id => {
+      if (!known.has(id)) list.unshift({ id, mtime: Date.now(), title: "New session — say something to it", messages: 0, live: true });
+    });
+    cb(list);
+  });
+}
+const PAGE = `<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${PROJECT} — aibox</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&display=swap">
+<style>
+:root{--bg:#F6F7F8;--surface:#FFF;--ink:#23282E;--muted:#78828C;--line:#ECEEF0;--accent:#12808F;--accent-soft:#E7F3F4;--accent-ink:#FFF;--live:#2E9E5B;--live-soft:#E9F6EE}
+@media(prefers-color-scheme:dark){:root{--bg:#14181C;--surface:#1D2329;--ink:#E9EDF0;--muted:#8E99A3;--line:#2A323A;--accent:#4FB6C2;--accent-soft:#1C3A3F;--accent-ink:#10161A;--live:#52C081;--live-soft:#1D3529}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:"Instrument Sans",system-ui,sans-serif;font-size:15px;line-height:1.5}
+.wrap{max-width:640px;margin:0 auto;padding:48px 20px 72px}
+.eyebrow{font-size:12px;font-weight:600;letter-spacing:.12em;text-transform:uppercase;color:var(--accent);margin:0 0 10px}
+h1{margin:0 0 6px;font-size:30px;font-weight:700;letter-spacing:-.02em}
+.status{display:flex;align-items:center;gap:8px;font-size:14px;color:var(--muted);margin:0 0 28px}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--live)}
+.card{background:var(--surface);border-radius:14px;box-shadow:0 1px 2px rgba(30,40,50,.05),0 4px 16px rgba(30,40,50,.05);overflow:hidden}
+.row{display:flex;align-items:center;gap:16px;padding:18px 22px}
+.row+.row{border-top:1px solid var(--line)}
+.rm{flex:1;min-width:0}
+.t{margin:0 0 3px;font-size:15.5px;font-weight:600}
+.t a{color:inherit;text-decoration:none}.t a:hover{color:var(--accent)}
+.m{margin:0;font-size:13px;color:var(--muted)}
+.tag{display:inline-flex;align-items:center;gap:6px;font-size:12.5px;font-weight:600;color:var(--live);background:var(--live-soft);border-radius:999px;padding:4px 12px}
+.tag:before{content:"";width:6px;height:6px;border-radius:50%;background:var(--live)}
+a.open,button.res{font-family:inherit;font-size:13.5px;font-weight:600;border-radius:999px;padding:7px 16px;cursor:pointer;text-decoration:none;border:none}
+a.open{color:var(--accent-ink);background:var(--accent)}
+button.res{color:var(--accent);background:var(--accent-soft)}
+button.res:hover{background:var(--accent);color:var(--accent-ink)}
+button.res[disabled]{opacity:.6;cursor:wait}
+.hrow{display:flex;align-items:center;justify-content:space-between;gap:16px}
+button.newb{font-family:inherit;font-size:13.5px;font-weight:600;border:none;border-radius:999px;padding:8px 18px;background:var(--accent);color:var(--accent-ink);cursor:pointer}
+button.newb[disabled]{opacity:.6;cursor:wait}
+button.stopb{font-family:inherit;font-size:13px;font-weight:600;border:none;background:none;color:var(--muted);cursor:pointer;padding:7px 6px}
+button.stopb:hover{color:var(--ink)}
+.empty{padding:36px 22px;color:var(--muted);text-align:center}
+.hint{margin:18px 6px 0;font-size:13px;color:var(--muted)}
+</style></head><body><div class="wrap">
+<p class="eyebrow">aibox</p>
+<div class="hrow"><h1>${PROJECT}</h1><button class="newb" id="new">New session</button></div>
+<p class="status"><span class="dot"></span><span id="st">Loading…</span></p>
+<div class="card" id="list"><div class="empty">Loading…</div></div>
+<p class="hint">Resuming brings a session back within a few seconds — it also appears in the Claude app on your phone.</p>
+</div><script>
+function ago(ms){const s=(Date.now()-ms)/1e3;if(s<90)return "just now";const m=s/60,h=m/60,d=h/24,w=d/7;
+  if(m<90)return Math.round(m)+" minutes ago";if(h<36)return Math.round(h)+" hours ago";
+  if(d<10)return Math.round(d)+" days ago";return Math.round(w)+" weeks ago"}
+function render(list){
+  const el=document.getElementById("list");
+  document.getElementById("st").textContent=list.filter(x=>x.live).length+" live · "+list.length+" sessions";
+  if(!list.length){el.innerHTML="<div class=empty>No sessions yet — run aibox in this project and talk to Claude.</div>";return}
+  el.innerHTML="";
+  list.forEach(s=>{
+    const row=document.createElement("div");row.className="row";
+    const url="https://claude.ai/code/"+s.id;
+    const main=document.createElement("div");main.className="rm";
+    const t=document.createElement("p");t.className="t";
+    if(s.live){const a=document.createElement("a");a.href=url;a.target="_blank";a.textContent=s.title;t.appendChild(a)}
+    else t.textContent=s.title;
+    const m=document.createElement("p");m.className="m";m.textContent=ago(s.mtime)+" · "+s.messages+" messages";
+    main.appendChild(t);main.appendChild(m);row.appendChild(main);
+    if(s.live){
+      const tag=document.createElement("span");tag.className="tag";tag.textContent="Live";row.appendChild(tag);
+      const a=document.createElement("a");a.className="open";a.href=url;a.target="_blank";a.textContent="Open";row.appendChild(a);
+      const st=document.createElement("button");st.className="stopb";st.textContent="Stop";
+      st.onclick=()=>{st.disabled=true;fetch("/api/stop?id="+s.id,{method:"POST"}).then(()=>setTimeout(load,1200))};
+      row.appendChild(st);
+    }else{
+      const b=document.createElement("button");b.className="res";b.textContent="Resume";
+      b.onclick=()=>{b.disabled=true;b.textContent="Starting…";
+        fetch("/api/resume?id="+s.id,{method:"POST"}).then(()=>setTimeout(load,2500))};
+      row.appendChild(b);
+    }
+    el.appendChild(row);
+  });
+}
+function load(){fetch("/api/sessions").then(r=>r.json()).then(render)}
+document.getElementById("new").onclick=()=>{
+  const b=document.getElementById("new");b.disabled=true;b.textContent="Starting…";
+  fetch("/api/new",{method:"POST"}).then(()=>setTimeout(()=>{b.disabled=false;b.textContent="New session";load()},2000));
+};
+load();setInterval(load,15000);
+</script></body></html>`;
+function spawnSession(args) {
+  const c = cp.spawn("script", ["-qfc", "claude " + args + " --remote-control", "/dev/null"],
+    { detached: true, stdio: "ignore", cwd: process.cwd() });
+  c.on("error", function () {});
+  c.unref();
+}
+http.createServer((req, res) => {
+  let u;
+  // Request-targets like "//" make new URL() throw — a crash here would
+  // kill the whole UI.
+  try { u = new URL(req.url, "http://x"); } catch (e) { res.writeHead(400); return res.end("bad request"); }
+  if (req.method === "POST" && u.pathname === "/api/new") {
+    const id = require("crypto").randomUUID();
+    spawnSession("--session-id " + id);
+    res.writeHead(200, { "content-type": "application/json" });
+    return res.end(JSON.stringify({ ok: true, id: id }));
+  }
+  if (req.method === "POST" && u.pathname === "/api/stop") {
+    const id = String(u.searchParams.get("id") || "");
+    if (!/^[0-9a-f-]{36}$/.test(id)) { res.writeHead(400); return res.end("bad id"); }
+    // id is regex-vetted above, so interpolating it into the shell is safe
+    cp.exec("pkill -f -- \"(--resume|--session-id)[= ]" + id + "\" || true", () => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("{\"ok\":true}");
+    });
+    return;
+  }
+  if (req.method === "POST" && u.pathname === "/api/resume") {
+    const id = String(u.searchParams.get("id") || "");
+    if (!/^[0-9a-f-]{36}$/.test(id)) { res.writeHead(400); return res.end("bad id"); }
+    return liveIds(live => {
+      // Double-resume would attach two claude processes to one transcript
+      // (clients on several devices share this page).
+      if (live.has(id)) { res.writeHead(409); return res.end("already live"); }
+      spawnSession("--resume " + id);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("{\"ok\":true}");
+    });
+  }
+  if (u.pathname === "/api/sessions") {
+    return sessions(list => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(list));
+    });
+  }
+  res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+  res.end(PAGE);
+  // Container-wide bind is what lets the dev proxy reach us; the accepted
+  // trade-off is that other containers on the aibox network can reach it
+  // too. Endpoints only spawn/stop sessions of THIS project.
+}).listen(PORT, "0.0.0.0");
+UIJS
+  if ! docker exec -u aibox "$CONTAINER" pgrep -f aibox-serve-ui >/dev/null 2>&1; then
+    # The tag rides as an (ignored) node argv so it survives exec and is
+    # visible to pgrep/pkill — a comment in bash -c would be erased by exec.
+    docker exec -d -u aibox -w "$PROJECT_DIR" "$CONTAINER" bash -c \
+      'exec node "$HOME/.aibox-serve/ui.js" aibox-serve-ui >>"$HOME/.aibox-serve/ui.log" 2>&1'
   fi
 
-  # Get the compose network name (take first if multiple)
-  local network
-  network=$(docker inspect "$CONTAINER_NAME" --format '{{range $net,$v := .NetworkSettings.Networks}}{{$net}}{{"\n"}}{{end}}' 2>/dev/null | head -1)
-  if [[ -z "$network" ]]; then
-    _err "Cannot determine network for ${CONTAINER_NAME}"
-    return 1
-  fi
-
-  # Pull socat image if needed (only first time)
-  if ! docker image inspect alpine/socat &>/dev/null; then
-    _info "Pulling alpine/socat image..."
-    docker pull alpine/socat >/dev/null
-  fi
-
-  # Start sidecar socat container on the same network
-  # Use container name as DNS target (compose networks register containers by name)
-  if ! docker run -d \
-    --name "$pf_name" \
-    --network "$network" \
-    --publish "${host_port}:${host_port}" \
-    --label "aibox.pf.target=${CONTAINER_NAME}" \
-    --label "aibox.pf.host_port=${host_port}" \
-    --label "aibox.pf.container_port=${container_port}" \
-    --restart unless-stopped \
-    alpine/socat \
-    "TCP-LISTEN:${host_port},fork,reuseaddr" "TCP-CONNECT:${CONTAINER_NAME}:${container_port}" \
-    >/dev/null 2>&1; then
-    _err "Failed to forward port ${host_port} (is it already in use?)"
-    return 1
-  fi
-
-  _ok "Forwarding host:${host_port} → container:${container_port}"
+  _ok "Sessions UI: $(_dev_url 45789) — new session, resume, live list."
+  _info "Sessions started there register with claude.ai (Claude app included) and keep running after this terminal closes. End everything with: aibox serve stop"
 }
 
-_pf_cleanup() {
-  # Remove all port-forward sidecars for a container
-  local target_name="$1"
-  local pf_containers
-  pf_containers=$(docker ps -a --filter "name=${PF_PREFIX}-${target_name}-" --format '{{.Names}}' 2>/dev/null) || true
-  if [[ -n "$pf_containers" ]]; then
-    echo "$pf_containers" | xargs docker rm -f >/dev/null
-    _ok "Removed port forwards"
-  fi
+# Plumbing for the host-side sessions page (and handy on its own): make one
+# past session of THIS project drivable from claude.ai / the Claude app.
+cmd_rc_resume() {
+  [[ "${1:-}" =~ ^[0-9a-f-]{36}$ ]] || _die "Usage: aibox rc-resume <session-id>"
+  _ensure_all
+  _ensure_claude_bin
+  docker exec -d -u aibox -w "$PROJECT_DIR" "$CONTAINER" \
+    script -qfc "claude --resume $1 --remote-control" /dev/null
+  _ok "Session registering — it appears in the claude.ai / Claude app list shortly."
 }
 
-cmd_port_forward() {
-  shift  # remove "port-forward" from args
+# ── Sessions page (host-side, foreground, all projects) ──────────
+# `aibox sessions` runs a small Node server ON THE HOST (node is present by
+# construction — aibox installs via npm), loopback-only, and opens the
+# browser. Not a daemon: Ctrl-C or the page's Close button ends it. Listing
+# is read via a throwaway container with the volume mounted read-only; the
+# Terminal/Phone actions shell back into aibox itself.
+cmd_sessions() {
+  _ensure_docker
+  _ensure_image
+  command -v node >/dev/null 2>&1 \
+    || _die "aibox sessions needs node on the host (it comes with the npm install of aibox)."
 
-  # Handle flags
-  case "${1:-}" in
-    --list|-l)
-      _pf_list
-      return
-      ;;
-    --stop-all)
-      _pf_stop_all
-      return
-      ;;
-    --stop)
-      shift
-      if [[ -z "${1:-}" ]]; then
-        _err "Usage: ${SCRIPT_NAME} port-forward --stop PORT"
-        return 1
-      fi
-      _pf_stop "$1"
-      return
-      ;;
-    "")
-      _err "Usage: ${SCRIPT_NAME} port-forward PORT [PORT...]"
-      echo "  PORT can be HOST_PORT:CONTAINER_PORT or just PORT (same for both)"
-      echo ""
-      echo "  Examples:"
-      echo "    ${SCRIPT_NAME} port-forward 3000"
-      echo "    ${SCRIPT_NAME} port-forward 8080:3000"
-      echo "    ${SCRIPT_NAME} port-forward 3000 5173"
-      echo ""
-      echo "  Management:"
-      echo "    ${SCRIPT_NAME} port-forward --list"
-      echo "    ${SCRIPT_NAME} port-forward --stop 3000"
-      echo "    ${SCRIPT_NAME} port-forward --stop-all"
-      return 1
-      ;;
-  esac
+  cat > "${CONFIG_DIR}/sessions-lister.js" <<'LISTER'
+// Runs inside a container with the aibox-home volume mounted read-only at
+// /v (AIBOX_LIST_ROOT overrides the root, for testing outside docker). Prints all projects' sessions
+// as JSON on stdout.
+const fs = require("fs"), path = require("path");
+const ROOT = process.env.AIBOX_LIST_ROOT || "/v";
+// Deep search: with AIBOX_SEARCH set, only sessions whose metadata OR full
+// transcript contains the (case-insensitive) query are emitted.
+const Q = (process.env.AIBOX_SEARCH || "").toLowerCase().slice(0, 200);
+function fileHas(p, q) {
+  try {
+    const fd = fs.openSync(p, "r"), CH = 4 * 1024 * 1024, b = Buffer.alloc(CH);
+    // StringDecoder buffers a codepoint split across chunk reads — a plain
+    // per-chunk toString would mangle it and silently miss the match.
+    const dec = new (require("string_decoder").StringDecoder)("utf8");
+    let pos = 0, carry = "";
+    for (;;) {
+      const n = fs.readSync(fd, b, 0, CH, pos);
+      if (n <= 0) break;
+      const s = carry + dec.write(b.slice(0, n));
+      if (s.toLowerCase().includes(q)) { fs.closeSync(fd); return true; }
+      carry = s.slice(-q.length);   // query straddling a chunk boundary
+      pos += n;
+      if (n < CH) break;
+    }
+    fs.closeSync(fd);
+  } catch (e) {}
+  return false;
+}
+function msgText(m) {
+  const c = m.content;
+  const t = typeof c === "string" ? c : Array.isArray(c) ? c.map(x => x.text || "").join(" ") : "";
+  return t.replace(/\s+/g, " ").trim();
+}
+function parseLine(l) { try { return JSON.parse(l); } catch (e) { return null; } }
+// Title prefers Claude Code's own summary records (what its resume picker
+// shows); falls back to the first real user message. `last` is the tail of
+// the conversation — the most recent assistant text. Reads only a head and
+// a tail window, transcripts can be many MB.
+function info(file, size) {
+  let head = "", tail = "";
+  try {
+    const fd = fs.openSync(file, "r");
+    const rd = (pos, len) => {
+      const b = Buffer.alloc(len), n = fs.readSync(fd, b, 0, len, pos);
+      return b.slice(0, n).toString("utf8");
+    };
+    head = rd(0, 262144);
+    if (size > 262144) tail = rd(Math.max(0, size - 131072), 131072);
+    fs.closeSync(fd);
+  } catch (e) { return { title: "Untitled session", summary: "", last: "", lastUser: "" }; }
+  let firstUser = "", summary = "", last = "";
+  for (const l of head.split("\n")) {
+    const j = parseLine(l); if (!j) continue;
+    if (j.type === "summary" && j.summary) summary = j.summary;
+    if (!firstUser && j.type === "user" && j.message && !j.isMeta) {
+      const t = msgText(j.message);
+      if (t && !t.startsWith("Caveat:") && !t.startsWith("<command-")) firstUser = t;
+    }
+  }
+  const tl = (tail || head).split("\n");
+  let tailSummary = "", lastUser = "";
+  for (let i = tl.length - 1; i >= 0; i--) {
+    const j = parseLine(tl[i]); if (!j) continue;
+    if (!tailSummary && j.type === "summary" && j.summary) tailSummary = j.summary;
+    if (!last && j.type === "assistant" && j.message) {
+      const t = msgText(j.message);
+      if (t) last = t.slice(0, 2000);
+    }
+    if (!lastUser && j.type === "user" && j.message && !j.isMeta) {
+      const t = msgText(j.message);
+      if (t && !t.startsWith("Caveat:") && !t.startsWith("<command-")) lastUser = t.slice(0, 500);
+    }
+    if (last && lastUser && tailSummary) break;
+  }
+  const sum = tailSummary || summary;
+  return {
+    title: (sum || firstUser || "Untitled session").slice(0, 100),
+    summary: sum.slice(0, 600),
+    last: last,
+    lastUser: lastUser
+  };
+}
+const out = [];
+function addDir(dir, ppath, label) {
+  let files = []; try { files = fs.readdirSync(dir); } catch (e) { return; }
+  for (const f of files) {
+    if (!f.endsWith(".jsonl")) continue;
+    try {
+      const p = path.join(dir, f), st = fs.statSync(p), inf = info(p, st.size);
+      if (Q) {
+        const meta = (inf.title + " " + inf.summary + " " + inf.last + " " + inf.lastUser + " " + label + " " + f).toLowerCase();
+        if (!meta.includes(Q) && !fileHas(p, Q)) continue;
+      }
+      out.push({ project: ppath, label: label, id: f.slice(0, -6), mtime: st.mtimeMs,
+                 title: inf.title, summary: inf.summary, last: inf.last, lastUser: inf.lastUser });
+    } catch (e) {}
+  }
+}
+// New layout: per-project slices.
+let hashes = [];
+try { hashes = fs.readdirSync(path.join(ROOT, "projects")); } catch (e) {}
+for (const h of hashes) {
+  const base = path.join(ROOT, "projects", h);
+  // A slice without its .aibox-path sentinel (pre-fix migrations wrote
+  // none) is still listed — pathless, so copy-only, labelled by hash.
+  let ppath = "";
+  try { ppath = fs.readFileSync(path.join(base, ".aibox-path"), "utf8"); } catch (e) {}
+  const cp = path.join(base, "claude-projects");
+  let encs = []; try { encs = fs.readdirSync(cp); } catch (e) {}
+  for (const enc of encs) addDir(path.join(cp, enc), ppath, ppath || "slice " + h);
+}
+// Legacy / not-yet-migrated layout (and post-migration leftovers). Dir
+// names are lossy encodings; real paths come from .claude.json KEYS with
+// the same rule the migration uses. Unmatched dirs are listed anyway with
+// no project path — the page then offers copy-only.
+const legacyRoot = path.join(ROOT, ".claude", "projects");
+let legacy = []; try { legacy = fs.readdirSync(legacyRoot); } catch (e) {}
+if (legacy.length) {
+  const map = {};
+  try {
+    const cj = fs.readFileSync(path.join(ROOT, ".claude", ".claude.json"), "utf8");
+    for (const m of cj.matchAll(/"(\/[^"]*)":/g)) map[m[1].replace(/[^a-zA-Z0-9]/g, "-")] = m[1];
+  } catch (e) {}
+  for (const enc of legacy) addDir(path.join(legacyRoot, enc), map[enc] || "", map[enc] || enc);
+}
+out.sort((a, b) => b.mtime - a.mtime);
+console.log(JSON.stringify(out));
+LISTER
 
-  # Ensure container is running
-  if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -Fxq "$CONTAINER_NAME"; then
-    cmd_up
-  fi
+  cat > "${CONFIG_DIR}/sessions-ui.js" <<'SESSJS'
+// aibox sessions — host-side page over all projects' sessions. Generated by
+// aibox (rewritten on every run). Foreground; Close button or Ctrl-C ends it.
+const http = require("http"), fs = require("fs"), cp = require("child_process");
+const PORT = 45790, URLBASE = "http://127.0.0.1:" + PORT;
+const IMAGE = process.env.AIBOX_IMAGE, VOLUME = process.env.AIBOX_VOLUME, CFG = process.env.AIBOX_CFG;
+let known = new Set();   // "path\nid" pairs from the last listing — action guards
+function list(cb, q) {
+  // --entrypoint bypasses the aibox image entrypoint, which would otherwise
+  // try to install claude into the (empty) image-local home before running
+  // the lister — minutes of hang on every listing. q (deep search) travels
+  // as an env var: argv only, no shell anywhere.
+  const args = ["run", "--rm", "--entrypoint", "node",
+    "-v", VOLUME + ":/v:ro",
+    "-v", CFG + "/sessions-lister.js:/lister.js:ro"];
+  if (q) args.push("-e", "AIBOX_SEARCH=" + q);
+  args.push(IMAGE, "/lister.js");
+  cp.execFile("docker", args, { maxBuffer: 64 * 1024 * 1024 }, (e, out) => {
+    // On errors keep the previous `known` — stale-but-real pairs beat
+    // rejecting every action on rows still visible from the last listing.
+    if (e) { return cb(null, "Could not read sessions (is docker running?). Details in the aibox sessions terminal."), console.error(e.message); }
+    let l = [];
+    try { l = JSON.parse(out); } catch (err) { return cb(null, "Could not parse the session list."); }
+    const pairs = l.map(s => s.project + "\n" + s.id);
+    // Deep-search results are a subset: union them in, so rows from the
+    // cached full list stay actionable; full listings replace (self-heal).
+    if (q) pairs.forEach(x => known.add(x)); else known = new Set(pairs);
+    cb(l, null);
+  });
+}
+function vetted(u) {
+  const p = String(u.searchParams.get("path") || ""), id = String(u.searchParams.get("id") || "");
+  // Pathless (legacy-orphan) sessions are copy-only — no shell actions.
+  // id is also charset-checked as defense in depth; every branch that
+  // interpolates these into a command still shell-quotes them.
+  if (!p || !/^[0-9a-f-]{36}$/.test(id)) return null;
+  return known.has(p + "\n" + id) ? { p, id } : null;
+}
+// POSIX single-quote a string for embedding in a shell command. Paths and
+// ids reaching a shell come from volume contents (.aibox-path, .claude.json
+// keys, transcript filenames) — treat them as hostile.
+function shq(s) { return "'" + String(s).replace(/'/g, "'\\''") + "'"; }
+const AIBOX = process.env.AIBOX_BIN || "aibox";
+// Nothing but one file path reaches the terminal app: Ghostty 1.2+ treats
+// every existing path in its argv as a file to open (an executable gets
+// run as "<path>; exit" from its own folder), which mangled the earlier
+// `--args -e bash -lc ... <project> <aibox>` form. Both Ghostty and
+// Terminal run an executable .command file handed to them by `open`, so
+// the whole command lives inside that file, shell-quoted. On failure it
+// holds the window open so the error can be read.
+function openTerminal(p, id, cb) {
+  if (process.platform !== "darwin") return cb("Opening a terminal is macOS-only — use Copy instead.");
+  const dir = CFG + "/open", file = dir + "/" + id + ".command";
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(file, "#!/bin/bash\ncd " + shq(p) + " && " + shq(AIBOX) + " --resume " + shq(id) +
+      " || { echo; echo \"[exited $?] press Enter to close\"; read -r _; }\n", { mode: 0o700 });
+    fs.chmodSync(file, 0o700);
+  } catch (e) { return cb("Could not write the launcher: " + e.message); }
+  const app = fs.existsSync("/Applications/Ghostty.app") ? "Ghostty" : "Terminal";
+  cp.execFile("open", ["-a", app, file], e => cb(e ? "Could not open " + app + ": " + e.message : null));
+}
+const PAGE = `<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>aibox sessions</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&display=swap">
+<style>
+:root{--bg:#F6F7F8;--surface:#FFF;--ink:#23282E;--muted:#78828C;--line:#ECEEF0;--accent:#12808F;--accent-soft:#E7F3F4;--accent-ink:#FFF}
+@media(prefers-color-scheme:dark){:root{--bg:#14181C;--surface:#1D2329;--ink:#E9EDF0;--muted:#8E99A3;--line:#2A323A;--accent:#4FB6C2;--accent-soft:#1C3A3F;--accent-ink:#10161A}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:"Instrument Sans",system-ui,-apple-system,sans-serif;font-size:15px;line-height:1.5;-webkit-font-smoothing:antialiased}
+.wrap{max-width:760px;margin:0 auto;padding:44px 20px 72px}
+.hrow{display:flex;align-items:baseline;justify-content:space-between;gap:12px;flex-wrap:wrap;margin:0 0 4px}
+.eyebrow{font-size:12px;font-weight:600;letter-spacing:.12em;text-transform:uppercase;color:var(--accent);margin:0 0 10px}
+h1{margin:0;font-size:28px;font-weight:700;letter-spacing:-.02em}
+.tools{display:flex;gap:8px}
+.tools button{font-family:inherit;font-size:13px;font-weight:600;border:none;border-radius:999px;padding:7px 14px;cursor:pointer;background:var(--accent-soft);color:var(--accent)}
+.tools button:hover{background:var(--accent);color:var(--accent-ink)}
+.sub{font-size:14px;color:var(--muted);margin:4px 0 16px}
+.search{margin:0 0 18px}
+.search input{width:100%;font-family:inherit;font-size:14px;padding:10px 14px;border:1px solid var(--line);border-radius:10px;background:var(--surface);color:var(--ink);outline:none}
+.search input:focus{border-color:var(--accent)}
+.search input::placeholder{color:var(--muted)}
+.banner{background:#FBEDE3;color:#8A4B24;border-radius:10px;padding:12px 16px;font-size:13.5px;margin:0 0 20px}
+@media(prefers-color-scheme:dark){.banner{background:#3A2517;color:#E7B48C}}
+.card{background:var(--surface);border-radius:14px;box-shadow:0 1px 2px rgba(30,40,50,.05),0 4px 16px rgba(30,40,50,.05);overflow:hidden}
+.row{padding:16px 20px;display:flex;flex-direction:column;gap:10px}
+.row+.row{border-top:1px solid var(--line)}
+.meta{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12.5px;color:var(--muted)}
+.chip{font-size:11.5px;font-weight:600;color:var(--accent);background:var(--accent-soft);border-radius:6px;padding:2px 8px}
+.live{font-size:11.5px;font-weight:700;color:#B45309;background:#FDECCF;border-radius:6px;padding:2px 8px}
+@media(prefers-color-scheme:dark){.live{color:#F0C077;background:#3A2A12}}
+.path{overflow-wrap:anywhere}
+.head{display:flex;align-items:flex-start;gap:10px;cursor:pointer}
+.chev{flex:none;color:var(--muted);font-size:11px;margin-top:5px;transition:transform .15s ease}
+.row.open .chev{transform:rotate(90deg)}
+.hmain{flex:1;min-width:0;display:flex;flex-direction:column;gap:6px}
+.t{margin:0;font-size:15.5px;font-weight:600;letter-spacing:-.005em;overflow-wrap:anywhere}
+.last{margin:0;font-size:13px;color:var(--muted);overflow-wrap:anywhere;
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.row.open .last{display:none}
+.detail{display:none;background:var(--bg);border-radius:10px;padding:14px 16px;flex-direction:column;gap:14px}
+.row.open .detail{display:flex}
+.dl{font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin:0 0 4px}
+.dt{margin:0;font-size:13.5px;line-height:1.55;white-space:pre-wrap;overflow-wrap:anywhere;max-height:320px;overflow-y:auto}
+.acts{display:flex;gap:8px;flex-wrap:wrap}
+.acts button{font-family:inherit;font-size:13px;font-weight:600;border:1px solid var(--line);background:var(--surface);color:var(--ink);border-radius:8px;padding:7px 14px;cursor:pointer}
+.acts button:hover{border-color:var(--accent);color:var(--accent)}
+.acts button.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
+.acts button.primary:hover{filter:brightness(1.08);color:var(--accent-ink)}
+.empty{padding:40px 22px;color:var(--muted);text-align:center;line-height:1.6}
+.toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%) translateY(120px);background:var(--ink);color:var(--bg);font-size:13.5px;font-weight:500;padding:11px 20px;border-radius:999px;box-shadow:0 6px 24px rgba(0,0,0,.18);transition:transform .25s ease;max-width:calc(100vw - 32px)}
+.toast.show{transform:translateX(-50%) translateY(0)}
+@media(prefers-reduced-motion:reduce){.toast{transition:none}}
+</style></head><body><div class="wrap">
+<p class="eyebrow">aibox</p>
+<div class="hrow"><h1>Sessions</h1><div class="tools">
+<button id="refresh">Refresh</button><button id="close">Close</button></div></div>
+<p class="sub" id="sub">Loading…</p>
+<div class="search"><input id="q" type="search"
+  placeholder="Search titles and previews — press Enter to search inside full transcripts"></div>
+<div id="banner"></div>
+<div class="card" id="list"><div class="empty">Loading…</div></div>
+</div><div class="toast" id="toast" role="status"></div><script>
+const toast=document.getElementById("toast");let tt;
+function say(m){toast.textContent=m;toast.classList.add("show");clearTimeout(tt);tt=setTimeout(()=>toast.classList.remove("show"),3400)}
+function ago(ms){const s=(Date.now()-ms)/1e3;if(s<90)return "just now";const m=s/60,h=m/60,d=h/24;
+  if(m<90)return Math.round(m)+" min ago";if(h<36)return Math.round(h)+" hr ago";
+  if(d<10)return Math.round(d)+" days ago";return Math.round(d/7)+" wk ago"}
+function shq(s){return "'"+String(s).replace(/'/g,"'\\''")+"'"}
+function act(path,id,ep,okMsg){
+  const q="?path="+encodeURIComponent(path)+"&id="+encodeURIComponent(id);
+  fetch("/api/"+ep+q,{method:"POST"}).then(r=>r.json()).then(j=>say(j.error||okMsg)).catch(()=>say("Server stopped — restart aibox sessions."))
+}
+// A session touched within ~2 min is very likely open in a terminal right
+// now; resuming it starts a SECOND claude on the same conversation.
+function isActive(s){return Date.now()-s.mtime < 120000}
+function el(tag,cls,txt){const e=document.createElement(tag);if(cls)e.className=cls;if(txt!=null)e.textContent=txt;return e}
+function render(list){
+  document.getElementById("sub").textContent=
+    list.length+" session"+(list.length===1?"":"s")+" across "+new Set(list.map(s=>s.label)).size+" project"+(new Set(list.map(s=>s.label)).size===1?"":"s");
+  const box=document.getElementById("list");
+  if(!list.length){box.innerHTML="<div class=empty>No sessions found in the aibox-home volume.<br>If you just updated aibox and see this, check that Docker is running, then Refresh.</div>";return}
+  box.innerHTML="";
+  list.forEach(s=>{
+    const active=isActive(s);
+    const row=el("div","row");
+    // Clickable header: expands the row to the summary + full last reply.
+    const head=el("div","head");
+    head.appendChild(el("span","chev","▶"));
+    const hmain=el("div","hmain");
+    hmain.appendChild(el("p","t",s.title));
+    if(s.last)hmain.appendChild(el("p","last",s.last));
+    const meta=el("div","meta");
+    meta.appendChild(el("span","chip",s.label.split("/").filter(Boolean).pop()||s.label));
+    if(active)meta.appendChild(el("span","live","● active now"));
+    meta.appendChild(el("span",null,ago(s.mtime)));
+    meta.appendChild(el("span","path","· "+s.label));
+    hmain.appendChild(meta);
+    head.appendChild(hmain);
+    row.appendChild(head);
+    const detail=el("div","detail");
+    const section=(label,text)=>{const d=el("div");d.appendChild(el("p","dl",label));d.appendChild(el("p","dt",text));detail.appendChild(d)};
+    if(s.summary)section("Summary",s.summary);
+    if(s.lastUser)section("Your last message",s.lastUser);
+    if(s.last)section("Last reply",s.last);
+    if(!s.summary&&!s.last&&!s.lastUser)section("Details","Nothing readable in this transcript yet.");
+    row.appendChild(detail);
+    head.onclick=()=>row.classList.toggle("open");
+    const acts=el("div","acts");
+    const resume=(fn,warnMsg)=>()=>{ if(active && !confirm(warnMsg)) return; fn(); };
+    if(s.project){
+      const bT=el("button",active?null:"primary","Open in terminal");
+      bT.onclick=resume(()=>act(s.project,s.id,"terminal","Opening a terminal…"),
+        "This session looks active in another window. Opening it here starts a SECOND Claude on the same conversation. Continue?");
+      acts.appendChild(bT);
+    }
+    const bC=el("button",null,"Copy resume command");
+    bC.onclick=()=>{
+      const cmd=s.project?("cd "+shq(s.project)+" && aibox --resume "+s.id):("aibox --resume "+s.id);
+      navigator.clipboard.writeText(cmd).then(
+        ()=>say(s.project?"Copied — paste into any terminal tab.":"Copied — run inside that project directory (its path isn't recorded)."),
+        ()=>say("Copy failed — select the command manually."))};
+    acts.appendChild(bC);
+    if(s.project){
+      const bP=el("button",null,"Send to phone");
+      bP.onclick=resume(()=>act(s.project,s.id,"rc","Registering — watch the Claude app’s session list."),
+        "This session looks active in another window. Sending it to your phone starts a SECOND Claude on the same conversation. Continue?");
+      acts.appendChild(bP);
+    }
+    row.appendChild(acts);
+    box.appendChild(row);
+  });
+}
+let ALL=[];
+function banner(msg){document.getElementById("banner").innerHTML=msg?"<div class=banner></div>":"";
+  if(msg)document.querySelector(".banner").textContent=msg}
+function load(){
+  fetch("/api/sessions").then(r=>r.json()).then(d=>{
+    banner(d.error);
+    ALL=d.sessions||[];
+    const q=document.getElementById("q").value.trim();
+    render(q?clientFilter(q):ALL);
+  }).catch(()=>say("Server stopped — restart aibox sessions."))
+}
+function clientFilter(q){q=q.toLowerCase();
+  return ALL.filter(s=>(s.title+" "+(s.summary||"")+" "+(s.last||"")+" "+(s.lastUser||"")+" "+s.label+" "+s.id).toLowerCase().includes(q))}
+const qEl=document.getElementById("q");
+qEl.addEventListener("input",()=>{const q=qEl.value.trim();
+  if(!q){load();return}   // full reload also resyncs the server's action guard
+  render(clientFilter(q))});
+qEl.addEventListener("keydown",e=>{
+  if(e.key!=="Enter")return;
+  const q=qEl.value.trim();
+  if(!q){render(ALL);return}
+  say("Searching inside all transcripts…");
+  fetch("/api/search?q="+encodeURIComponent(q)).then(r=>r.json()).then(d=>{
+    banner(d.error);
+    render(d.sessions||[]);
+    say((d.sessions||[]).length+" transcript match"+((d.sessions||[]).length===1?"":"es")+" — clear the box to see everything again.");
+  }).catch(()=>say("Server stopped — restart aibox sessions."));
+});
+document.getElementById("refresh").onclick=load;
+document.getElementById("close").onclick=()=>{fetch("/api/close",{method:"POST"}).finally(()=>{
+  document.body.innerHTML="<div class=wrap><p class=eyebrow>aibox</p><p class=sub>Sessions page stopped. You can close this tab.</p></div>"})};
+load();
+</script></body></html>`;
+const server = http.createServer((req, res) => {
+  const json = (o, code) => { res.writeHead(code || 200, { "content-type": "application/json" }); res.end(JSON.stringify(o)); };
+  // Only same-origin loopback callers: blocks other sites (and DNS-rebinding
+  // pages) from driving this server via the browser.
+  const host = req.headers.host || "";
+  if (host !== "127.0.0.1:" + PORT && host !== "localhost:" + PORT) { res.writeHead(403); return res.end("forbidden"); }
+  let u;
+  try { u = new URL(req.url, URLBASE); } catch (e) { return json({ error: "bad request" }, 400); }
+  if (req.method === "POST" && u.pathname === "/api/close") {
+    json({ ok: true });
+    console.log("Closed from the page. Bye.");
+    return setTimeout(() => process.exit(0), 100);
+  }
+  if (req.method === "POST" && (u.pathname === "/api/terminal" || u.pathname === "/api/rc")) {
+    const v = vetted(u);
+    if (!v) return json({ error: "Unknown session — Refresh the page and try again." }, 400);
+    if (u.pathname === "/api/terminal") return openTerminal(v.p, v.id, err => json(err ? { error: err } : { ok: true }));
+    // id is regex-vetted in vetted(); path is a positional param (no shell
+    // reinterpretation). AIBOX is the resolved binary, so PATH gaps in the
+    // spawned shell don't matter.
+    cp.execFile("bash", ["-lc", 'cd "$1" && exec "$AIBOX" rc-resume "$2"', "aibox-sessions", v.p, v.id],
+      { env: Object.assign({}, process.env, { AIBOX: AIBOX }) },
+      (e, out, serr) => {
+        if (e) console.error(String(serr || e.message).trim());
+        else console.log(String(out).trim());
+        json(e ? { error: "Send to phone failed — see the aibox sessions terminal." } : { ok: true });
+      });
+    return;
+  }
+  if (u.pathname === "/api/sessions") return list((l, err) => json({ sessions: l || [], error: err || null }));
+  if (u.pathname === "/api/search") {
+    const q = String(u.searchParams.get("q") || "").trim().slice(0, 200);
+    return list((l, err) => json({ sessions: l || [], error: err || null }), q);
+  }
+  res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+  res.end(PAGE);
+});
+server.on("error", e => {
+  console.error(e.code === "EADDRINUSE"
+    ? "aibox sessions is already running (or something holds port " + PORT + "). Open " + URLBASE + ", or stop the other one first."
+    : "aibox sessions server error: " + e.message);
+  process.exit(1);
+});
+server.listen(PORT, "127.0.0.1", () => {
+  console.log("aibox sessions: " + URLBASE + "  (Ctrl-C or the Close button to stop)");
+  const opener = process.platform === "darwin" ? "open" : "xdg-open";
+  cp.execFile(opener, [URLBASE], () => {});
+});
+SESSJS
 
-  # Forward each port (don't exit on failure so remaining ports still get tried)
-  local _pf_failed=0
-  for spec in "$@"; do
-    [[ "$spec" == -* ]] && continue
-    _pf_start "$spec" || _pf_failed=1
-  done
-  return "$_pf_failed"
+  local aibox_bin
+  aibox_bin="$(command -v aibox 2>/dev/null || realpath "$0" 2>/dev/null || readlink -f "$0" 2>/dev/null || echo "$0")"
+  AIBOX_IMAGE="$IMAGE" AIBOX_VOLUME="$VOLUME" AIBOX_CFG="$CONFIG_DIR" AIBOX_BIN="$aibox_bin" \
+    node "${CONFIG_DIR}/sessions-ui.js"
 }
 
-cmd_down() {
-  if [[ "$DOWN_ALL" == "true" ]]; then
-    local project_containers
-    project_containers=$(docker ps -a --format '{{.Names}}' | grep -F "$BASE_CONTAINER_NAME" | grep -v "^${PF_PREFIX}-") || true
-    if [[ -n "$project_containers" ]]; then
-      echo "Will remove all containers for ${PROJECT_NAME}:"
-      echo "$project_containers" | sed 's/^/  /'
-      echo ""
-      if _confirm_no "Remove all?"; then
-        # Clean up port-forward sidecars first
-        while IFS= read -r cname; do
-          _pf_cleanup "$cname"
-        done <<< "$project_containers"
-        echo "$project_containers" | xargs docker rm -f
-        echo "Removed all containers for ${PROJECT_NAME}"
-        if [[ "$DOWN_CLEAN" == "true" ]]; then
-          # Clean up copy volumes and worktrees for removed containers
-          while IFS= read -r cname; do
-            docker volume rm "${cname}-src" 2>/dev/null && echo "Removed copy volume ${cname}-src" || true
-            local wt="${CONFIG_DIR}/worktrees/${cname}"
-            if [[ -d "$wt" ]]; then
-              if [[ -n "$GIT_ROOT" ]]; then
-                git -C "$GIT_ROOT" worktree remove "$wt" 2>/dev/null && echo "Removed worktree ${wt}" || true
-              else
-                echo "Warning: cannot remove worktree ${wt} (not in a git repo). Remove manually."
-              fi
-            fi
-          done <<< "$project_containers"
-        else
-          # Check if any had isolation resources
-          local has_isolation=false
-          while IFS= read -r cname; do
-            if docker volume inspect "${cname}-src" &>/dev/null || [[ -d "${CONFIG_DIR}/worktrees/${cname}" ]]; then
-              has_isolation=true
-              break
-            fi
-          done <<< "$project_containers"
-          if [[ "$has_isolation" == "true" ]]; then
-            echo "Note: copy volumes / worktrees kept. Use --clean to remove."
-          fi
-        fi
-      else
-        echo "Aborted."
-      fi
-    else
-      echo "No containers found for ${PROJECT_NAME}"
+cmd_stop() {
+  _ensure_docker
+  if [[ "${1:-}" == "--all" ]]; then
+    # Only containers this tool created (label) plus the proxy — never
+    # unrelated containers that happen to be named aibox-*.
+    local names slugs
+    names="$(docker ps --filter label=aibox.slug --format '{{.Names}}')"
+    slugs="$(docker ps --filter label=aibox.slug --format '{{.Label "aibox.slug"}}' | sort | tr '\n' ' ')"
+    if [[ "$(_state "$PROXY")" == "running" ]]; then
+      [[ -n "$names" ]] && names+=$'\n'
+      names+="$PROXY"
+      slugs="${slugs}+ proxy "
     fi
+    [[ -z "$names" ]] && { _info "No aibox containers running."; return 0; }
+    echo "$names" | xargs docker stop >/dev/null
+    _ok "Stopped: ${slugs}(state preserved)."
+  elif [[ -n "${1:-}" ]]; then
+    _die "Usage: aibox stop [--all]"
+  elif [[ "$(_state "$CONTAINER")" == "running" ]]; then
+    docker stop "$CONTAINER" >/dev/null
+    _ok "Stopped ${SLUG} (state preserved — run aibox to start it again)."
   else
-    _pf_cleanup "$CONTAINER_NAME"
-    if docker ps -a --format '{{.Names}}' | grep -Fxq "$CONTAINER_NAME"; then
-      dc down --remove-orphans
-      _ok "Removed $(_file "$CONTAINER_NAME")"
-    else
-      _info "No container found: $(_file "$CONTAINER_NAME")"
-    fi
-    # Clean up isolation resources (works even if container is already gone)
-    if [[ "$DOWN_CLEAN" == "true" ]]; then
-      if [[ -n "$COPY_VOLUME" ]]; then
-        docker volume rm "$COPY_VOLUME" 2>/dev/null && echo "Removed copy volume ${COPY_VOLUME}" || true
-      fi
-      if [[ -n "$WORKTREE_DIR" && -d "$WORKTREE_DIR" ]]; then
-        if [[ -n "$GIT_ROOT" ]]; then
-          git -C "$GIT_ROOT" worktree remove "$WORKTREE_DIR" 2>/dev/null && echo "Removed worktree ${WORKTREE_DIR}" || true
-        else
-          echo "Warning: cannot remove worktree ${WORKTREE_DIR} (not in a git repo). Remove manually."
-        fi
-      fi
-    elif [[ "$ISOLATION" == "copy" && -n "$COPY_VOLUME" ]] && docker volume inspect "$COPY_VOLUME" &>/dev/null; then
-      echo "Copy volume kept: ${COPY_VOLUME} (use --clean to remove)"
-    elif [[ "$ISOLATION" == "worktree" && -n "$WORKTREE_DIR" && -d "$WORKTREE_DIR" ]]; then
-      echo "Worktree kept: ${WORKTREE_DIR} (use --clean to remove)"
-    fi
+    _info "Not running: ${SLUG}"
   fi
 }
 
 cmd_status() {
-  local containers
-  containers=$(docker ps -a --filter "name=${CONTAINER_PREFIX}-" -q) || true
-
-  if [[ -z "$containers" ]]; then
-    echo "No ${SCRIPT_NAME} containers found."
-    return
-  fi
-
-  printf "%-30s %-10s %-10s %-6s %-8s %s\n" "CONTAINER" "INSTANCE" "ISOLATION" "MODE" "STATUS" "PROJECT PATH"
-  printf "%-30s %-10s %-10s %-6s %-8s %s\n" "---------" "--------" "---------" "----" "------" "------------"
-
-  docker ps -a \
-    --filter "name=${CONTAINER_PREFIX}-" \
-    --format '{{.Names}}' \
-  | grep -v "^${PF_PREFIX}-" \
-  | while IFS= read -r name; do
-    local instance isolation mode state path
-    instance=$(docker inspect "$name" --format '{{index .Config.Labels "aibox.instance"}}' 2>/dev/null || echo "")
-    isolation=$(docker inspect "$name" --format '{{index .Config.Labels "aibox.isolation"}}' 2>/dev/null || echo "")
-    state=$(docker inspect "$name" --format '{{.State.Status}}' 2>/dev/null || echo "")
-    path=$(docker inspect "$name" --format '{{index .Config.Labels "aibox.path"}}' 2>/dev/null || echo "")
-    # Extract AIBOX_MODE from container env
-    mode=$(docker inspect "$name" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null | grep '^AIBOX_MODE=' | cut -d= -f2- || echo "")
-    [[ -z "$instance" ]] && instance="-"
-    [[ -z "$isolation" ]] && isolation="-"
-    [[ -z "$mode" ]] && mode="-"
-    [[ -z "$path" ]] && path="-"
-    printf "%-30s %-10s %-10s %-6s %-8s %s\n" "$name" "$instance" "$isolation" "$mode" "$state" "$path"
-  done
-}
-
-cmd_nuke() {
-  local containers
-  containers=$(docker ps -a --filter "name=${CONTAINER_PREFIX}-" -q) || true
-  if [[ -n "$containers" ]]; then
-    echo "This will remove ALL ${SCRIPT_NAME} containers across ALL projects:"
-    docker ps -a --filter "name=${CONTAINER_PREFIX}-" --format "  {{.Names}}  ({{.Status}})"
-    echo ""
-    if _confirm_no "Remove all?"; then
-      docker ps -a --filter "name=${CONTAINER_PREFIX}-" -q | xargs docker rm -f
-      echo "All containers removed."
-    else
-      echo "Aborted."
-    fi
+  _ensure_docker
+  local rows
+  rows="$(docker ps -a --filter label=aibox.slug \
+    --format '{{.Label "aibox.slug"}}\t{{.Status}}\t{{.Image}}\t{{.Label "aibox.path"}}\t{{.Names}}' 2>/dev/null)"
+  if [[ -z "$rows" ]]; then
+    echo "No aibox containers. Run aibox in a project directory to start one."
   else
-    echo "No ${SCRIPT_NAME} containers found."
+    # One stats sample for all running containers (docker stats needs ~2s)
+    # and rw-layer sizes for all; joined per row below by container name.
+    local running_names stats sizes
+    running_names="$(docker ps --filter label=aibox.slug --format '{{.Names}}' | tr '\n' ' ')"
+    stats=""
+    if [[ -n "${running_names// /}" ]]; then
+      # shellcheck disable=SC2086
+      stats="$(docker stats --no-stream --format '{{.Name}} {{.MemUsage}}' $running_names 2>/dev/null || true)"
+    fi
+    sizes="$(docker ps -as --filter label=aibox.slug --format '{{.Names}} {{.Size}}' 2>/dev/null || true)"
+    local suffix key name
+    suffix="$(_proxy_suffix)"
+    printf "%-18s %-20s %-10s %-10s %-30s %s\n" "PROJECT" "STATUS" "MEM" "DISK" "DEV URL" "PATH"
+    while IFS=$'\t' read -r cslug cstatus cimage cpath cname; do
+      local url="-" mem disk
+      while read -r key name; do
+        [[ "$name" == "$cname" ]] && url="<port>.${key}.aibox.localhost${suffix}"
+      done < <(_proxy_pairs)
+      mem="$(awk -v n="$cname" '$1==n{print $2}' <<< "$stats")"
+      disk="$(awk -v n="$cname" '$1==n{print $2}' <<< "$sizes")"
+      # De-jargon docker's status ("Up 2 hours", "Exited (143) 3 days ago")
+      cstatus="$(echo "$cstatus" | sed 's/^Up /running /; s/^Exited ([0-9]*) /stopped /; s/^Created$/created/')"
+      printf "%-18s %-20s %-10s %-10s %-30s %s\n" "$cslug" "$cstatus" "${mem:--}" "${disk:--}" "$url" "$cpath"
+      [[ "$cimage" != "$IMAGE" ]] && _info "  ${cslug}: image ${cimage} (current: ${IMAGE} — recreated on next run)"
+    done <<< "$rows"
   fi
-}
-
-cmd_volumes() {
-  # List copy volumes
-  local volumes
-  volumes=$(docker volume ls --format '{{.Name}}' | grep -F "${CONTAINER_PREFIX}-" | grep -- '-src$') || true
-
-  # List worktree dirs
-  local worktree_dir="${CONFIG_DIR}/worktrees"
-  local worktrees=""
-  if [[ -d "$worktree_dir" ]]; then
-    worktrees=$(ls -1 "$worktree_dir" 2>/dev/null) || true
+  # Daemon-wide disk picture (images/containers/volumes + reclaimable).
+  local df
+  df="$(docker system df --format '{{.Type}}: {{.Size}}, reclaimable {{.Reclaimable}}' 2>/dev/null \
+    | sed 's/^Local Volumes/Volumes/; s/^Build Cache/Build-cache/' | tr '\n' '\t')" || true
+  [[ -n "$df" ]] && { echo ""; echo "Docker disk:  $(echo "$df" | sed 's/\t$//; s/\t/  ·  /g')"; }
+  echo ""
+  local pstate
+  pstate="$(_state "$PROXY")"
+  if [[ "$pstate" == "running" ]]; then
+    echo "Proxy: running (http://<port>.<project>.aibox.localhost$(_proxy_suffix))"
+  else
+    echo "Proxy: stopped (starts on next aibox run)"
   fi
-
-  if [[ -z "$volumes" && -z "$worktrees" ]]; then
-    echo "No isolation volumes or worktrees found."
-    return
+  if [[ "$(_state "$CONTAINER")" == "running" ]] \
+     && docker exec -u aibox "$CONTAINER" pgrep -f aibox-serve-ui >/dev/null 2>&1; then
+    echo "Serve (${SLUG}): running — sessions UI $(_dev_url 45789)"
   fi
-
-  printf "%-50s %-10s %-8s %s\n" "NAME" "TYPE" "STATUS" "CREATED"
-  printf "%-50s %-10s %-8s %s\n" "----" "----" "------" "-------"
-
-  if [[ -n "$volumes" ]]; then
-    while IFS= read -r vol; do
-      local status="orphan"
-      local container_name="${vol%-src}"
-      if docker ps -a --format '{{.Names}}' | grep -Fxq "$container_name" 2>/dev/null; then
-        status="in use"
-      fi
-      local created
-      created=$(docker volume inspect "$vol" --format '{{.CreatedAt}}' 2>/dev/null | cut -d' ' -f1 || echo "-")
-      printf "%-50s %-10s %-8s %s\n" "$vol" "copy" "$status" "$created"
-    done <<< "$volumes"
-  fi
-
-  if [[ -n "$worktrees" ]]; then
-    while IFS= read -r wt; do
-      local status="orphan"
-      if docker ps -a --format '{{.Names}}' | grep -Fxq "$wt" 2>/dev/null; then
-        status="in use"
-      fi
-      local wt_path="${worktree_dir}/${wt}"
-      printf "%-50s %-10s %-8s %s\n" "$wt_path" "worktree" "$status" "-"
-    done <<< "$worktrees"
+  if docker volume inspect "$VOLUME" >/dev/null 2>&1; then
+    local size
+    size="$(docker run --rm -v "${VOLUME}:/v:ro" "$HELPER_IMAGE" du -sh /v 2>/dev/null | cut -f1 || echo '?')"
+    echo "Home volume: ${VOLUME} (${size:-?}) — sessions, login, claude binary. Protect with: aibox backup"
   fi
 }
 
-# ── Volume size helper ───────────────────────────────────────────
-_volume_size() {
-  local vol="$1"
-  docker run --rm -v "${vol}:/mnt/vol" alpine sh -c 'du -sh /mnt/vol 2>/dev/null | cut -f1' 2>/dev/null || echo "?"
+# Writes one tar.gz of the volume; prints its path. Every step is explicitly
+# error-checked: this runs inside command substitutions, where `set -e` is
+# OFF — a silent failure here once meant restore wiped a volume against a
+# safety backup that didn't exist.
+_do_backup() {
+  local dir="$1" prefix="${2:-aibox-home}" name
+  case "$dir" in *:*)
+    echo "backup dir contains ':' — docker cannot mount it: ${dir}" >&2; return 1 ;;
+  esac
+  mkdir -p "$dir" || return 1
+  dir="$(cd "$dir" && pwd)" || return 1
+  name="${prefix}-${VERSION_TAG}-$(date -u +%Y%m%d-%H%M%S).tar.gz" || return 1
+  docker run --rm -v "${VOLUME}:/home/aibox:ro" -v "${dir}:/backup" "$HELPER_IMAGE" \
+    tar czf "/backup/${name}" -C /home/aibox . >/dev/null || return 1
+  [[ -s "${dir}/${name}" ]] || return 1
+  echo "${dir}/${name}"
 }
 
-cmd_disk() {
-  _check_deps
-
-  _step "Disk usage report"
-
-  # Auth volumes
-  echo -e "  ${_B}Auth volumes:${_N}"
-  local auth_vols
-  auth_vols=$(docker volume ls --format '{{.Name}}' | grep '^aibox-auth-') || true
-  if [[ -n "$auth_vols" ]]; then
-    while IFS= read -r vol; do
-      echo "    ${vol}: $(_volume_size "$vol")"
-    done <<< "$auth_vols"
-  else
-    echo "    (none)"
-  fi
-
-  # Containers
-  echo ""
-  echo -e "  ${_B}Containers:${_N}"
-  local containers
-  containers=$(docker ps -a --filter "name=${CONTAINER_PREFIX}-" --format '{{.Names}}\t{{.Size}}' 2>/dev/null | grep -v "^${PF_PREFIX}-") || true
-  if [[ -n "$containers" ]]; then
-    while IFS= read -r line; do
-      echo "    ${line}"
-    done <<< "$containers"
-  else
-    echo "    (none)"
-  fi
-
-  # Copy volumes
-  echo ""
-  echo -e "  ${_B}Copy volumes:${_N}"
-  local copy_vols
-  copy_vols=$(docker volume ls --format '{{.Name}}' | grep -F "${CONTAINER_PREFIX}-" | grep -- '-src$') || true
-  if [[ -n "$copy_vols" ]]; then
-    while IFS= read -r vol; do
-      echo "    ${vol}: $(_volume_size "$vol")"
-    done <<< "$copy_vols"
-  else
-    echo "    (none)"
-  fi
-
-  # node_modules volumes
-  echo ""
-  echo -e "  ${_B}node_modules volumes:${_N}"
-  local nm_vols
-  nm_vols=$(docker volume ls --format '{{.Name}}' | grep '_node_modules$') || true
-  if [[ -n "$nm_vols" ]]; then
-    while IFS= read -r vol; do
-      echo "    ${vol}: $(_volume_size "$vol")"
-    done <<< "$nm_vols"
-  else
-    echo "    (none)"
-  fi
-
-  # Worktrees
-  echo ""
-  echo -e "  ${_B}Worktrees:${_N}"
-  local worktree_dir="${CONFIG_DIR}/worktrees"
-  if [[ -d "$worktree_dir" ]] && ls -1 "$worktree_dir" 2>/dev/null | head -1 | grep -q .; then
-    du -sh "${worktree_dir}"/* 2>/dev/null | while IFS= read -r line; do
-      echo "    ${line}"
-    done
-  else
-    echo "    (none)"
-  fi
-
-  # Docker system summary
-  echo ""
-  echo -e "  ${_B}Docker system:${_N}"
-  docker system df 2>/dev/null | while IFS= read -r line; do
-    echo "    ${line}"
-  done
+cmd_backup() {
+  _ensure_docker
+  [[ -d "${CONFIG_DIR}/.lock-migrate" ]] \
+    && _die "A volume-layout migration is in progress — retry once it finishes."
+  docker volume inspect "$VOLUME" >/dev/null 2>&1 \
+    || _die "No ${VOLUME} volume yet — nothing to back up."
+  local out
+  out="$(_do_backup "${1:-$BACKUP_DIR}")" \
+    || _die "Backup failed — nothing was written (see error above; destination: ${1:-$BACKUP_DIR})."
+  _ok "Backed up ${VOLUME} (sessions, login, claude binary) → ${out} ($(ls -lh "$out" | awk '{print $5}'))"
 }
 
-cmd_clean() {
-  _check_deps
+cmd_restore() {
+  [[ $# -ge 1 ]] || _die "Usage: aibox restore <backup.tar.gz>"
+  local file="$1"
+  [[ -f "$file" ]] || _die "Not found: ${file}"
+  file="$(cd "$(dirname "$file")" && pwd)/$(basename "$file")"
+  [[ "$file" == *:* ]] && _die "Backup path contains ':' — docker cannot mount it. Move/rename the file first."
+  _ensure_docker
+  [[ -d "${CONFIG_DIR}/.lock-migrate" ]] \
+    && _die "A volume-layout migration is in progress — retry once it finishes."
+  docker volume create "$VOLUME" >/dev/null 2>&1 || true
 
-  shift  # remove "clean" from args
+  # Validate the archive BEFORE touching anything. The file is mounted at a
+  # fixed path — its name never reaches a shell string.
+  docker run --rm -v "${file}:/backup.tar.gz:ro" "$HELPER_IMAGE" \
+    tar tzf /backup.tar.gz >/dev/null 2>&1 \
+    || _die "Not a readable .tar.gz archive: ${file} — nothing was changed."
 
-  # Parse clean-specific flags
-  local clean_containers=false clean_volumes=false clean_docker=false clean_sessions=false
-  local days="30"
-  local filter_set=false
+  echo "This replaces the contents of ${VOLUME} (sessions, login, claude binary)"
+  echo "with: ${file}"
+  echo "A safety backup is taken first. aibox containers are removed so the"
+  echo "next run recreates them against the restored data (project files are"
+  echo "untouched; apt-installed packages reset)."
+  _confirm "Restore?" || { echo "Aborted — nothing was changed."; return 0; }
 
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --containers) clean_containers=true; filter_set=true; shift ;;
-      --volumes)    clean_volumes=true;    filter_set=true; shift ;;
-      --docker)     clean_docker=true;     filter_set=true; shift ;;
-      --sessions)   clean_sessions=true;   filter_set=true; shift ;;
-      [0-9]*)       days="$1"; shift ;;
-      *)            shift ;;
-    esac
-  done
-
-  # No filter flags = clean everything
-  if [[ "$filter_set" == "false" ]]; then
-    clean_containers=true; clean_volumes=true; clean_docker=true; clean_sessions=true
-  fi
-
-  _step "Scanning for cleanup targets"
-
-  local has_work=false
-
-  # 1. Stopped/exited aibox containers
-  local stopped=""
-  if [[ "$clean_containers" == "true" ]]; then
-    stopped=$(docker ps -a \
-      --filter "name=${CONTAINER_PREFIX}-" \
-      --filter "status=exited" \
-      --filter "status=created" \
-      --format '{{.Names}}' | grep -v "^${PF_PREFIX}-" | sort -u) || true
-
-    if [[ -n "$stopped" ]]; then
-      has_work=true
-      echo -e "  ${_B}Stopped containers:${_N}"
-      while IFS= read -r c; do echo "    $c"; done <<< "$stopped"
-    fi
-  fi
-
-  # 2. Orphaned volumes
-  local orphan_vols=()
-  if [[ "$clean_volumes" == "true" ]]; then
-    local copy_vols
-    copy_vols=$(docker volume ls --format '{{.Name}}' | grep -F "${CONTAINER_PREFIX}-" | grep -- '-src$') || true
-    if [[ -n "$copy_vols" ]]; then
-      while IFS= read -r vol; do
-        local container_name="${vol%-src}"
-        if ! docker ps -a --format '{{.Names}}' | grep -Fxq "$container_name" 2>/dev/null; then
-          orphan_vols+=("$vol")
-        fi
-      done <<< "$copy_vols"
-    fi
-
-    local nm_vols
-    nm_vols=$(docker volume ls --format '{{.Name}}' | grep '_node_modules$') || true
-    if [[ -n "$nm_vols" ]]; then
-      while IFS= read -r vol; do
-        local mounted_by
-        mounted_by=$(docker ps -a -q --filter "volume=${vol}" 2>/dev/null) || true
-        if [[ -z "$mounted_by" ]]; then
-          orphan_vols+=("$vol")
-        fi
-      done <<< "$nm_vols"
-    fi
-
-    if [[ ${#orphan_vols[@]} -gt 0 ]]; then
-      has_work=true
-      echo -e "  ${_B}Orphaned volumes:${_N}"
-      for v in "${orphan_vols[@]}"; do echo "    $v"; done
-    fi
-  fi
-
-  # 3. Dangling Docker images + build cache
-  local dangling_count=0
-  if [[ "$clean_docker" == "true" ]]; then
-    local dangling
-    dangling=$(docker images -f "dangling=true" -q) || true
-    [[ -n "$dangling" ]] && dangling_count=$(echo "$dangling" | wc -l | tr -d ' ')
-
-    if [[ "$dangling_count" -gt 0 ]]; then
-      has_work=true
-      echo -e "  ${_B}Dangling images:${_N} ${dangling_count}"
-    fi
-
-    local build_cache
-    build_cache=$(docker system df --format '{{.Type}}\t{{.Reclaimable}}' 2>/dev/null | grep '^Build' | cut -f2) || true
-    if [[ -n "$build_cache" && "$build_cache" != "0B" ]]; then
-      has_work=true
-      echo -e "  ${_B}Build cache (reclaimable):${_N} ${build_cache}"
-    fi
-  fi
-
-  # 4. Old Claude sessions in auth volumes
-  local auth_vols_list=""
-  local old_sessions_found=false
-  local sessions_skipped=false
-  if [[ "$clean_sessions" == "true" ]]; then
-    auth_vols_list=$(docker volume ls --format '{{.Name}}' | grep '^aibox-auth-') || true
-
-    if [[ -n "$auth_vols_list" ]]; then
-      while IFS= read -r avol; do
-        # Skip if any running container mounts this volume
-        local running_users
-        running_users=$(docker ps -q --filter "volume=${avol}" 2>/dev/null) || true
-        if [[ -n "$running_users" ]]; then
-          _warn "Skipping ${avol} — mounted by running container(s). Stop them first."
-          sessions_skipped=true
-          continue
-        fi
-
-        local count
-        count=$(docker run --rm -v "${avol}:/mnt/vol" alpine sh -c \
-          "find /mnt/vol/projects /mnt/vol/session-env /mnt/vol/file-history /mnt/vol/shell-snapshots \
-            -type f -mtime +${days} 2>/dev/null | wc -l" 2>/dev/null || echo "0")
-        count=$(echo "$count" | tr -d '[:space:]')
-        if [[ "$count" -gt 0 ]]; then
-          has_work=true
-          old_sessions_found=true
-          echo -e "  ${_B}Old Claude sessions:${_N} ${count} files older than ${days} days in ${avol}"
-        fi
-      done <<< "$auth_vols_list"
-    fi
-  fi
-
-  if [[ "$has_work" == "false" ]]; then
-    _ok "Nothing to clean."
-    return 0
-  fi
-
-  echo ""
-  if [[ "$FORCE_CLEAN" != "true" ]]; then
-    if ! _confirm_no "Proceed with cleanup?"; then
-      echo "Aborted."
-      return 0
-    fi
-  fi
-
-  # Execute cleanup
-  _step "Cleaning up"
-
-  if [[ "$clean_containers" == "true" && -n "$stopped" ]]; then
-    while IFS= read -r c; do
-      _pf_cleanup "$c"
-      docker rm "$c" >/dev/null
-      _ok "Removed container: $c"
-    done <<< "$stopped"
-  fi
-
-  if [[ "$clean_volumes" == "true" ]]; then
-    for v in "${orphan_vols[@]}"; do
-      docker volume rm "$v" >/dev/null 2>&1 \
-        && _ok "Removed volume: $v" \
-        || _warn "Could not remove volume: $v"
-    done
-  fi
-
-  if [[ "$clean_docker" == "true" ]]; then
-    if [[ "$dangling_count" -gt 0 ]]; then
-      docker image prune -f >/dev/null
-      _ok "Removed ${dangling_count} dangling images."
-    fi
-
-    docker builder prune -f >/dev/null 2>&1 \
-      && _ok "Pruned build cache." || true
-  fi
-
-  if [[ "$clean_sessions" == "true" && "$old_sessions_found" == "true" && -n "$auth_vols_list" ]]; then
-    while IFS= read -r avol; do
-      # Re-check: skip if a running container now uses this volume
-      local running_users
-      running_users=$(docker ps -q --filter "volume=${avol}" 2>/dev/null) || true
-      [[ -n "$running_users" ]] && continue
-
-      docker run --rm -v "${avol}:/mnt/vol" alpine sh -c "
-        find /mnt/vol/projects /mnt/vol/session-env /mnt/vol/file-history /mnt/vol/shell-snapshots \
-          -type f -mtime +${days} -delete 2>/dev/null
-        find /mnt/vol/projects /mnt/vol/session-env /mnt/vol/file-history /mnt/vol/shell-snapshots \
-          -type d -empty -delete 2>/dev/null
-      " 2>/dev/null || true
-    done <<< "$auth_vols_list"
-    _ok "Cleaned Claude sessions older than ${days} days."
-  fi
-
-  _ok "Cleanup complete."
-}
-
-cmd_doctor() {
-  _check_deps
-
-  _step "Running diagnostics"
-  local issues=0
-
-  # 1. Stale containers
-  echo -e "  ${_B}Containers...${_N}"
   local running
-  running=$(docker ps --filter "name=${CONTAINER_PREFIX}-" --format '{{.Names}}' | grep -v "^${PF_PREFIX}-") || true
+  running="$(docker ps --filter "volume=${VOLUME}" --format '{{.Names}}')"
   if [[ -n "$running" ]]; then
-    while IFS= read -r c; do
-      local active
-      active=$(docker top "$c" -o pid,args 2>/dev/null \
-        | tail -n +2 \
-        | grep -v -c 'sleep infinity' || echo "0")
-      active=$(echo "$active" | tr -d '[:space:]')
-      if [[ "$active" -le 0 ]]; then
-        _warn "Stale: ${c} (running, no active sessions)"
-        echo -e "    Fix: ${_B}aibox down${_N} or ${_B}aibox clean${_N}"
-        issues=$((issues + 1))
-      else
-        _ok "${c} (${active} active session(s))"
-      fi
-    done <<< "$running"
-  else
-    _ok "No running containers"
+    _info "Stopping: $(echo "$running" | tr '\n' ' ')"
+    echo "$running" | xargs docker stop >/dev/null
   fi
 
-  # 2. Orphaned volumes
-  echo ""
-  echo -e "  ${_B}Volumes...${_N}"
-  local copy_vols
-  copy_vols=$(docker volume ls --format '{{.Name}}' | grep -F "${CONTAINER_PREFIX}-" | grep -- '-src$') || true
-  if [[ -n "$copy_vols" ]]; then
-    while IFS= read -r vol; do
-      local container_name="${vol%-src}"
-      if ! docker ps -a --format '{{.Names}}' | grep -Fxq "$container_name" 2>/dev/null; then
-        _warn "Orphaned: ${vol}"
-        echo -e "    Fix: ${_B}aibox clean${_N}"
-        issues=$((issues + 1))
-      fi
-    done <<< "$copy_vols"
+  local has_data
+  has_data="$(docker run --rm -v "${VOLUME}:/v:ro" "$HELPER_IMAGE" sh -c 'ls -A /v 2>/dev/null | head -1')"
+  if [[ -n "$has_data" ]]; then
+    local safety
+    safety="$(_do_backup "$BACKUP_DIR" "aibox-home-pre-restore")" \
+      || _die "Safety backup failed — aborting restore. The volume is untouched."
+    _ok "Safety backup: ${safety}"
   fi
 
-  local nm_vols
-  nm_vols=$(docker volume ls --format '{{.Name}}' | grep '_node_modules$') || true
-  if [[ -n "$nm_vols" ]]; then
-    while IFS= read -r vol; do
-      local mounted_by
-      mounted_by=$(docker ps -a -q --filter "volume=${vol}" 2>/dev/null) || true
-      if [[ -z "$mounted_by" ]]; then
-        _warn "Orphaned: ${vol}"
-        echo -e "    Fix: ${_B}aibox clean${_N}"
-        issues=$((issues + 1))
-      fi
-    done <<< "$nm_vols"
+  docker run --rm -v "${VOLUME}:/v" -v "${file}:/backup.tar.gz:ro" "$HELPER_IMAGE" \
+    sh -c 'find /v -mindepth 1 -maxdepth 1 -exec rm -rf {} + && tar xzf /backup.tar.gz -C /v' \
+    || _die "Restore failed mid-way. Recover with: aibox restore <the safety backup above>"
+  _ok "Restored ${VOLUME} from $(basename "$file")."
+
+  # Containers must be recreated, not restarted: their volume-subpath mounts
+  # may not match the restored data (a pre-migration backup has none of the
+  # slices; the next aibox run re-runs layout detection/migration).
+  local stale
+  stale="$(docker ps -aq --filter label=aibox.slug)"
+  if [[ -n "$stale" ]]; then
+    echo "$stale" | xargs docker rm -f >/dev/null 2>&1 || true
+    _ok "Removed old containers — the next aibox run in each project recreates them."
   fi
-
-  # 3. Disk space
-  echo ""
-  echo -e "  ${_B}Disk space...${_N}"
-  local available_kb
-  available_kb=$(df -k "${HOME}" 2>/dev/null | awk 'NR==2 {print $4}') || true
-  if [[ -n "$available_kb" && "$available_kb" =~ ^[0-9]+$ ]]; then
-    local available_gb=$(( available_kb / 1048576 ))
-    if (( available_gb < 5 )); then
-      _warn "Low disk space: ${available_gb}GB free"
-      echo -e "    Fix: ${_B}aibox clean${_N}"
-      issues=$((issues + 1))
-    else
-      _ok "Disk space: ${available_gb}GB free"
-    fi
-  fi
-
-  docker system df --format '{{.Type}}\t{{.Size}}\t{{.Reclaimable}}' 2>/dev/null | while IFS=$'\t' read -r dtype dsize dreclaimable; do
-    echo -e "    ${dtype}: ${dsize} (reclaimable: ${dreclaimable})"
-  done
-
-  # 4. Image version
-  echo ""
-  echo -e "  ${_B}Image...${_N}"
-  if docker image inspect "$IMAGE" &>/dev/null; then
-    local img_version
-    img_version=$(docker inspect "$IMAGE" --format '{{index .Config.Labels "aibox.version"}}' 2>/dev/null || echo "")
-    if [[ "$img_version" != "$AIBOX_VERSION" ]]; then
-      _warn "Image outdated: v${img_version:-unknown} (script: v${AIBOX_VERSION})"
-      echo -e "    Fix: ${_B}aibox build${_N}"
-      issues=$((issues + 1))
-    else
-      _ok "Image: v${AIBOX_VERSION}"
-    fi
-
-    # Check running containers against current image
-    if [[ -n "$running" ]]; then
-      local latest_id
-      latest_id=$(docker inspect "$IMAGE" --format '{{.Id}}' 2>/dev/null || echo "")
-      while IFS= read -r c; do
-        local c_img_id
-        c_img_id=$(docker inspect "$c" --format '{{.Image}}' 2>/dev/null || echo "")
-        if [[ -n "$c_img_id" && -n "$latest_id" && "$c_img_id" != "$latest_id" ]]; then
-          _warn "Container ${c} uses outdated image"
-          echo -e "    Fix: ${_B}aibox down && aibox up${_N}"
-          issues=$((issues + 1))
-        fi
-      done <<< "$running"
-    fi
-  else
-    _warn "Image '${IMAGE}' not found"
-    echo -e "    Fix: ${_B}aibox build${_N}"
-    issues=$((issues + 1))
-  fi
-
-  # 5. Dependencies
-  echo ""
-  echo -e "  ${_B}Dependencies...${_N}"
-  local deps_ok=true
-  command -v docker &>/dev/null || { _warn "docker not found"; deps_ok=false; issues=$((issues + 1)); }
-  { docker compose version &>/dev/null || command -v docker-compose &>/dev/null; } \
-    || { _warn "docker compose not found"; deps_ok=false; issues=$((issues + 1)); }
-  docker info &>/dev/null \
-    || { _warn "Docker daemon not running"; deps_ok=false; issues=$((issues + 1)); }
-  [[ "$deps_ok" == "true" ]] && _ok "All dependencies present"
-
-  # Summary
-  echo ""
-  if [[ "$issues" -eq 0 ]]; then
-    _ok "No issues found."
-  else
-    _warn "${issues} issue(s) found. Run ${_B}aibox clean${_N} to fix most."
-  fi
-}
-
-_init_files() {
-  write_project_compose
-  save_project_conf
-  configure_webstorm
-
-  local gitignore="${PROJECT_DIR}/.gitignore"
-  # Ensure file ends with a newline before appending
-  [[ -f "$gitignore" ]] && echo "" >> "$gitignore"
-  local entries=("compose.dev.yaml" ".aibox" ".idea/workspace.xml")
-  for entry in "${entries[@]}"; do
-    if [[ -f "$gitignore" ]]; then
-      grep -qxF "$entry" "$gitignore" || echo "$entry" >> "$gitignore"
-    else
-      echo "$entry" >> "$gitignore"
-    fi
-  done
-  echo "Updated .gitignore"
-
-  echo ""
-  echo "Done! Open this project in WebStorm — Node.js runtime is configured."
-  echo "  ${SCRIPT_NAME} up       Start the container"
-  echo "  ${SCRIPT_NAME} claude   Open Claude Code"
-  echo "  ${SCRIPT_NAME} shell    Open a shell"
-}
-
-cmd_init() {
-  _require_safe_dir
-
-  echo "Will create/update in ${PROJECT_DIR}:"
-  echo "  compose.dev.yaml, .aibox, .idea/workspace.xml, .gitignore"
-  echo ""
-
-  if ! _confirm_yes "Proceed?"; then
-    echo "Aborted."
-    exit 0
-  fi
-
-  _init_files
-}
-
-cmd_help() {
-  awk '/^# aibox/,/^[^#]/{if(/^#/) print}' "$0" | sed 's/^# \{0,1\}//'
-  echo "Version: ${AIBOX_VERSION}"
-}
-
-cmd_version() {
-  echo "aibox v${AIBOX_CLI_VERSION} (image v${AIBOX_VERSION})"
-}
-
-# ── Update check (non-blocking, cached for 24h) ─────────────────
-_check_for_updates() {
-  [[ ! -t 1 || -n "${CI:-}" || "$AIBOX_CLI_VERSION" == "__CLI_VERSION__" ]] && return 0
-
-  local cache_file="${CONFIG_DIR}/update-check"
-  mkdir -p "$CONFIG_DIR"
-
-  if [[ -f "$cache_file" ]]; then
-    local mtime latest
-    mtime=$(stat -c %Y "$cache_file" 2>/dev/null || stat -f %m "$cache_file" 2>/dev/null || echo 0)
-    if (( $(date +%s) - mtime < 86400 )); then
-      latest=$(cat "$cache_file")
-      [[ -n "$latest" && "$latest" != "$AIBOX_CLI_VERSION" ]] && \
-        _warn "aibox ${_B}v${latest}${_N}${_BY} available${_N} (current: v${AIBOX_CLI_VERSION}). Run: ${_B}aibox update${_N}"
-      return 0
-    fi
-  fi
-
-  # Refresh cache in background (silent — notice shown on next run)
-  ( curl -fsSL --max-time 3 "https://registry.npmjs.org/aibox-cli/latest" 2>/dev/null \
-      | grep -o '"version":"[^"]*"' | head -1 | cut -d'"' -f4 > "$cache_file"
-  ) &>/dev/null &
-  disown 2>/dev/null || true
 }
 
 cmd_update() {
   local script_path
   script_path="$(realpath "$0" 2>/dev/null || readlink -f "$0" 2>/dev/null || echo "$0")"
-
   if [[ "$script_path" == */Cellar/* || "$script_path" == */homebrew/* ]]; then
-    if ! command -v brew &>/dev/null; then
-      _err "Installed via Homebrew but ${_B}brew${_N} not found in PATH."
-      echo "  Run: brew upgrade aibox"
-      exit 1
-    fi
-    _step "Updating via Homebrew"
-    brew update && brew upgrade aibox
-  elif command -v npm &>/dev/null && npm list -g aibox-cli &>/dev/null; then
-    _step "Updating via npm"
-    npm update -g aibox-cli
+    command -v brew >/dev/null 2>&1 || _die "Installed via Homebrew but brew not found. Run: brew upgrade aibox"
+    _info "Updating via Homebrew..."
+    brew update || _die "brew update failed."
+    brew upgrade aibox || _die "brew upgrade aibox failed."
+  elif command -v npm >/dev/null 2>&1 && npm list -g aibox-cli >/dev/null 2>&1; then
+    _info "Updating via npm..."
+    # install@latest, not `npm update`: update won't cross major versions.
+    npm install -g aibox-cli@latest || _die "npm install -g aibox-cli@latest failed."
   else
-    _err "Could not detect install method (Homebrew or npm)."
-    echo "  Update manually:"
-    echo "    Homebrew: brew upgrade aibox"
-    echo "    npm:      npm update -g aibox-cli"
-    exit 1
+    _die "Could not detect install method. Update manually: brew upgrade aibox / npm install -g aibox-cli@latest"
   fi
-
-  _ok "Updated. Run ${_B}aibox build${_N} to rebuild the Docker image."
+  _ok "Updated. The image rebuilds and containers recreate automatically on your next aibox run (sessions and login persist)."
 }
 
-# ── Main ─────────────────────────────────────────────────────────
+cmd_version() {
+  echo "aibox v${VERSION_TAG} (image ${IMAGE})"
+  if command -v docker >/dev/null 2>&1; then
+    local daemon="daemon not running"
+    docker info >/dev/null 2>&1 && daemon="daemon running"
+    echo "$(docker --version 2>/dev/null || echo docker) — ${daemon}"
+  else
+    echo "docker: not installed"
+  fi
+}
+
+cmd_help() {
+  awk '/^# aibox/,/^[^#]/{if(/^#/) print}' "$0" | sed 's/^# \{0,1\}//'
+}
+
+# ── Update notice (non-blocking, cached 24h) ─────────────────────
+_check_for_updates() {
+  [[ ! -t 1 || -n "${CI:-}" || "$CLI_VERSION" == "__CLI_VERSION__" ]] && return 0
+  local cache="${CONFIG_DIR}/update-check"
+  if [[ -f "$cache" ]]; then
+    local mtime latest
+    mtime="$(stat -c %Y "$cache" 2>/dev/null || stat -f %m "$cache" 2>/dev/null || echo 0)"
+    if (( $(date +%s) - mtime < 86400 )); then
+      latest="$(cat "$cache")"
+      [[ -n "$latest" && "$latest" != "$CLI_VERSION" ]] \
+        && _warn "aibox v${latest} available (current: v${CLI_VERSION}). Run: aibox update"
+      return 0
+    fi
+  fi
+  ( curl -fsSL --max-time 3 "https://registry.npmjs.org/aibox-cli/latest" 2>/dev/null \
+      | grep -o '"version":"[^"]*"' | head -1 | cut -d'"' -f4 > "$cache"
+  ) >/dev/null 2>&1 &
+}
+
+# ── Dispatch ─────────────────────────────────────────────────────
 _check_for_updates
 
-case "${1:-help}" in
-  up)       cmd_up ;;
-  claude)   shift; cmd_claude "$@" ;;
-  shell)    cmd_shell "$@" ;;
-  port-forward) cmd_port_forward "$@" ;;
-  down)     cmd_down ;;
-  status)   cmd_status ;;
-  volumes)  cmd_volumes ;;
-  disk)     cmd_disk ;;
-  clean)    cmd_clean "$@" ;;
-  doctor)   cmd_doctor ;;
-  nuke)     cmd_nuke ;;
-  build)    cmd_build ;;
-  init)     cmd_init ;;
-  update)   cmd_update ;;
-  help|-h)         cmd_help ;;
+CMD="${1:-claude}"
+[[ $# -gt 0 ]] && shift
+case "$CMD" in
+  claude)               cmd_run claude "$@" ;;
+  run)                  cmd_run "$@" ;;
+  serve)                cmd_serve "$@" ;;
+  sessions)             cmd_sessions ;;
+  rc-resume)            cmd_rc_resume "$@" ;;
+  shell)                cmd_shell "$@" ;;
+  stop)                 cmd_stop "$@" ;;
+  status)               cmd_status ;;
+  backup)               cmd_backup "$@" ;;
+  restore)              cmd_restore "$@" ;;
+  update)               cmd_update ;;
   version|-v|--version) cmd_version ;;
-  *)
-    echo "Unknown command: $1"
-    cmd_help
-    exit 1
-    ;;
+  help|-h|--help)       cmd_help ;;
+  -*)                   cmd_run claude "$CMD" "$@" ;;
+  *)                    _die "Unknown command: ${CMD}. Run 'aibox help' for usage." ;;
 esac
