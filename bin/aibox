@@ -1224,24 +1224,24 @@ function vetted(u) {
 // keys, transcript filenames) — treat them as hostile.
 function shq(s) { return "'" + String(s).replace(/'/g, "'\\''") + "'"; }
 const AIBOX = process.env.AIBOX_BIN || "aibox";
-// argv: $1=project dir, $2=aibox binary, $3=session id (env doesn't reliably
-// survive `open` → LaunchServices, so pass the resolved binary positionally).
-// On failure hold the window open — a bare -e window closes instantly.
-const RESUME_SH = 'cd "$1" && "$2" --resume "$3" || { echo; echo "[exited $?] press Enter to close"; read -r _; }';
+// Nothing but one file path reaches the terminal app: Ghostty 1.2+ treats
+// every existing path in its argv as a file to open (an executable gets
+// run as "<path>; exit" from its own folder), which mangled the earlier
+// `--args -e bash -lc ... <project> <aibox>` form. Both Ghostty and
+// Terminal run an executable .command file handed to them by `open`, so
+// the whole command lives inside that file, shell-quoted. On failure it
+// holds the window open so the error can be read.
 function openTerminal(p, id, cb) {
   if (process.platform !== "darwin") return cb("Opening a terminal is macOS-only — use Copy instead.");
-  if (fs.existsSync("/Applications/Ghostty.app")) {
-    cp.execFile("open", ["-na", "Ghostty", "--args", "-e", "bash", "-lc", RESUME_SH, "aibox", p, AIBOX, id],
-      e => cb(e ? "Could not open Ghostty: " + e.message : null));
-  } else {
-    // do script runs cmd through a shell, so shq() every component first;
-    // JSON.stringify then makes cmd a valid AppleScript string literal.
-    const cmd = "cd " + shq(p) + " && " + shq(AIBOX) + " --resume " + shq(id);
-    cp.execFile("osascript",
-      ["-e", "tell application \"Terminal\" to do script " + JSON.stringify(cmd),
-       "-e", "tell application \"Terminal\" to activate"],
-      e => cb(e ? "Could not open Terminal: " + e.message : null));
-  }
+  const dir = CFG + "/open", file = dir + "/" + id + ".command";
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(file, "#!/bin/bash\ncd " + shq(p) + " && " + shq(AIBOX) + " --resume " + shq(id) +
+      " || { echo; echo \"[exited $?] press Enter to close\"; read -r _; }\n", { mode: 0o700 });
+    fs.chmodSync(file, 0o700);
+  } catch (e) { return cb("Could not write the launcher: " + e.message); }
+  const app = fs.existsSync("/Applications/Ghostty.app") ? "Ghostty" : "Terminal";
+  cp.execFile("open", ["-a", app, file], e => cb(e ? "Could not open " + app + ": " + e.message : null));
 }
 const PAGE = `<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
