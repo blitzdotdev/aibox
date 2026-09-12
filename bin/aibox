@@ -481,6 +481,9 @@ if [ -f "$CJ" ]; then
   grep -o "\"/[^\"]*\":" "$CJ" | sed "s/\":\$//; s/^\"//" | sort -u | while read -r p; do
     h="$(printf %s "$p" | sha256sum | cut -c1-6)"
     copy_home "$h"
+    # The slice sentinel: the sessions page lists a slice only through it,
+    # and container creation checks it for hash collisions.
+    [ -e "projects/$h/.aibox-path" ] || printf %s "$p" > "projects/$h/.aibox-path"
     enc="$(printf %s "$p" | sed "s/[^A-Za-z0-9]/-/g")"
     if [ -d ".claude/projects/$enc" ] && [ ! -e "projects/$h/claude-projects/$enc" ]; then
       mv ".claude/projects/$enc" "projects/$h/claude-projects/$enc"
@@ -1152,11 +1155,13 @@ let hashes = [];
 try { hashes = fs.readdirSync(path.join(ROOT, "projects")); } catch (e) {}
 for (const h of hashes) {
   const base = path.join(ROOT, "projects", h);
-  let ppath;
-  try { ppath = fs.readFileSync(path.join(base, ".aibox-path"), "utf8"); } catch (e) { continue; }
+  // A slice without its .aibox-path sentinel (pre-fix migrations wrote
+  // none) is still listed — pathless, so copy-only, labelled by hash.
+  let ppath = "";
+  try { ppath = fs.readFileSync(path.join(base, ".aibox-path"), "utf8"); } catch (e) {}
   const cp = path.join(base, "claude-projects");
   let encs = []; try { encs = fs.readdirSync(cp); } catch (e) {}
-  for (const enc of encs) addDir(path.join(cp, enc), ppath, ppath);
+  for (const enc of encs) addDir(path.join(cp, enc), ppath, ppath || "slice " + h);
 }
 // Legacy / not-yet-migrated layout (and post-migration leftovers). Dir
 // names are lossy encodings; real paths come from .claude.json KEYS with
