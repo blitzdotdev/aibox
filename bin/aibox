@@ -169,7 +169,16 @@ EXIT_HOOKS=()
 LOCKS=()
 _run_exit_hooks() { local h; for h in ${EXIT_HOOKS[@]+"${EXIT_HOOKS[@]}"}; do "$h"; done; }
 _on_exit() { EXIT_HOOKS+=("$1"); trap _run_exit_hooks EXIT; }
-_unlock_all() { local l; for l in ${LOCKS[@]+"${LOCKS[@]}"}; do rmdir "$l" 2>/dev/null || true; done; }
+_unlock_all() { local l; for l in ${LOCKS[@]+"${LOCKS[@]}"}; do rmdir "$l" 2>/dev/null || true; done; LOCKS=(); }
+# Release one lock now AND forget it: aibox lives for the whole Claude
+# session, and a lock path released early is soon another invocation's —
+# the exit hook must not remove that one.
+_unlock() {
+  local keep=() l
+  for l in ${LOCKS[@]+"${LOCKS[@]}"}; do [[ "$l" == "$1" ]] || keep+=("$l"); done
+  LOCKS=(${keep[@]+"${keep[@]}"})
+  rmdir "$1" 2>/dev/null || true
+}
 
 # ── Docker runtime ───────────────────────────────────────────────
 _ensure_docker() {
@@ -370,6 +379,9 @@ _ensure_proxy() {
   fi
   rm -f "$tmp"
 
+  # A proxy stuck in Created never got past a failed docker run (busy port);
+  # docker start cannot fix it, so remove it and let the create path retry.
+  [[ "$(_state "$PROXY")" == "created" ]] && { docker rm -f "$PROXY" >/dev/null 2>&1 || true; } || true
   # The host port is baked into the container at creation, so a changed
   # proxy_port means recreating it. The 80→8080 fallback is left alone —
   # otherwise every run would retry 80 and fall back again.
@@ -398,7 +410,10 @@ _ensure_proxy() {
           if [[ "$PROXY_PORT" == "80" ]] && _start_proxy_on 8080; then
             _warn "Host port 80 unavailable — proxy on 8080 instead (URLs get :8080)."
           else
-            _warn "Dev-server proxy failed to start on port ${PROXY_PORT}; containers still work."
+            # The failed fallback leaves its own Created wedge behind.
+            [[ "$(_state "$PROXY")" == "created" ]] && { docker rm -f "$PROXY" >/dev/null 2>&1 || true; } || true
+            local tried="port ${PROXY_PORT}"; [[ "$PROXY_PORT" == "80" ]] && tried="ports 80 and 8080"
+            _warn "Dev-server proxy failed to start on ${tried}; containers still work (no dev URLs until it does)."
           fi
         fi
       fi
@@ -578,28 +593,28 @@ _migrate_layout() {
   local lock="${CONFIG_DIR}/.lock-migrate" waited=0
   until mkdir "$lock" 2>/dev/null; do
     (( waited % 600 == 599 )) && _info "Waiting for another aibox migration to finish... (if none is running, remove the stale lock: rmdir ${lock})"
-    (( waited++ >= 36000 )) && { rmdir "$lock" 2>/dev/null || true; waited=0; }   # 1h
+    (( waited++ >= 36000 )) && { _unlock "$lock"; waited=0; }   # 1h
     sleep 0.1
   done
   LOCKS+=("$lock"); _on_exit _unlock_all
   # Another invocation may have finished the migration while we waited.
   if [[ "$(docker run --rm -v "${VOLUME}:/v" "$HELPER_IMAGE" sh -c '[ -f /v/.aibox-layout ] && echo done || true')" == "done" ]]; then
-    rmdir "$lock" 2>/dev/null || true
+    _unlock "$lock"
     return 0
   fi
   _info "Migrating ${VOLUME} to the per-project layout (one-time; old files stay in the volume untouched)..."
   local safety
   safety="$(_do_backup "$BACKUP_DIR" "aibox-home-pre-migrate")" \
-    || { rmdir "$lock" 2>/dev/null || true; _die "Safety backup failed — migration aborted, the volume is untouched."; }
+    || { _unlock "$lock"; _die "Safety backup failed — migration aborted, the volume is untouched."; }
   _ok "Safety backup: ${safety}"
   # Runs in the aibox image (present by now), not the alpine helper: the
   # migration needs node to encode transcript-dir names exactly as Claude
   # Code does.
   if ! printf '%s' "$_MIGRATE_SH" | docker run -i --rm --entrypoint sh -v "${VOLUME}:/v" "$IMAGE" -s "$HASH6"; then
-    rmdir "$lock" 2>/dev/null || true
+    _unlock "$lock"
     _die "Migration failed — restore the safety backup above with: aibox restore <file>"
   fi
-  rmdir "$lock" 2>/dev/null || true
+  _unlock "$lock"
   _ok "Migrated. Each project now has a private home; login, settings, and the claude binary stay shared."
 }
 
@@ -663,7 +678,7 @@ _ensure_container() {
   # older than ~15s is presumed dead and stolen.
   local lock="${CONFIG_DIR}/.lock-${CONTAINER}" waited=0
   until mkdir "$lock" 2>/dev/null; do
-    (( waited++ >= 150 )) && { rmdir "$lock" 2>/dev/null || true; waited=0; }
+    (( waited++ >= 150 )) && { _unlock "$lock"; waited=0; }
     sleep 0.1
   done
   LOCKS+=("$lock"); _on_exit _unlock_all
@@ -709,7 +724,7 @@ _ensure_container() {
     docker start "$CONTAINER" >/dev/null 2>&1 || true
   fi
 
-  rmdir "$lock" 2>/dev/null || true
+  _unlock "$lock"
 
   _wait_running "Container failed to start.${run_err:+ ${run_err}}"
 }
