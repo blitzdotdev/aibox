@@ -228,17 +228,20 @@ if [[ ! -e /home/aibox/.zshrc ]]; then
 fi
 # Claude Code deletes transcripts idle >30 days by default; raise that once
 # so session history is permanent. Never touches an existing value, skips
-# an unparseable file.
+# an unparseable file. This runs as root in the shared .claude slice, which
+# every project can write to: a symlink planted there must never be
+# followed (it could point into another project's bind mount).
 node -e '
 const fs=require("fs"),p="/home/aibox/.claude/settings.json";
+try{if(fs.lstatSync(p).isSymbolicLink())process.exit(0)}catch(e){}
 let s={};
 if(fs.existsSync(p)){try{s=JSON.parse(fs.readFileSync(p,"utf8"))}catch(e){process.exit(0)}}
 if(s.cleanupPeriodDays==null){s.cleanupPeriodDays=3650;fs.writeFileSync(p,JSON.stringify(s,null,2));}
 ' 2>/dev/null || true
-chown aibox:aibox /home/aibox/.claude/settings.json 2>/dev/null || true
+chown -h aibox:aibox /home/aibox/.claude/settings.json 2>/dev/null || true
 # Teach every session how to find and revive this project's past sessions.
 CM=/home/aibox/.claude/CLAUDE.md
-if ! grep -q 'aibox:sessions' "$CM" 2>/dev/null; then
+if [[ ! -L "$CM" ]] && ! grep -q 'aibox:sessions' "$CM" 2>/dev/null; then
   cat >> "$CM" <<'NOTES'
 
 <!-- aibox:sessions -->
@@ -246,7 +249,7 @@ if ! grep -q 'aibox:sessions' "$CM" 2>/dev/null; then
 - To make a past session controllable from claude.ai / the Claude phone app: `nohup script -qfc "claude --resume <session-id> --remote-control" /dev/null >/dev/null 2>&1 &` — it appears in the claude.ai session list within seconds.
 - To start a brand-new session there instead: same command with `--session-id $(cat /proc/sys/kernel/random/uuid)` in place of `--resume <session-id>`.
 NOTES
-  chown aibox:aibox "$CM" 2>/dev/null || true
+  chown -h aibox:aibox "$CM" 2>/dev/null || true
 fi
 # First start with an empty home volume: install Claude Code into the volume
 # so the binary and its self-updates persist across container recreation.
@@ -987,6 +990,12 @@ http.createServer((req, res) => {
   // Request-targets like "//" make new URL() throw — a crash here would
   // kill the whole UI.
   try { u = new URL(req.url, "http://x"); } catch (e) { res.writeHead(400); return res.end("bad request"); }
+  // *.aibox.localhost is loopback in the browser, so any web page could POST
+  // here through the proxy; only this page's own origin may. (The proxy
+  // passes Host through unchanged, so Origin equals "http://" + Host.)
+  if (req.method === "POST" && (req.headers.origin || "") !== "http://" + (req.headers.host || "")) {
+    res.writeHead(403); return res.end("forbidden");
+  }
   if (req.method === "POST" && u.pathname === "/api/new") {
     const id = require("crypto").randomUUID();
     spawnSession("--session-id " + id);
@@ -1150,6 +1159,9 @@ function addDir(dir, ppath, label) {
   let files = []; try { files = fs.readdirSync(dir); } catch (e) { return; }
   for (const f of files) {
     if (!f.endsWith(".jsonl")) continue;
+    // Filenames are agent-written: only a bare uuid may become an id that
+    // the host page later puts into a shell command.
+    if (!/^[0-9a-f-]{36}$/.test(f.slice(0, -6))) continue;
     try {
       const p = path.join(dir, f), st = fs.statSync(p), inf = info(p, st.size);
       if (Q) {
@@ -1198,6 +1210,10 @@ LISTER
 const http = require("http"), fs = require("fs"), cp = require("child_process");
 const PORT = 45790, URLBASE = "http://127.0.0.1:" + PORT;
 const IMAGE = process.env.AIBOX_IMAGE, VOLUME = process.env.AIBOX_VOLUME, CFG = process.env.AIBOX_CFG;
+// Per-run key. Loopback-only is not enough: containers reach the Mac's
+// loopback through host.docker.internal and can forge the Host header, so
+// every API call must carry the key that only the opened page knows.
+const TOK = require("crypto").randomBytes(16).toString("hex");
 let known = new Set();   // "path\nid" pairs from the last listing — action guards
 function list(cb, q) {
   // --entrypoint bypasses the aibox image entrypoint, which would otherwise
@@ -1322,9 +1338,11 @@ function ago(ms){const s=(Date.now()-ms)/1e3;if(s<90)return "just now";const m=s
   if(m<90)return Math.round(m)+" min ago";if(h<36)return Math.round(h)+" hr ago";
   if(d<10)return Math.round(d)+" days ago";return Math.round(d/7)+" wk ago"}
 function shq(s){return "'"+String(s).replace(/'/g,"'\\''")+"'"}
+const TOK=new URLSearchParams(location.search).get("t")||"";
+function api(p){return p+(p.includes("?")?"&":"?")+"t="+encodeURIComponent(TOK)}
 function act(path,id,ep,okMsg){
   const q="?path="+encodeURIComponent(path)+"&id="+encodeURIComponent(id);
-  fetch("/api/"+ep+q,{method:"POST"}).then(r=>r.json()).then(j=>say(j.error||okMsg)).catch(()=>say("Server stopped — restart aibox sessions."))
+  fetch(api("/api/"+ep+q),{method:"POST"}).then(r=>r.json()).then(j=>say(j.error||okMsg)).catch(()=>say("Server stopped — restart aibox sessions."))
 }
 // A session touched within ~2 min is very likely open in a terminal right
 // now; resuming it starts a SECOND claude on the same conversation.
@@ -1371,7 +1389,7 @@ function render(list){
     }
     const bC=el("button",null,"Copy resume command");
     bC.onclick=()=>{
-      const cmd=s.project?("cd "+shq(s.project)+" && aibox --resume "+s.id):("aibox --resume "+s.id);
+      const cmd=s.project?("cd "+shq(s.project)+" && aibox --resume "+shq(s.id)):("aibox --resume "+shq(s.id));
       navigator.clipboard.writeText(cmd).then(
         ()=>say(s.project?"Copied — paste into any terminal tab.":"Copied — run inside that project directory (its path isn't recorded)."),
         ()=>say("Copy failed — select the command manually."))};
@@ -1390,7 +1408,7 @@ let ALL=[];
 function banner(msg){document.getElementById("banner").innerHTML=msg?"<div class=banner></div>":"";
   if(msg)document.querySelector(".banner").textContent=msg}
 function load(){
-  fetch("/api/sessions").then(r=>r.json()).then(d=>{
+  fetch(api("/api/sessions")).then(r=>r.json()).then(d=>{
     banner(d.error);
     ALL=d.sessions||[];
     const q=document.getElementById("q").value.trim();
@@ -1408,14 +1426,14 @@ qEl.addEventListener("keydown",e=>{
   const q=qEl.value.trim();
   if(!q){render(ALL);return}
   say("Searching inside all transcripts…");
-  fetch("/api/search?q="+encodeURIComponent(q)).then(r=>r.json()).then(d=>{
+  fetch(api("/api/search?q="+encodeURIComponent(q))).then(r=>r.json()).then(d=>{
     banner(d.error);
     render(d.sessions||[]);
     say((d.sessions||[]).length+" transcript match"+((d.sessions||[]).length===1?"":"es")+" — clear the box to see everything again.");
   }).catch(()=>say("Server stopped — restart aibox sessions."));
 });
 document.getElementById("refresh").onclick=load;
-document.getElementById("close").onclick=()=>{fetch("/api/close",{method:"POST"}).finally(()=>{
+document.getElementById("close").onclick=()=>{fetch(api("/api/close"),{method:"POST"}).finally(()=>{
   document.body.innerHTML="<div class=wrap><p class=eyebrow>aibox</p><p class=sub>Sessions page stopped. You can close this tab.</p></div>"})};
 load();
 </script></body></html>`;
@@ -1427,6 +1445,9 @@ const server = http.createServer((req, res) => {
   if (host !== "127.0.0.1:" + PORT && host !== "localhost:" + PORT) { res.writeHead(403); return res.end("forbidden"); }
   let u;
   try { u = new URL(req.url, URLBASE); } catch (e) { return json({ error: "bad request" }, 400); }
+  if (u.pathname.startsWith("/api/") && u.searchParams.get("t") !== TOK) {
+    return json({ error: "Open the link printed by aibox sessions — it carries this run's key." }, 403);
+  }
   if (req.method === "POST" && u.pathname === "/api/close") {
     json({ ok: true });
     console.log("Closed from the page. Bye.");
@@ -1463,9 +1484,10 @@ server.on("error", e => {
   process.exit(1);
 });
 server.listen(PORT, "127.0.0.1", () => {
-  console.log("aibox sessions: " + URLBASE + "  (Ctrl-C or the Close button to stop)");
+  const link = URLBASE + "/?t=" + TOK;
+  console.log("aibox sessions: " + link + "  (Ctrl-C or the Close button to stop)");
   const opener = process.platform === "darwin" ? "open" : "xdg-open";
-  cp.execFile(opener, [URLBASE], () => {});
+  cp.execFile(opener, [link], () => {});
 });
 SESSJS
 
