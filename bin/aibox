@@ -161,6 +161,16 @@ _state() {
   echo "${s:-absent}"
 }
 
+# One EXIT trap for the whole script. bash keeps a single EXIT trap, so
+# cleanups register here instead of overwriting each other (a Ctrl-C during
+# migration used to leave .lock-migrate behind, which then blocked the very
+# `aibox restore` the error message recommends). Hooks are idempotent.
+EXIT_HOOKS=()
+LOCKS=()
+_run_exit_hooks() { local h; for h in ${EXIT_HOOKS[@]+"${EXIT_HOOKS[@]}"}; do "$h"; done; }
+_on_exit() { EXIT_HOOKS+=("$1"); trap _run_exit_hooks EXIT; }
+_unlock_all() { local l; for l in ${LOCKS[@]+"${LOCKS[@]}"}; do rmdir "$l" 2>/dev/null || true; done; }
+
 # ── Docker runtime ───────────────────────────────────────────────
 _ensure_docker() {
   command -v docker >/dev/null 2>&1 \
@@ -464,11 +474,15 @@ set -e
 cd "${AIBOX_MIG_ROOT:-/v}"
 [ -f .aibox-layout ] && exit 0
 mkdir -p shared/claude-cfg projects
+# Never clobber: a half-migrated volume (crash, Ctrl-C, then refilled by
+# migrate-to-v2.sh) can hold entries in both places, and the ones already
+# in shared/ are the live copies.
 if [ -d .claude ]; then
   for f in .claude/* .claude/.[!.]*; do
     [ -e "$f" ] || [ -L "$f" ] || continue
-    case "$(basename "$f")" in projects) continue ;; esac
-    mv "$f" shared/claude-cfg/
+    b="$(basename "$f")"
+    [ "$b" = projects ] && continue
+    [ -e "shared/claude-cfg/$b" ] || [ -L "shared/claude-cfg/$b" ] || mv "$f" shared/claude-cfg/
   done
 fi
 if [ -d .local/bin ] && [ ! -e shared/local-bin ]; then mv .local/bin shared/local-bin; fi
@@ -487,29 +501,66 @@ copy_home() {
     mv "projects/$1/home/.aibox-mig-tmp" "projects/$1/home/$d"
   done
 }
+# Transcript-dir encoding exactly as Claude Code does it (per code point).
+# The helper runs in the aibox image, so node is there; the sed fallback
+# is byte-wise and only right for ASCII paths.
+encode() {
+  if command -v node >/dev/null 2>&1; then node -e "process.stdout.write(process.argv[1].replace(/[^a-zA-Z0-9]/g, \"-\"))" "$1"
+  else printf %s "$1" | sed "s/[^A-Za-z0-9]/-/g"; fi
+}
+TAB="$(printf "\t")"
+# KEYS: "enc<TAB>hash6<TAB>path" per project KEY of .claude.json, longest
+# encoding first (the prefix pass below must try the most specific key
+# first). Value-position path strings (MCP args, history entries) must
+# never claim a transcript dir. IFS= keeps a trailing space in a path.
+KEYS=""
 CJ=shared/claude-cfg/.claude.json
 if [ -f "$CJ" ]; then
-  # Project paths appear as JSON KEYS ("/abs/path": ...). Value-position
-  # path strings (MCP args, history entries) must never claim a transcript
-  # dir — a stray match would strand sessions in a slice nothing mounts.
-  grep -o "\"/[^\"]*\":" "$CJ" | sed "s/\":\$//; s/^\"//" | sort -u | while read -r p; do
-    h="$(printf %s "$p" | sha256sum | cut -c1-6)"
+  KEYS="$(grep -o "\"/[^\"]*\":" "$CJ" | sed "s/\":\$//; s/^\"//" | sort -u | while IFS= read -r p; do
+    enc="$(encode "$p")"
+    printf "%08d\t%s\t%s\t%s\n" "${#enc}" "$enc" "$(printf %s "$p" | sha256sum | cut -c1-6)" "$p"
+  done | sort -rn | cut -f2-)"
+fi
+# (Loop bodies below end in if/case so a no-match last iteration cannot
+# return non-zero and trip set -e.)
+printf "%s\n" "$KEYS" | while IFS="$TAB" read -r enc h p; do
+  if [ -n "$h" ]; then
     copy_home "$h"
     # The slice sentinel: the sessions page lists a slice only through it,
     # and container creation checks it for hash collisions.
     [ -e "projects/$h/.aibox-path" ] || printf %s "$p" > "projects/$h/.aibox-path"
-    enc="$(printf %s "$p" | sed "s/[^A-Za-z0-9]/-/g")"
-    if [ -d ".claude/projects/$enc" ] && [ ! -e "projects/$h/claude-projects/$enc" ]; then
-      mv ".claude/projects/$enc" "projects/$h/claude-projects/$enc"
-    fi
+  fi
+done
+copy_home "$1"
+# claim <dir name> → hash6 of the owning key, or empty. Exact encoding
+# first, else the longest key whose encoding is a prefix: sessions started
+# in a subdirectory of a project, which in v2 land in the parent slice
+# anyway. The encoding is lossy, so a prefix claim can pick a sibling
+# project; nothing is deleted, the sessions page shows the dir under the
+# claimed project, and --resume finds a session by id from any directory.
+claim() {
+  r="$(printf "%s\n" "$KEYS" | while IFS="$TAB" read -r enc h p; do
+    if [ -n "$enc" ] && [ "$1" = "$enc" ]; then echo "$h"; exit 0; fi
+  done)"
+  [ -n "$r" ] || r="$(printf "%s\n" "$KEYS" | while IFS="$TAB" read -r enc h p; do
+    if [ -n "$enc" ]; then case "$1" in "$enc"-*) echo "$h"; exit 0;; esac; fi
+  done)"
+  printf %s "$r"
+}
+if [ -d .claude/projects ]; then
+  for d in .claude/projects/*; do
+    [ -d "$d" ] || continue
+    name="$(basename "$d")"
+    h="$(claim "$name")"
+    [ -n "$h" ] || continue
+    [ -e "projects/$h/claude-projects/$name" ] || mv "$d" "projects/$h/claude-projects/$name"
   done
 fi
-copy_home "$1"
-# Anything path-matching could not claim stays put (non-ASCII or >200-char
-# encodings, dirs with no .claude.json key) — but say so loudly.
-if [ -d .claude/projects ] && [ -n "$(ls -A .claude/projects 2>/dev/null)" ]; then
+# Anything still unclaimed (no key, no matching prefix) stays put — but say
+# so loudly. Finder litter is not worth a warning.
+if [ -d .claude/projects ] && [ -n "$(ls -A .claude/projects 2>/dev/null | grep -v "^\.DS_Store\$")" ]; then
   echo "aibox migrate: transcript dirs left unclaimed (kept in the volume at .claude/projects/):" >&2
-  ls .claude/projects >&2
+  ls -A .claude/projects >&2
 fi
 chown -R 1000:1000 shared projects 2>/dev/null || true
 echo 2 > .aibox-layout
@@ -530,6 +581,7 @@ _migrate_layout() {
     (( waited++ >= 36000 )) && { rmdir "$lock" 2>/dev/null || true; waited=0; }   # 1h
     sleep 0.1
   done
+  LOCKS+=("$lock"); _on_exit _unlock_all
   # Another invocation may have finished the migration while we waited.
   if [[ "$(docker run --rm -v "${VOLUME}:/v" "$HELPER_IMAGE" sh -c '[ -f /v/.aibox-layout ] && echo done || true')" == "done" ]]; then
     rmdir "$lock" 2>/dev/null || true
@@ -540,7 +592,10 @@ _migrate_layout() {
   safety="$(_do_backup "$BACKUP_DIR" "aibox-home-pre-migrate")" \
     || { rmdir "$lock" 2>/dev/null || true; _die "Safety backup failed — migration aborted, the volume is untouched."; }
   _ok "Safety backup: ${safety}"
-  if ! printf '%s' "$_MIGRATE_SH" | docker run -i --rm -v "${VOLUME}:/v" "$HELPER_IMAGE" sh -s "$HASH6"; then
+  # Runs in the aibox image (present by now), not the alpine helper: the
+  # migration needs node to encode transcript-dir names exactly as Claude
+  # Code does.
+  if ! printf '%s' "$_MIGRATE_SH" | docker run -i --rm --entrypoint sh -v "${VOLUME}:/v" "$IMAGE" -s "$HASH6"; then
     rmdir "$lock" 2>/dev/null || true
     _die "Migration failed — restore the safety backup above with: aibox restore <file>"
   fi
@@ -564,6 +619,7 @@ _ensure_layout() {
   # slices produces far worse errors than stopping here.
   local state
   state="$(docker run --rm -v "${VOLUME}:/v" "$HELPER_IMAGE" sh -c '
+    set -e
     if [ -f /v/.aibox-layout ]; then echo current
     elif [ -z "$(ls -A /v 2>/dev/null)" ]; then
       mkdir -p /v/shared/claude-cfg /v/shared/local-bin /v/shared/claude-app /v/projects
@@ -581,8 +637,11 @@ _ensure_layout() {
   # otherwise silently merge their private homes.
   local slice
   slice="$(docker run --rm -e "P=${PROJECT_DIR}" -v "${VOLUME}:/v" "$HELPER_IMAGE" sh -c '
+    set -e
     d="/v/projects/'"${HASH6}"'"
-    mkdir -p "$d/home" "$d/claude-projects"
+    # Shared dirs too: docker does not create a missing volume-subpath, so a
+    # volume whose shared/ went missing would otherwise fail every create.
+    mkdir -p /v/shared/claude-cfg /v/shared/local-bin /v/shared/claude-app "$d/home" "$d/claude-projects"
     if [ -f "$d/.aibox-path" ]; then
       [ "$(cat "$d/.aibox-path")" = "$P" ] || { echo COLLISION; exit 0; }
     else printf %s "$P" > "$d/.aibox-path"; fi
@@ -607,7 +666,7 @@ _ensure_container() {
     (( waited++ >= 150 )) && { rmdir "$lock" 2>/dev/null || true; waited=0; }
     sleep 0.1
   done
-  trap 'rmdir "$lock" 2>/dev/null || true' EXIT
+  LOCKS+=("$lock"); _on_exit _unlock_all
 
   local state cur_img cur_layout
   read -r state cur_img cur_layout < <(docker inspect "$CONTAINER" \
@@ -651,7 +710,6 @@ _ensure_container() {
   fi
 
   rmdir "$lock" 2>/dev/null || true
-  trap - EXIT
 
   _wait_running "Container failed to start.${run_err:+ ${run_err}}"
 }
@@ -728,7 +786,7 @@ _ensure_copy_all() {
   # The trailing random segment doubles as the URL suffix if slugs collide
   # (see _proxy_pairs). No --restart policy: disposable by design.
   CONTAINER="${CONTAINER}-copy-$(printf '%04x%04x' "$RANDOM" "$RANDOM")"
-  trap _cleanup_copy EXIT
+  _on_exit _cleanup_copy
   _docker_run -l "aibox.slug=${SLUG}-copy" -l "aibox.copy=1" >/dev/null
   _wait_running "Copy container failed to start."
   _ensure_proxy   # independent of the snapshot — do it before the slow part
@@ -1602,13 +1660,18 @@ _do_backup() {
 cmd_backup() {
   _ensure_docker
   [[ -d "${CONFIG_DIR}/.lock-migrate" ]] \
-    && _die "A volume-layout migration is in progress — retry once it finishes."
+    && _die "A volume-layout migration is in progress — retry once it finishes. (If none is running, remove the stale lock: rmdir ${CONFIG_DIR}/.lock-migrate)"
   docker volume inspect "$VOLUME" >/dev/null 2>&1 \
     || _die "No ${VOLUME} volume yet — nothing to back up."
   local out
   out="$(_do_backup "${1:-$BACKUP_DIR}")" \
     || _die "Backup failed — nothing was written (see error above; destination: ${1:-$BACKUP_DIR})."
   _ok "Backed up ${VOLUME} (sessions, login, claude binary) → ${out} ($(ls -lh "$out" | awk '{print $5}'))"
+}
+
+_restore_hint() {
+  [[ "${RESTORE_DONE:-}" == true || -z "${RESTORE_SAFETY:-}" ]] \
+    || _warn "Restore was interrupted — the volume may be incomplete. Recover with: aibox restore ${RESTORE_SAFETY}"
 }
 
 cmd_restore() {
@@ -1619,7 +1682,7 @@ cmd_restore() {
   [[ "$file" == *:* ]] && _die "Backup path contains ':' — docker cannot mount it. Move/rename the file first."
   _ensure_docker
   [[ -d "${CONFIG_DIR}/.lock-migrate" ]] \
-    && _die "A volume-layout migration is in progress — retry once it finishes."
+    && _die "A volume-layout migration is in progress — retry once it finishes. (If none is running, remove the stale lock: rmdir ${CONFIG_DIR}/.lock-migrate)"
   docker volume create "$VOLUME" >/dev/null 2>&1 || true
 
   # Validate the archive BEFORE touching anything. The file is mounted at a
@@ -1649,11 +1712,15 @@ cmd_restore() {
     safety="$(_do_backup "$BACKUP_DIR" "aibox-home-pre-restore")" \
       || _die "Safety backup failed — aborting restore. The volume is untouched."
     _ok "Safety backup: ${safety}"
+    # The wipe+extract below is not atomic; a Ctrl-C in the middle must
+    # still tell the user how to get back.
+    RESTORE_SAFETY="$safety"; _on_exit _restore_hint
   fi
 
   docker run --rm -v "${VOLUME}:/v" -v "${file}:/backup.tar.gz:ro" "$HELPER_IMAGE" \
     sh -c 'find /v -mindepth 1 -maxdepth 1 -exec rm -rf {} + && tar xzf /backup.tar.gz -C /v' \
     || _die "Restore failed mid-way. Recover with: aibox restore <the safety backup above>"
+  RESTORE_DONE=true
   _ok "Restored ${VOLUME} from $(basename "$file")."
 
   # Containers must be recreated, not restarted: their volume-subpath mounts

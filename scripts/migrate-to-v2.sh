@@ -87,9 +87,9 @@ docker volume create "$VOLUME" >/dev/null 2>&1 || true
 # This script writes the flat layout that v2 re-slices on its first run. Once
 # that run has happened the volume is sliced, and anything merged into the
 # flat paths would sit unmounted and invisible — refuse rather than "succeed".
-if docker run --rm -v "${VOLUME}:/dst:ro" "$HELPER_IMAGE" test -f /dst/.aibox-layout; then
-  die "${VOLUME} is already in v2's per-project layout (aibox v2 ran before this merge), and this script only fills the flat layout that v2 slices on first run.
-  To merge v1 data anyway: aibox stop --all; aibox backup (sessions created in v2 so far stay only in that backup); docker volume rm ${VOLUME}; rerun this script; then run aibox once."
+if docker run --rm -v "${VOLUME}:/dst:ro" "$HELPER_IMAGE" sh -c 'test -f /dst/.aibox-layout || test -e /dst/shared || test -e /dst/projects'; then
+  die "${VOLUME} already carries v2's per-project layout (aibox v2 ran before this merge, or a migration was interrupted), and this script only fills the flat layout that v2 slices on first run.
+  To merge v1 data anyway: aibox stop --all; aibox backup (sessions created in v2 so far stay only in that backup); docker rm -f \$(docker ps -aq --filter label=aibox.slug); docker volume rm ${VOLUME}; rerun this script; then run aibox once."
 fi
 docker run --rm -v "${VOLUME}:/dst" "$HELPER_IMAGE" mkdir -p /dst/.claude
 
