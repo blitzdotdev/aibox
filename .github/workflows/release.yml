@@ -29,7 +29,12 @@ jobs:
           node-version: 24
           registry-url: https://registry.npmjs.org
       - name: Stamp CLI version
-        run: sed -i "s/__CLI_VERSION__/$(node -p 'require(\"./package.json\").version')/" bin/aibox
+        # Anchor to the assignment line ONLY: the script contains two more
+        # __CLI_VERSION__ occurrences that are runtime dev-build sentinels
+        # ([[ "$X" == "__CLI_VERSION__" ]]) — replacing those too would make
+        # every released build identify as "dev" (wrong image tag, dead
+        # update mechanism).
+        run: sed -i "s/^CLI_VERSION=\"__CLI_VERSION__\"/CLI_VERSION=\"$(node -p 'require(\"./package.json\").version')\"/" bin/aibox
       - run: npm publish --access public --provenance
 
   homebrew:

@@ -16,6 +16,8 @@ To test locally, symlink into your PATH:
 ln -sf "$(pwd)/bin/aibox" /usr/local/bin/aibox
 ```
 
+Dev-mode note: a checkout runs as version `dev`, so the image tag doesn't change between your edits — after modifying the embedded Dockerfile or entrypoint, force a rebuild with `docker rmi aibox:dev-node<version>` (releases bump the tag, so users get rebuilds automatically).
+
 ## Publishing
 
 Publishing is fully automated. Pushing a version tag triggers CI which creates a GitHub release, publishes to npm, and updates the Homebrew tap.
@@ -36,4 +38,8 @@ npm run release
 1. Update `version` in `package.json`
 2. Commit, then `npm run release` — CI handles the rest
 
-Note: `AIBOX_VERSION` in `bin/aibox` is separate — it tracks the Docker image format and only needs bumping when the Dockerfile or entrypoint changes (triggers automatic image rebuild for users).
+Note: the Docker image tag is derived from the CLI version (`aibox:<version>-node<node_version>`), so any release automatically rebuilds users' images and recreates their containers on next run — sessions and login live in the `aibox-home` volume and are unaffected. In a git checkout (unstamped `__CLI_VERSION__`) the tag is `aibox:dev-node<version>`.
+
+Two stamping caveats:
+- The release workflow's sed must replace ONLY the `CLI_VERSION=` assignment — the script contains two more `__CLI_VERSION__` occurrences that are runtime dev-build sentinels and must survive stamping.
+- The Homebrew formula installs from the raw git tag, which is unstamped. The tap formula should `inreplace` the same assignment during install; until it does, brew installs behave like dev builds (image `aibox:dev-*`, no update notice).
