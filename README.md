@@ -28,7 +28,7 @@ aibox                       # 3. run (builds the image on first use)
 
 - **One container per project directory.** `aibox` in a project creates (or re-attaches to) that project's container. Open more terminal tabs and run `aibox` again — they attach to the same container.
 - **Your project is bind-mounted at its real path.** Changes sync both ways, paths inside the container match your Mac.
-- **One home volume, sliced per project.** Claude login, settings, and the `claude` binary live in shared slices of the `aibox-home` volume — log in once, forever. Everything else in a project's home (ssh keys, shell history, caches, and that project's sessions) is a private slice only its own containers mount, so one project's agent can't read another project's home directory or session transcripts. What *is* shared, because there is one login: Claude's settings and plugins, and Claude Code's own bookkeeping — the prompt history of every project (each prompt you typed, with its project path), snapshots of files Claude edited, todos, pastes. So an agent in one project can see what you *asked* in another, but not the conversations, tool output, or files themselves. Volumes from older aibox versions migrate to this layout automatically on first run, with a safety backup taken first.
+- **One home volume, sliced per project.** Claude login, settings, and the `claude` binary live in shared slices of the `aibox-home` volume — log in once, forever. Everything else in a project's home (ssh keys, shell history, caches, and that project's sessions) is a private slice only its own containers mount, so one project's agent can't read another project's home directory or session transcripts. What *is* shared, because there is one login: Claude's settings and plugins, and Claude Code's own bookkeeping — the prompt history of every project (each prompt you typed, with its project path), snapshots of files Claude edited, todos, pastes. So an agent in one project can see what you *asked* in another (and those edit snapshots), but not the conversations or tool output. Two more things are common to all projects: `~/.local/bin`, where the `claude` binary lives and self-updates (writable by every project), and the Docker network, so one project's dev servers are reachable from another's container. A flat `aibox-home` volume (from `migrate-to-v2.sh`, or a pre-release v2) is re-sliced into this layout automatically on first run, with a safety backup taken first.
 - **Nothing is destroyed implicitly.** Exiting Claude leaves the container running in the background (idle containers cost ~nothing) — the next `aibox` attaches instantly. `aibox stop` stops it; a stopped container keeps everything, including packages you apt-installed. Containers are only recreated when the image changes, and the home volume survives even that.
 - **The container is the sandbox.** Full sudo inside. Permission prompts are on by default, but bypass mode is always available in-session (aibox passes claude's `--allow-dangerously-skip-permissions`); run `aibox --yolo` to start with all prompts skipped (`--dangerously-skip-permissions`).
 - **Disposable copies on demand.** `aibox --copy` runs Claude in a fresh container on a *snapshot* of the project instead — nothing is bind-mounted, so the agent physically can't touch your real files. Same login and session history (shared home volume), own dev URLs (`<port>.<project>-copy.aibox.localhost`). The container is removed when the session exits; keep work by committing and pushing from inside. Each `--copy` run is its own independent sandbox. Combines with `--yolo`, and works for any program via `aibox run <prog> --copy`.
@@ -43,7 +43,7 @@ http://<port>.<project>.aibox.localhost
 
 Claude starts `vite` on 5173 in project `myapp` → open `http://5173.myapp.aibox.localhost`. No ports to publish, no restarts, no config — a tiny shared Caddy proxy on the Docker network reaches any container port directly, WebSockets/HMR included.
 
-Works out of the box in Chrome, Edge, and Firefox (`*.localhost` resolves to loopback natively). Safari needs macOS 26+. CLI tools like `curl` need `--resolve` (the system resolver doesn't do `*.localhost`).
+Works out of the box in Chrome, Edge, and Firefox (`*.localhost` resolves to loopback natively). Safari needs macOS 26+. CLI tools like `curl` need `--resolve` (the system resolver doesn't do `*.localhost`). If host port 80 is taken, the proxy falls back to 8080 and URLs get `:8080`; `proxy_port` in the config picks any other port.
 
 ## Phone & browser sessions
 
@@ -60,7 +60,7 @@ Everything worth keeping is in one volume, so backup is one file:
 ```bash
 aibox backup                 # ~/aibox-backups/aibox-home-<ver>-<timestamp>.tar.gz
 aibox backup /some/dir       # custom destination
-aibox restore <backup.tar.gz> # replaces the volume (auto safety-backup first)
+aibox restore <backup.tar.gz> # replaces the volume (auto safety-backup first; containers are recreated, apt installs reset)
 ```
 
 Backups are safe to take while sessions are running.
@@ -93,7 +93,7 @@ Sessions merge file-by-file (nothing is ever overwritten or deleted; sources are
 | `aibox stop [--all]` | Stop this project's container (`--all`: everything incl. proxy). Loses nothing |
 | `aibox status` | Containers with live memory + disk use, dev URLs, Docker disk totals, home volume size |
 | `aibox backup [dir]` | Snapshot the home volume to a tar.gz |
-| `aibox restore <file>` | Restore a backup (safety-backup of current state first) |
+| `aibox restore <file>` | Restore a backup (safety-backup of current state first; all containers are recreated, so apt-installed packages reset) |
 | `aibox update` | Update the CLI; image rebuilds automatically on next run |
 | `aibox version` / `help` | Versions + docker state / this table's long form |
 

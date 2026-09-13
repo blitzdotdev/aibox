@@ -74,8 +74,9 @@
 # All Claude state lives in one Docker volume (aibox-home), sliced per
 # project: login, settings, and the claude binary are shared; each project
 # gets a private home (ssh keys, shell history, its own sessions) that other
-# projects' containers never mount. Needs Docker Engine 26+. Volumes from
-# older aibox versions are migrated automatically (safety backup first).
+# projects' containers never mount. Needs Docker Engine 26+. A flat
+# aibox-home (from scripts/migrate-to-v2.sh or a pre-release v2) is
+# re-sliced automatically on first run (safety backup first).
 # Containers are disposable; the volume is what `aibox backup` protects.
 #
 # (This header is the output of `aibox help` — keep it accurate.)
@@ -201,7 +202,7 @@ RUN userdel -r node 2>/dev/null || true \\
  && echo "aibox ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/aibox \\
  && chmod 0440 /etc/sudoers.d/aibox
 
-ENV PATH="/home/aibox/.local/bin:\$PATH"
+ENV PATH="\$PATH:/home/aibox/.local/bin"
 
 COPY entrypoint.sh /usr/local/bin/aibox-entrypoint
 RUN chmod +x /usr/local/bin/aibox-entrypoint
@@ -355,6 +356,16 @@ _ensure_proxy() {
     cat "$tmp" > "$file"
   fi
   rm -f "$tmp"
+
+  # The host port is baked into the container at creation, so a changed
+  # proxy_port means recreating it. The 80→8080 fallback is left alone —
+  # otherwise every run would retry 80 and fall back again.
+  local cur
+  cur="$(docker inspect "$PROXY" --format '{{(index (index .HostConfig.PortBindings "80/tcp") 0).HostPort}}' 2>/dev/null || true)"
+  if [[ -n "$cur" && "$cur" != "$PROXY_PORT" && ! ( "$PROXY_PORT" == "80" && "$cur" == "8080" ) ]]; then
+    _info "proxy_port changed (${cur} → ${PROXY_PORT}) — recreating the dev-server proxy."
+    docker rm -f "$PROXY" >/dev/null 2>&1 || true
+  fi
 
   case "$(_state "$PROXY")" in
     running)

@@ -198,8 +198,10 @@ aibox claude/shell:
 - `aibox stop` = `docker stop` only. A stopped container preserves its
   writable layer (apt installs etc.); next `aibox claude` starts it again in
   ~1s.
-- The only code path that ever runs `docker rm` on a project container is
-  image-change recreation, which immediately recreates it.
+- `docker rm` on a project container happens only for recreation (image or
+  layout change, or a container wedged in Created state), which immediately
+  recreates it; for `--copy` cleanup on exit; and for `aibox restore`, which
+  is destructive by design and says so.
 
 ### 4.4 Image
 
@@ -289,9 +291,10 @@ no commands, no restarts, no sidecars, no tunnels.
   e.g. `http://5173.myapp.aibox.localhost`.
 - Inside the container, set an env var (e.g. `AIBOX_URL_BASE=myapp.aibox.localhost`)
   so Claude can tell the user the right URL for whatever port it just opened.
-- If publishing host port 80 fails (already taken, or the runtime can't),
-  fall back to `proxy_port` from config (default fallback 8080) and include
-  the port in printed URLs (`http://5173.myapp.aibox.localhost:8080`).
+- If publishing host port 80 fails (already taken, or the runtime can't)
+  and `proxy_port` is the default 80, fall back to 8080 and include the port
+  in printed URLs (`http://5173.myapp.aibox.localhost:8080`). A non-default
+  `proxy_port` has no fallback.
   Low-port caveat on macOS: binding `127.0.0.1:80` specifically needs
   privileges — Docker Desktop handles it via its privileged helper, while
   Colima/OrbStack emulate loopback-only publishing by binding `0.0.0.0` and
