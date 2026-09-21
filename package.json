@@ -1,7 +1,7 @@
 {
   "name": "aibox-cli",
-  "version": "0.6.0",
-  "description": "Run AI coding agents in isolated Docker containers",
+  "version": "2.0.0",
+  "description": "Persistent Docker sandboxes for Claude Code",
   "author": "repalash <palash@shaders.app>",
   "license": "MIT",
   "repository": {
@@ -26,6 +26,7 @@
   },
   "files": [
     "bin/aibox",
+    "scripts/migrate-to-v2.sh",
     "README.md",
     "LICENSE"
   ],
