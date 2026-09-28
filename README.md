@@ -53,6 +53,20 @@ aibox serve
 
 runs a small sessions UI at `http://45789.<project>.aibox.localhost`. **New session** starts a fresh session you drive from claude.ai/code or the Claude phone app ([Remote Control](https://code.claude.com/docs/en/remote-control)); **Resume** brings any past session back the same way; live sessions show as such and can be stopped. Every session is one detached claude process inside the project's container — closing your terminal changes nothing, and registration is outbound-only HTTPS (no ports, nothing exposed). Any Claude session can pull the same tricks on request — the shared CLAUDE.md teaches it the commands, so you can also say "start me a new session" from your phone in any live chat. `aibox serve stop` ends the UI and every live session of this project. On a remote Linux box, reach the UI with `ssh -L 8080:127.0.0.1:80 host` and open the same URL with `:8080`; the phone side needs no tunnel at all.
 
+## Scheduled jobs
+
+```bash
+cd myproject
+aibox schedule add briefing "weekdays 08:00" claude routines/briefing.md   # a prompt file in the project
+aibox schedule add tests "every 2h" run "npm test"
+aibox schedule add chrome on-start run "chromium --headless --remote-debugging-port=9222"
+aibox schedule            # list: next run, last result, proposals waiting
+```
+
+Every job runs **inside that project's sandbox**: `claude` entries as a fresh headless session over the prompt file (`--permission-mode auto --permission-prompts none --max-turns 30`, so write the file to stand on its own), `run` entries as a one-line shell command. The host side is one launchd agent (macOS) or crontab line (Linux) that ticks every minute: a due job starts Colima and the container if they are down, a run missed while the Mac slept happens once at wake, and `on-start` entries re-launch when the container comes up (dev servers, a headless browser, a Remote Control session). Output goes to `~/.aibox/schedule.log`; a failed run shows a notification. Schedules: `daily HH:MM`, `weekdays HH:MM`, `every 30m` … `every 24h`, `on-start`.
+
+Ask Claude in any session to "summarize my open PRs every weekday morning" and it writes a **proposal** (`~/.aibox/proposals/<name>` inside its container, which is a host-side inbox) — nothing runs until you approve it, via the dialog that appears on your Mac, `aibox schedule approve <name>`, or the reminder line every aibox run prints while proposals wait. Containers cannot write the registry, the registry cannot express a host command, and `aibox schedule off` stops the ticker without forgetting the entries.
+
 ## Backup & restore
 
 Everything worth keeping is in one volume, so backup is one file:
@@ -89,6 +103,7 @@ Sessions merge file-by-file (nothing is ever overwritten or deleted; sources are
 | `aibox run [--copy] <prog> [args]` | Run any program in the sandbox (e.g. `aibox run codex`). `--copy` works the same as above; the program's own flags pass through |
 | `aibox serve` | Sessions UI in the container: start new phone/claude.ai-drivable sessions, resume past ones, stop live ones. `aibox serve stop` ends the UI and every live session of this project |
 | `aibox sessions` | All projects' sessions on one local page (host-side, loopback-only, foreground). Buttons per session: open in Ghostty/Terminal, copy the resume command, or send to your phone |
+| `aibox schedule [add\|rm\|approve\|reject\|on\|off\|log]` | Jobs that run inside project sandboxes on a schedule or on container start; no args lists them with next/last run and pending proposals. See [Scheduled jobs](#scheduled-jobs) |
 | `aibox shell [cmd]` | zsh in the container, or run a one-off command |
 | `aibox stop [--all]` | Stop this project's container (`--all`: everything incl. proxy). Loses nothing |
 | `aibox status` | Containers with live memory + disk use, dev URLs, Docker disk totals, home volume size |
