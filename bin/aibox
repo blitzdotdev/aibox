@@ -35,6 +35,12 @@
 #                             the foreground until Ctrl-C or its Close
 #                             button). Per session: open in a terminal, copy
 #                             the resume command, or make it phone-drivable.
+#   aibox schedule [...]      Jobs that run inside project sandboxes on a
+#                             schedule (daily HH:MM, weekdays HH:MM, every
+#                             30m) or on container start, driven by launchd/
+#                             cron on the host. `add`, `rm`, `approve`/`reject`
+#                             proposals that a Claude session wrote, `on`/
+#                             `off`, `log`. No args lists everything.
 #   aibox rc-resume <id>      Make one past session of this project
 #                             drivable from claude.ai / the Claude app.
 #   aibox shell [cmd...]      zsh in the container. One argument runs as a
@@ -235,10 +241,13 @@ DOCKERFILE
   cat > "${CONFIG_DIR}/entrypoint.sh" <<'ENTRYPOINT'
 #!/bin/bash
 set -e
-rm -f /tmp/aibox-ready
+rm -f /tmp/aibox-ready /tmp/aibox-onstart-done   # per-boot markers (see _run_on_start)
 # /home/aibox is a named volume; normalize ownership on every container start
 # (data migrated from v1 or restored from backups may carry other UIDs).
-chown -R aibox:aibox /home/aibox 2>/dev/null || true
+# ~/.aibox holds the host-owned proposals inbox bind mount — never chown
+# into it (on Linux hosts the host user would lose the files).
+find /home/aibox -mindepth 1 -maxdepth 1 ! -name .aibox -exec chown -R aibox:aibox {} + 2>/dev/null || true
+chown aibox:aibox /home/aibox 2>/dev/null || true
 # A fresh volume has no .zshrc — without one, the first interactive zsh
 # opens the zsh-newuser-install questionnaire.
 if [[ ! -e /home/aibox/.zshrc ]]; then
@@ -270,6 +279,16 @@ if [[ ! -L "$CM" ]] && ! grep -q 'aibox:sessions' "$CM" 2>/dev/null; then
 NOTES
   chown -h aibox:aibox "$CM" 2>/dev/null || true
 fi
+if [[ ! -L "$CM" ]] && ! grep -q 'aibox:schedule' "$CM" 2>/dev/null; then
+  cat >> "$CM" <<'NOTES'
+
+<!-- aibox:schedule -->
+- You cannot schedule anything yourself; the host runs approved jobs inside this container. To propose one: first write the prompt file (if any), then write `~/.aibox/proposals/<name>` (name: a-z, 0-9, dashes) with two lines: the schedule (`daily 08:00`, `weekdays 18:30`, `every 30m`, `every 2h`, or `on-start`) and either `claude <prompt-file>` (a self-contained prompt file in this project — it runs later as a fresh headless session with no memory of this chat, so put everything it needs in the file) or `run <shell command>` (one line, at most 200 chars). Then tell the user to approve it with `aibox schedule approve <name>` on their machine (a dialog also offers it on a Mac); the job's output lands in ~/.aibox/schedule.log there.
+NOTES
+  chown -h aibox:aibox "$CM" 2>/dev/null || true
+fi
+# The proposals mount creates ~/.aibox root-owned; hand it to the user.
+chown aibox:aibox /home/aibox/.aibox 2>/dev/null || true
 # First start with an empty home volume: install Claude Code into the volume
 # so the binary and its self-updates persist across container recreation.
 # (Anything baked into the image's home dir would be shadowed by the mount.)
@@ -443,6 +462,11 @@ _ensure_net_vol() {
 # isolation boundary (in-volume permissions are meaningless with full sudo).
 # todos/file-history/shell-snapshots stay inside the shared .claude mount.
 _docker_run() {
+  # Scheduling proposals: the one host path a container may write, its own
+  # per-project inbox (see cmd_schedule). The .path file beside it tells the
+  # scheduler which project a proposal came from — the mount is the sender.
+  mkdir -p "${CONFIG_DIR}/inbox/${HASH6}"
+  printf %s "$PROJECT_DIR" > "${CONFIG_DIR}/inbox/${HASH6}.path"
   docker run -d --name "$CONTAINER" \
     --network "$NETWORK" \
     --hostname "${SLUG:0:63}" \
@@ -453,10 +477,11 @@ _docker_run() {
     --mount "type=volume,src=${VOLUME},dst=/home/aibox/.claude/projects,volume-subpath=projects/${HASH6}/claude-projects" \
     --mount "type=volume,src=${VOLUME},dst=/home/aibox/.local/bin,volume-subpath=shared/local-bin" \
     --mount "type=volume,src=${VOLUME},dst=/home/aibox/.local/share/claude,volume-subpath=shared/claude-app" \
+    -v "${CONFIG_DIR}/inbox/${HASH6}:/home/aibox/.aibox/proposals" \
     -w "$PROJECT_DIR" \
     -e CLAUDE_CONFIG_DIR=/home/aibox/.claude \
     -l "aibox.path=${PROJECT_DIR}" \
-    -l "aibox.layout=2" \
+    -l "aibox.layout=3" \
     "$@" "$IMAGE"
 }
 
@@ -693,7 +718,7 @@ _ensure_container() {
   # it never got past Created (a failed docker run leaves the name wedged —
   # docker start can never succeed, and there are no processes to protect).
   # The home volume and project bind survive by construction.
-  if [[ "$state" != "absent" && -n "${cur_img:-}" && ( "$cur_img" != "$IMAGE" || "${cur_layout:-}" != "2" || "$state" == "created" ) ]]; then
+  if [[ "$state" != "absent" && -n "${cur_img:-}" && ( "$cur_img" != "$IMAGE" || "${cur_layout:-}" != "3" || "$state" == "created" ) ]]; then
     local active=0
     if [[ "$state" == "running" ]]; then
       active="$(docker top "$CONTAINER" -o pid,args 2>/dev/null | tail -n +2 | grep -vc 'sleep infinity' || true)"
@@ -727,6 +752,36 @@ _ensure_container() {
   _unlock "$lock"
 
   _wait_running "Container failed to start.${run_err:+ ${run_err}}"
+  _run_on_start
+}
+
+# `on-start` schedule entries for this project: re-launch long-running
+# things (dev servers, a headless browser, remote-control sessions) once per
+# container boot. The entrypoint clears /tmp/aibox-onstart-done at every
+# start (dockerd restarts containers itself after a reboot, before aibox
+# looks), so the marker, not aibox's own start path, decides. Called on
+# every aibox run and by the scheduler tick (onstart-check).
+_run_on_start() {
+  [[ -f "${CONFIG_DIR}/schedule.json" ]] || return 0
+  local first
+  first="$(docker exec -u aibox "$CONTAINER" sh -c '[ -e /tmp/aibox-onstart-done ] || { touch /tmp/aibox-onstart-done && echo RUN; }' 2>/dev/null || true)"
+  [[ "$first" == "RUN" ]] || return 0
+  _write_schedule_js
+  local c
+  AIBOX_CFG="$CONFIG_DIR" node "${CONFIG_DIR}/schedule.js" on-start "$PROJECT_DIR" 2>/dev/null | while IFS= read -r c; do
+    [[ -n "$c" ]] || continue
+    _info "on-start: ${c}"
+    docker exec -d -u aibox -w "$PROJECT_DIR" "$CONTAINER" bash -lc "$c" || true
+  done
+  return 0
+}
+
+# Scheduler plumbing: run this project's on-start entries if its container
+# is up and hasn't had them this boot. Never starts docker or containers.
+cmd_onstart_check() {
+  docker info >/dev/null 2>&1 || return 0
+  [[ "$(_state "$CONTAINER")" == "running" ]] || return 0
+  _run_on_start
 }
 
 _ensure_claude_bin() {
@@ -757,6 +812,7 @@ _ensure_all() {
   if [[ "$CREATED" == "true" ]]; then
     _ok "Container ready. Dev servers: $(_dev_url)"
   fi
+  _remind_proposals
 }
 
 # ── exec plumbing ────────────────────────────────────────────────
@@ -1130,6 +1186,380 @@ cmd_rc_resume() {
   docker exec -d -u aibox -w "$PROJECT_DIR" "$CONTAINER" \
     script -qfc "claude --resume $1 --remote-control" /dev/null
   _ok "Session registering — it appears in the claude.ai / Claude app list shortly."
+}
+
+# ── Schedule (host-side jobs that run inside project sandboxes) ──
+# One launchd agent (macOS) / crontab line (Linux) runs `aibox schedule
+# tick` every minute. Entries live in ~/.aibox/schedule.json on the HOST;
+# each runs as `aibox shell <cmd>` in its project, so nothing in the
+# registry can execute outside a container. Containers can only write
+# proposals into their own inbox mount, which the tick surfaces for
+# approval. The logic is Node (date math is the same on macOS and Linux).
+_write_schedule_js() {
+  cat > "${CONFIG_DIR}/schedule.js" <<'SCHEDJS'
+// aibox schedule — host-side scheduler. Generated by aibox (rewritten on
+// every `aibox schedule` run). One launchd agent (macOS) or crontab line
+// (Linux) runs `aibox schedule tick` every minute; the tick starts due
+// jobs, each as `aibox shell '<cmd>'` in its project, re-launches on-start
+// entries after a container (re)boot, and surfaces pending proposals from
+// containers. Registry and state live in ~/.aibox; the only thing a
+// container can write is its own inbox of proposals.
+const fs = require("fs"), path = require("path"), cp = require("child_process"), os = require("os"), crypto = require("crypto");
+const CFG = process.env.AIBOX_CFG || "", AIBOX = process.env.AIBOX_BIN || "aibox";
+const REG = path.join(CFG, "schedule.json"), STATE_DIR = path.join(CFG, "schedule-state"), SNOOZE = path.join(CFG, "schedule-snooze.json");
+const LOG = path.join(CFG, "schedule.log"), INBOX = path.join(CFG, "inbox");
+const MAC = process.platform === "darwin";
+const NAME_RE = /^[a-z0-9][a-z0-9-]{0,31}$/, MAX_PROPOSAL = 2048, MAX_PREVIEW = 4096;
+const now = () => process.env.AIBOX_NOW ? new Date(Number(process.env.AIBOX_NOW)) : new Date();
+const readJson = (f, d) => { try { return JSON.parse(fs.readFileSync(f, "utf8")); } catch (e) { return d; } };
+// Per-process temp name: several processes (tick + run children) write
+// state at once, and a shared temp name loses writes.
+function writeJson(f, o) { const t = f + "." + process.pid + ".tmp"; fs.writeFileSync(t, JSON.stringify(o, null, 2) + "\n"); fs.renameSync(t, f); }
+const shq = s => "'" + String(s).replace(/'/g, "'\\''") + "'";
+const log = line => fs.appendFileSync(LOG, now().toISOString() + " " + line + "\n");
+const die = msg => { console.error("✗ " + msg); process.exit(1); };
+// Bounded read of a REGULAR file only: inbox files and prompt files are
+// written inside containers, so a FIFO, a symlink to /dev/zero, a
+// directory, or a huge file must not hang or crash the tick.
+function safeRead(file, max) {
+  let fd = null;
+  try {
+    if (!fs.lstatSync(file).isFile()) return null;
+    fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+    const st = fs.fstatSync(fd); if (!st.isFile() || st.size > max) return null;
+    const buf = Buffer.alloc(max), n = fs.readSync(fd, buf, 0, max, 0);
+    return buf.slice(0, n).toString("utf8");
+  } catch (e) { return null; } finally { if (fd !== null) fs.closeSync(fd); }
+}
+
+// ── schedule forms ──────────────────────────────────────────────
+// daily HH:MM · weekdays HH:MM · every Nm|Nh (5m…24h, counted from local
+// midnight) · on-start
+function parseWhen(s) {
+  s = String(s || "").trim().toLowerCase(); let m;
+  if (s === "on-start") return { kind: "on-start", text: s };
+  if ((m = s.match(/^(daily|weekdays) ([01]?\d|2[0-3]):([0-5]\d)$/)))
+    return { kind: m[1], h: +m[2], min: +m[3], text: m[1] + " " + String(+m[2]).padStart(2, "0") + ":" + m[3] };
+  if ((m = s.match(/^every (\d{1,3})(m|h)$/))) {
+    const n = +m[1] * (m[2] === "h" ? 60 : 1);
+    if (n >= 5 && n <= 1440) return { kind: "every", minutes: n, text: s };
+  }
+  return null;
+}
+// Latest due time at or before t (local time); null if none / on-start.
+function lastDue(w, t) {
+  if (w.kind === "every") {
+    const d = new Date(t), slot = Math.floor((t.getHours() * 60 + t.getMinutes()) / w.minutes) * w.minutes;
+    d.setHours(0, slot, 0, 0); return d;
+  }
+  if (w.kind !== "daily" && w.kind !== "weekdays") return null;
+  for (let back = 0; back < 8; back++) {
+    const d = new Date(t); d.setDate(d.getDate() - back); d.setHours(w.h, w.min, 0, 0);
+    if (d > t) continue;
+    if (w.kind === "weekdays" && (d.getDay() === 0 || d.getDay() === 6)) continue;
+    return d;
+  }
+  return null;
+}
+function nextDue(w, t) {
+  if (w.kind === "every") {
+    const d = new Date(t), slot = (Math.floor((t.getHours() * 60 + t.getMinutes()) / w.minutes) + 1) * w.minutes;
+    d.setHours(0, slot, 0, 0); return d;
+  }
+  if (w.kind !== "daily" && w.kind !== "weekdays") return null;
+  for (let fwd = 0; fwd < 8; fwd++) {
+    const d = new Date(t); d.setDate(d.getDate() + fwd); d.setHours(w.h, w.min, 0, 0);
+    if (d <= t) continue;
+    if (w.kind === "weekdays" && (d.getDay() === 0 || d.getDay() === 6)) continue;
+    return d;
+  }
+  return null;
+}
+const fmt = d => d ? d.toLocaleString(undefined, { weekday: "short", hour: "2-digit", minute: "2-digit", month: "short", day: "numeric" }) : "–";
+
+// ── entries ─────────────────────────────────────────────────────
+// kind "claude": a prompt file runs as a fresh headless session with a
+// fixed, reviewable flag set (prompt on stdin, so a file starting with
+// "---" is not parsed as an option). kind "run": one shell line.
+function containerCmd(e) {
+  if (e.kind === "claude") return "claude -p --permission-mode auto --permission-prompts none --max-turns 30 < " + shq(e.arg);
+  return e.arg;
+}
+function validate(e) {
+  if (!NAME_RE.test(e.name || "")) return "name must be 1–32 chars of a-z, 0-9, dashes";
+  const w = parseWhen(e.when); if (!w) return "when must be: daily HH:MM · weekdays HH:MM · every 30m / every 2h · on-start";
+  if (!e.project || !path.isAbsolute(e.project) || !fs.existsSync(e.project)) return "project directory not found: " + e.project;
+  if (e.kind === "claude") {
+    if (!e.arg || e.arg.split(/[\\/]/).includes("..") || path.isAbsolute(e.arg)) return "claude needs a prompt file path relative to the project";
+    if (safeRead(path.join(e.project, e.arg), MAX_PREVIEW) === null) return "prompt file missing or not a small regular file: " + e.arg;
+    if (w.kind === "on-start") return "an on-start entry must be a run command";
+  } else if (e.kind === "run") {
+    if (!e.arg || e.arg.length > 200 || /[\r\n]/.test(e.arg)) return "run command must be 1–200 chars on one line (put longer ones in a script)";
+  } else return "kind must be claude or run";
+  return null;
+}
+const entries = () => readJson(REG, []);
+const getState = name => readJson(path.join(STATE_DIR, name + ".json"), {});
+function setState(name, patch) { fs.mkdirSync(STATE_DIR, { recursive: true }); const f = path.join(STATE_DIR, name + ".json"); writeJson(f, Object.assign(readJson(f, {}), patch)); }
+function addEntry(e, source) {
+  const err = validate(e); if (err) die(err);
+  const all = entries(), clash = all.find(x => x.name === e.name && x.project !== e.project);
+  if (clash) die("the name " + e.name + " is already used by " + clash.project + " — remove it (aibox schedule rm " + e.name + ") or pick another name");
+  const list = all.filter(x => x.name !== e.name);   // same project + same name: replace
+  list.push({ name: e.name, when: parseWhen(e.when).text, project: e.project, kind: e.kind, arg: e.arg, added: now().toISOString() });
+  writeJson(REG, list);
+  setState(e.name, { last: now().getTime() });   // waits for the NEXT occurrence
+  log("added " + e.name + " (" + source + "): " + e.when + " · " + e.kind + " " + e.arg + " · " + e.project);
+  if (!installed()) install();
+}
+
+// ── proposals (from containers, via the per-project inbox mount) ────
+// File <inbox>/<hash6>/<name>: line 1 = when, line 2 = "claude <file>" or
+// "run <command>". <hash6>.path (written by aibox on the host) names the
+// project — the sender is the mount, never a field in the file. Invalid
+// ones are never deleted automatically (Claude may still be writing the
+// prompt file); they show as INVALID until rejected.
+function proposals() {
+  const out = [];
+  let dirs = []; try { dirs = fs.readdirSync(INBOX).filter(d => !d.startsWith(".") && !d.endsWith(".path")); } catch (e) {}
+  for (const h of dirs) {
+    let project = ""; try { project = fs.readFileSync(path.join(INBOX, h + ".path"), "utf8").trim(); } catch (e) {}
+    let files = []; try { files = fs.readdirSync(path.join(INBOX, h)).filter(f => !f.startsWith(".")); } catch (e) {}
+    for (const f of files) {
+      const file = path.join(INBOX, h, f), p = { id: h + "/" + f, name: f, project, file, error: null, when: "", kind: "", arg: "", hash: "" };
+      try {
+        const text = safeRead(file, MAX_PROPOSAL);
+        if (text === null) { p.error = "not a small regular file"; }
+        else {
+          p.hash = crypto.createHash("sha256").update(text).digest("hex").slice(0, 16);
+          const lines = text.split("\n").map(s => s.trim()).filter(Boolean);
+          p.when = lines[0] || ""; const m = (lines[1] || "").match(/^(claude|run)\s+(.+)$/); if (m) { p.kind = m[1]; p.arg = m[2]; }
+          p.error = validate(p);
+        }
+      } catch (e) { p.error = "unreadable"; }
+      out.push(p);
+    }
+  }
+  return out;
+}
+// A bare name is enough unless two projects proposed the same name.
+function findProposal(ref) {
+  const all = proposals(), hits = all.filter(p => p.id === ref || p.name === ref);
+  if (!hits.length) die("no proposal named " + ref + " (aibox schedule lists them)");
+  if (hits.length > 1) die("several projects proposed " + ref + " — use one of: " + hits.map(p => p.id).join(", "));
+  return hits[0];
+}
+function describe(p) {
+  const proj = path.basename(p.project || "?");
+  let what = p.kind === "claude" ? "Claude runs the prompt file " + p.arg : "runs: " + p.arg;
+  if (p.kind === "claude" && !p.error) {
+    const t = safeRead(path.join(p.project, p.arg), MAX_PREVIEW);
+    if (t) what += "\n\n" + t.split("\n").slice(0, 10).join("\n").slice(0, 600);
+  }
+  return "Project " + proj + " proposes “" + p.name + "”: " + p.when + "\n" + what + "\n\nRuns inside that project's sandbox and starts its container if needed.";
+}
+// Approval is tied to the reviewed bytes: `expect` is the hash of what was
+// displayed; a file rewritten in between is refused and shown again.
+function approve(p, expect) {
+  if (p.error) die("proposal " + p.id + " is invalid (" + p.error + ") — reject it");
+  if (expect && p.hash !== expect) { log("proposal " + p.id + " changed after review — not approved"); return false; }
+  addEntry({ name: p.name, when: p.when, project: p.project, kind: p.kind, arg: p.arg }, "approved from " + path.basename(p.project));
+  try { fs.unlinkSync(p.file); } catch (e) {}
+  console.log("✓ approved " + p.name + " — " + p.when + " · " + p.kind + " " + p.arg + " · " + p.project);
+  return true;
+}
+function reject(ps) {
+  for (const p of ps) { try { fs.unlinkSync(p.file); } catch (e) { try { fs.rmSync(p.file, { recursive: true, force: true }); } catch (x) {} } log("rejected " + p.id); }
+  console.log("✓ rejected " + ps.map(p => p.id).join(", "));
+}
+// macOS only, and only when a GUI session can show it (osascript fails
+// over SSH). Shown from a detached child so the tick never waits on a
+// human; Later/timeout snoozes that exact file version for 4 hours.
+function dialog(text, buttons, def) {
+  if (!MAC || process.env.AIBOX_DIALOG === "0") return "";
+  const script = "display dialog " + JSON.stringify(text) + " with title \"aibox\" buttons {" + buttons.map(b => JSON.stringify(b)).join(",") +
+    "} default button " + JSON.stringify(def) + " giving up after 300";
+  const r = cp.spawnSync("osascript", ["-e", script], { encoding: "utf8" });
+  if (r.status !== 0 || /gave up:true/.test(r.stdout)) return "";
+  const m = String(r.stdout).match(/button returned:([^,]*)/); return m ? m[1].trim() : "";
+}
+function notify(text) {
+  if (!MAC || process.env.AIBOX_DIALOG === "0") return;
+  cp.spawnSync("osascript", ["-e", "display notification " + JSON.stringify(text) + " with title \"aibox\""]);
+}
+const snoozeKey = p => p.id + ":" + p.hash;
+function snooze(ps) { const s = readJson(SNOOZE, {}); ps.forEach(p => { s[snoozeKey(p)] = now().getTime() + 4 * 3600 * 1000; }); writeJson(SNOOZE, s); }
+function pendingToAsk() {
+  const s = readJson(SNOOZE, {}), t = now().getTime();
+  return proposals().filter(p => !p.error && !(s[snoozeKey(p)] > t));
+}
+function ask(id, expect) {   // detached child of tick; one dialog at a time
+  const lock = path.join(CFG, ".lock-dialog");
+  try { fs.mkdirSync(lock); } catch (e) { try { if (Date.now() - fs.statSync(lock).mtimeMs < 10 * 60 * 1000) return; fs.rmdirSync(lock); fs.mkdirSync(lock); } catch (x) { return; } }
+  try {
+    const p = proposals().find(x => x.id === id); if (!p || p.error) return;
+    const same = pendingToAsk().filter(x => x.project === p.project);
+    if (same.length > 5) {
+      const b = dialog(same.length + " scheduling proposals are waiting from " + path.basename(p.project) + ". Review them with: aibox schedule", ["Reject all", "Later"], "Later");
+      if (b === "Reject all") reject(same); else snooze(same);
+      return;
+    }
+    if (p.hash !== expect) return;   // rewritten since the tick looked; next tick re-evaluates
+    const b = dialog(describe(p), ["Reject", "Later", "Approve"], "Later");
+    if (b === "Approve") approve(p, expect); else if (b === "Reject") reject([p]); else snooze([p]);
+  } finally { try { fs.rmdirSync(lock); } catch (e) {} }
+}
+
+// ── running ─────────────────────────────────────────────────────
+// A pid counts as alive only if it started after this boot (pids recycle).
+const bootTime = () => Date.now() - os.uptime() * 1000;
+function alive(s) {
+  if (!s.pid || !s.started || s.started < bootTime()) return false;
+  try { return process.kill(s.pid, 0); } catch (e) { return e.code === "EPERM"; }
+}
+function runEntry(name) {   // synchronous; spawned detached by tick
+  const e = entries().find(x => x.name === name); if (!e) return;
+  setState(name, { pid: process.pid, started: Date.now() });
+  const fd = fs.openSync(LOG, "a");
+  fs.writeSync(fd, "\n" + now().toISOString() + " ▶ " + name + " in " + e.project + "\n");
+  const t0 = Date.now();
+  const r = cp.spawnSync(AIBOX, ["shell", containerCmd(e)], { cwd: e.project, stdio: ["ignore", fd, fd] });
+  const secs = Math.round((Date.now() - t0) / 1000), code = r.status === null ? "signal " + r.signal : r.status;
+  fs.writeSync(fd, now().toISOString() + " ■ " + name + " exit " + code + " (" + secs + "s)\n"); fs.closeSync(fd);
+  setState(name, { pid: 0, status: code === 0 ? "ok" : "failed (" + code + ")", finished: now().getTime() });
+  if (code !== 0) {
+    let hint = ""; try { hint = /login expired|not logged in|please run \/login/i.test(fs.readFileSync(LOG, "utf8").slice(-4000)) ? " Login expired — run aibox in any project to log in." : ""; } catch (x) {}
+    notify("Scheduled job “" + name + "” failed (exit " + code + ")." + hint + " Details: aibox schedule log");
+  }
+}
+const detach = args => cp.spawn(process.execPath, [__filename, ...args], { detached: true, stdio: "ignore", env: process.env }).unref();
+function tick() {
+  const lock = path.join(CFG, ".lock-tick");
+  try { fs.mkdirSync(lock); } catch (e) {
+    try { if (Date.now() - fs.statSync(lock).mtimeMs < 10 * 60 * 1000) return; fs.rmdirSync(lock); fs.mkdirSync(lock); } catch (x) { return; }
+  }
+  try {
+    const t = now(), es = entries();
+    for (const e of es) {
+      const w = parseWhen(e.when), due = w && lastDue(w, t), s = getState(e.name);
+      if (!due || due.getTime() <= (s.last || 0)) continue;
+      setState(e.name, { last: t.getTime() });   // before spawning: a crash must not re-fire every minute
+      if (alive(s)) { log("skip " + e.name + ": previous run still going (pid " + s.pid + ")"); continue; }
+      detach(["run", e.name]);
+    }
+    // on-start entries: aibox checks a per-boot marker in the container and
+    // runs them once; skipped quietly when docker or the container is down.
+    for (const project of [...new Set(es.filter(e => e.when === "on-start").map(e => e.project))])
+      cp.spawnSync(AIBOX, ["onstart-check"], { cwd: project, stdio: "ignore", timeout: 120000 });
+    const p = pendingToAsk()[0]; if (p) detach(["ask", p.id, p.hash]);
+  } finally { try { fs.rmdirSync(lock); } catch (e) {} }
+}
+
+// ── the every-minute trigger ────────────────────────────────────
+// PATH is captured at install time: launchd/cron give a login shell that
+// knows nothing of Homebrew or nvm, and the tick needs node, docker, colima.
+const PLIST = path.join(os.homedir(), "Library", "LaunchAgents", "dev.aibox.schedule.plist"), MARK = "# aibox-schedule";
+const xml = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;");
+const tickCmd = () => shq(AIBOX) + " schedule tick";
+function installed() { return MAC ? fs.existsSync(PLIST) : /aibox-schedule/.test(crontab()); }
+function crontab() { const r = cp.spawnSync("crontab", ["-l"], { encoding: "utf8" }); return r.status === 0 ? r.stdout : ""; }
+function install() {
+  if (MAC) {
+    fs.mkdirSync(path.dirname(PLIST), { recursive: true });
+    fs.writeFileSync(PLIST, `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>dev.aibox.schedule</string>
+  <key>ProgramArguments</key><array><string>/bin/bash</string><string>-c</string><string>${xml(tickCmd())}</string></array>
+  <key>EnvironmentVariables</key><dict><key>PATH</key><string>${xml(process.env.PATH || "/usr/local/bin:/usr/bin:/bin")}</string></dict>
+  <key>StartInterval</key><integer>60</integer>
+  <key>RunAtLoad</key><true/>
+  <key>AbandonProcessGroup</key><true/>
+  <key>StandardErrorPath</key><string>${xml(path.join(CFG, "schedule-agent.log"))}</string>
+</dict></plist>
+`);
+    const dom = "gui/" + process.getuid();
+    cp.spawnSync("launchctl", ["bootout", dom, PLIST]);
+    if (cp.spawnSync("launchctl", ["bootstrap", dom, PLIST]).status !== 0) cp.spawnSync("launchctl", ["load", "-w", PLIST]);
+    console.log("✓ scheduler on: launchd runs `aibox schedule tick` every minute (aibox schedule off to stop)");
+  } else {
+    const lines = crontab().split("\n").filter(l => l && !l.includes(MARK));
+    lines.push("* * * * * PATH=" + shq(process.env.PATH || "/usr/local/bin:/usr/bin:/bin") + " /bin/bash -c " + shq(tickCmd()) + " " + MARK);
+    const r = cp.spawnSync("crontab", ["-"], { input: lines.join("\n") + "\n" });
+    if (r.status !== 0) die("could not install the crontab line; add it yourself: * * * * * /bin/bash -c " + shq(tickCmd()));
+    console.log("✓ scheduler on: cron runs `aibox schedule tick` every minute (aibox schedule off to stop)");
+  }
+}
+function uninstall() {
+  if (MAC) { cp.spawnSync("launchctl", ["bootout", "gui/" + process.getuid(), PLIST]); try { fs.unlinkSync(PLIST); } catch (e) {} }
+  else { const lines = crontab().split("\n").filter(l => l && !l.includes(MARK)); cp.spawnSync("crontab", ["-"], { input: lines.length ? lines.join("\n") + "\n" : "" }); }
+  console.log("✓ scheduler off (entries kept; aibox schedule on to resume)");
+}
+
+// ── CLI ─────────────────────────────────────────────────────────
+function list() {
+  const es = entries(), t = now();
+  if (!es.length) console.log("No scheduled jobs. Add one from a project dir:  aibox schedule add <name> \"daily 08:00\" claude <prompt-file>");
+  for (const e of es) {
+    const w = parseWhen(e.when), s = getState(e.name);
+    const last = alive(s) ? "running since " + fmt(new Date(s.started)) : s.status ? s.status + " " + fmt(new Date(s.finished)) : "never run";
+    console.log(e.name.padEnd(14) + e.when.padEnd(16) + path.basename(e.project).padEnd(20) + (e.kind + " " + e.arg).slice(0, 44).padEnd(46) +
+      (w.kind === "on-start" ? "on container start" : "next " + fmt(nextDue(w, t))) + " · " + last);
+  }
+  const ps = proposals();
+  if (ps.length) {
+    console.log("\nProposals waiting (aibox schedule approve <name> / reject <name>):");
+    for (const p of ps) console.log("  " + p.name.padEnd(14) + (p.error ? "INVALID (" + p.error + ")" : p.when.padEnd(16) + path.basename(p.project).padEnd(20) + p.kind + " " + p.arg));
+  }
+  if (es.length && !installed()) console.log("\nScheduler is OFF — nothing runs until: aibox schedule on");
+}
+function main() {
+  if (!CFG) die("AIBOX_CFG not set");
+  const [cmd, ...a] = process.argv.slice(2);
+  switch (cmd || "list") {
+    case "list": return list();
+    case "add": {
+      const [name, when, kind, ...rest] = a;
+      if (!name || !when || !kind) die("usage: aibox schedule add <name> \"<when>\" claude <prompt-file> | run \"<command>\"  (from the project directory)");
+      addEntry({ name, when, project: process.env.AIBOX_PROJECT, kind, arg: rest.join(" ") }, "added by user");
+      return console.log("✓ " + name + ": " + parseWhen(when).text + " in " + process.env.AIBOX_PROJECT);
+    }
+    case "rm": { const l = entries(); if (!l.some(e => e.name === a[0])) die("no job named " + a[0]); writeJson(REG, l.filter(e => e.name !== a[0])); log("removed " + a[0]); return console.log("✓ removed " + a[0]); }
+    case "approve": return approve(findProposal(a[0] || die("usage: aibox schedule approve <name>")));
+    case "reject": return reject(a[0] === "all" ? proposals() : [findProposal(a[0] || die("usage: aibox schedule reject <name>|all"))]);
+    case "on": return install();
+    case "off": return uninstall();
+    case "tick": return tick();
+    case "run": return runEntry(a[0]);
+    case "ask": return ask(a[0], a[1]);
+    case "on-start": return installed() && entries().filter(e => e.when === "on-start" && e.project === a[0]).forEach(e => console.log(containerCmd(e)));
+    case "log": { let s = ""; try { s = fs.readFileSync(LOG, "utf8"); } catch (e) {} const ls = s.split("\n"); return console.log((a[0] ? ls.filter(l => l.includes(a[0])) : ls).slice(-60).join("\n")); }
+    default: die("aibox schedule [list|add|rm|approve|reject|on|off|log]");
+  }
+}
+if (require.main === module) main();
+module.exports = { parseWhen, lastDue, nextDue, validate, containerCmd, safeRead };
+SCHEDJS
+}
+
+# The aibox binary as an absolute path, for launchd and the sessions page
+# (env and PATH do not reliably survive open/launchd).
+_aibox_bin() {
+  command -v aibox 2>/dev/null || realpath "$0" 2>/dev/null || readlink -f "$0" 2>/dev/null || echo "$0"
+}
+
+cmd_schedule() {
+  mkdir -p "${CONFIG_DIR}/inbox"
+  _write_schedule_js
+  AIBOX_CFG="$CONFIG_DIR" AIBOX_BIN="$(_aibox_bin)" AIBOX_PROJECT="$PROJECT_DIR" node "${CONFIG_DIR}/schedule.js" "$@"
+}
+
+# Pending proposals from containers — a one-line nudge on ordinary runs.
+_remind_proposals() {
+  local n
+  n="$(find "${CONFIG_DIR}/inbox" -mindepth 2 -maxdepth 2 -type f ! -name '.*' 2>/dev/null | wc -l | tr -d ' ' || true)"
+  [[ "${n:-0}" -gt 0 ]] && _info "${n} scheduling proposal(s) waiting — review with: aibox schedule"
+  return 0
 }
 
 # ── Sessions page (host-side, foreground, all projects) ──────────
@@ -1564,9 +1994,7 @@ server.listen(PORT, "127.0.0.1", () => {
 });
 SESSJS
 
-  local aibox_bin
-  aibox_bin="$(command -v aibox 2>/dev/null || realpath "$0" 2>/dev/null || readlink -f "$0" 2>/dev/null || echo "$0")"
-  AIBOX_IMAGE="$IMAGE" AIBOX_VOLUME="$VOLUME" AIBOX_CFG="$CONFIG_DIR" AIBOX_BIN="$aibox_bin" \
+  AIBOX_IMAGE="$IMAGE" AIBOX_VOLUME="$VOLUME" AIBOX_CFG="$CONFIG_DIR" AIBOX_BIN="$(_aibox_bin)" \
     node "${CONFIG_DIR}/sessions-ui.js"
 }
 
@@ -1598,6 +2026,7 @@ cmd_stop() {
 
 cmd_status() {
   _ensure_docker
+  _remind_proposals
   local rows
   rows="$(docker ps -a --filter label=aibox.slug \
     --format '{{.Label "aibox.slug"}}\t{{.Status}}\t{{.Image}}\t{{.Label "aibox.path"}}\t{{.Names}}' 2>/dev/null)"
@@ -1811,6 +2240,8 @@ case "$CMD" in
   run)                  cmd_run "$@" ;;
   serve)                cmd_serve "$@" ;;
   sessions)             cmd_sessions ;;
+  schedule)             cmd_schedule "$@" ;;
+  onstart-check)        cmd_onstart_check ;;
   rc-resume)            cmd_rc_resume "$@" ;;
   shell)                cmd_shell "$@" ;;
   stop)                 cmd_stop "$@" ;;
