@@ -45,6 +45,17 @@ Claude starts `vite` on 5173 in project `myapp` → open `http://5173.myapp.aibo
 
 Works out of the box in Chrome, Edge, and Firefox (`*.localhost` resolves to loopback natively). Safari needs macOS 26+. CLI tools like `curl` need `--resolve` (the system resolver doesn't do `*.localhost`). If host port 80 is taken, the proxy falls back to 8080 and URLs get `:8080`; `proxy_port` in the config picks any other port.
 
+### GPU rendering
+
+Containers have no GPU, so headless Chromium inside renders WebGL in software. For real GPU renders (WebGL/WebGPU screenshots of a three.js scene, say), run a Playwright browser server **on the Mac** and let sessions connect to it:
+
+```bash
+aibox browser setup    # once: a hidden, unprivileged user with its own node + Playwright (asks for sudo)
+aibox browser          # start; prints the ws URL.  aibox browser stop | status
+```
+
+The browser runs as that user inside its own launchd domain, so it can read nothing of yours (setup also closes your home directory to other local users). Sessions find the URL and Playwright version in `~/.aibox/proposals/.browser-url`, and the shared CLAUDE.md tells them how to use it: matching client version, a `Host` header, one shared Chromium with a context per session, pages served over HTTP (your dev servers reach it through the proxy URL). If it isn't running, Claude asks you to start it. macOS only.
+
 ## Phone & browser sessions
 
 ```bash
@@ -103,6 +114,7 @@ Sessions merge file-by-file (nothing is ever overwritten or deleted; sources are
 | `aibox run [--copy] <prog> [args]` | Run any program in the sandbox (e.g. `aibox run codex`). `--copy` works the same as above; the program's own flags pass through |
 | `aibox serve` | Sessions UI in the container: start new phone/claude.ai-drivable sessions, resume past ones, stop live ones. `aibox serve stop` ends the UI and every live session of this project |
 | `aibox sessions` | All projects' sessions on one local page (host-side, loopback-only, foreground). Buttons per session: open in Ghostty/Terminal, copy the resume command, or send to your phone |
+| `aibox browser [setup\|stop\|status]` | GPU-backed Playwright browser server on the Mac that sessions connect to (see [GPU rendering](#gpu-rendering)). macOS only |
 | `aibox schedule [add\|rm\|approve\|reject\|on\|off\|log]` | Jobs that run inside project sandboxes on a schedule or on container start; no args lists them with next/last run and pending proposals. See [Scheduled jobs](#scheduled-jobs) |
 | `aibox shell [cmd]` | zsh in the container, or run a one-off command |
 | `aibox stop [--all]` | Stop this project's container (`--all`: everything incl. proxy). Loses nothing |

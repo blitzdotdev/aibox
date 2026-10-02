@@ -41,6 +41,11 @@
 #                             cron on the host. `add`, `rm`, `approve`/`reject`
 #                             proposals that a Claude session wrote, `on`/
 #                             `off`, `log`. No args lists everything.
+#   aibox browser [setup|stop|status]
+#                             Playwright browser server on the Mac, with the
+#                             real GPU, that sessions connect to for WebGL/
+#                             WebGPU renders. Runs as a hidden unprivileged
+#                             user; `setup` creates it once. macOS only.
 #   aibox rc-resume <id>      Make one past session of this project
 #                             drivable from claude.ai / the Claude app.
 #   aibox shell [cmd...]      zsh in the container. One argument runs as a
@@ -287,6 +292,50 @@ if [[ ! -L "$CM" ]] && ! grep -q 'aibox:schedule' "$CM" 2>/dev/null; then
 NOTES
   chown -h aibox:aibox "$CM" 2>/dev/null || true
 fi
+# How-to for the host-side GPU browser (see `aibox browser`). Rewritten on
+# every start so it tracks the aibox version; never through a symlink.
+GB=/home/aibox/.claude/aibox-gpu-browser.md
+if [[ ! -L "$GB" ]]; then
+  cat > "$GB" <<'DOC'
+# GPU browser for sessions (a Playwright server on the user's Mac)
+
+This container has no GPU: headless Chromium here renders WebGL/WebGPU in
+software (SwiftShader), slowly and with a large memory footprint. The user's
+Mac can run a Playwright browser server with the real GPU (`aibox browser`).
+While it runs, `~/.aibox/proposals/.browser-url` exists in this container:
+line 1 is the ws URL (reachable via host.docker.internal), line 2 the
+Playwright version.
+
+Using it:
+- The client must be exactly that Playwright version. Do not change the
+  project's own Playwright; use a scratch install:
+  `npm i --prefix /tmp/pw playwright@<version>` and
+  `require("/tmp/pw/node_modules/playwright")`.
+- Connect with `chromium.connect(url, { headers: { Host: "127.0.0.1:3145" } })`
+  — the server rejects any other Host value with 403.
+- One Chromium is shared by all sessions: use `browser.newContext()` for
+  isolation and always `browser.close()` when done (it only disconnects you).
+- The browser runs on the Mac, not here, so it cannot read this container's
+  files. Serve pages over HTTP: a dev server in this container is reachable
+  to it as `http://<port>.<$AIBOX_URL_BASE>` (the aibox dev-server proxy).
+- Save screenshots into the project directory so the user can open them.
+
+If the file is missing and GPU rendering would matter (WebGL/WebGPU
+screenshots, rendering performance), tell the user: "run `aibox browser` on
+your Mac for GPU rendering", then check the file again. Without it, use
+Playwright's own headless Chromium with
+`--enable-unsafe-swiftshader --use-angle=swiftshader`.
+DOC
+  chown -h aibox:aibox "$GB" 2>/dev/null || true
+fi
+if [[ ! -L "$CM" ]] && ! grep -q 'aibox:browser' "$CM" 2>/dev/null; then
+  cat >> "$CM" <<'NOTES'
+
+<!-- aibox:browser -->
+- GPU rendering (WebGL/WebGPU screenshots, render performance): this container has no GPU. Read `~/.claude/aibox-gpu-browser.md` — the user can run `aibox browser` on their Mac to give you a GPU-backed Playwright browser.
+NOTES
+  chown -h aibox:aibox "$CM" 2>/dev/null || true
+fi
 # The proposals mount creates ~/.aibox root-owned; hand it to the user.
 chown aibox:aibox /home/aibox/.aibox 2>/dev/null || true
 # First start with an empty home volume: install Claude Code into the volume
@@ -467,6 +516,9 @@ _docker_run() {
   # scheduler which project a proposal came from — the mount is the sender.
   mkdir -p "${CONFIG_DIR}/inbox/${HASH6}"
   printf %s "$PROJECT_DIR" > "${CONFIG_DIR}/inbox/${HASH6}.path"
+  # A running GPU browser server (aibox browser) is advertised to new
+  # containers the same way as to existing ones.
+  [[ -f "${CONFIG_DIR}/browser.url" ]] && cp "${CONFIG_DIR}/browser.url" "${CONFIG_DIR}/inbox/${HASH6}/.browser-url" || true
   docker run -d --name "$CONTAINER" \
     --network "$NETWORK" \
     --hostname "${SLUG:0:63}" \
@@ -1562,6 +1614,117 @@ _remind_proposals() {
   return 0
 }
 
+# ── GPU browser (macOS): a Playwright server on the Mac for sessions ──
+# Containers get no GPU (Colima, Docker Desktop and OrbStack pass none
+# through), so headless Chromium inside renders WebGL on the CPU. `aibox
+# browser` runs a Playwright browser server ON THE MAC as a hidden,
+# unprivileged user ("render": own node, own Playwright, own home) inside
+# that user's launchd domain (Chrome's Mach services need one). Sessions
+# read the ws URL from ~/.aibox/proposals/.browser-url and connect through
+# host.docker.internal; the browser sees that user's files, never yours.
+RENDER_USER=render
+RENDER_HOME=/var/render
+BROWSER_PORT=3145
+# Run a shell string as the render user, in its launchd domain, from its
+# home, with its own node first on PATH. sudo asks for your password.
+_render_sh() {
+  local uid
+  uid="$(id -u "$RENDER_USER" 2>/dev/null)" || _die "No '${RENDER_USER}' user yet — run: aibox browser setup"
+  sudo launchctl asuser "$uid" sudo -u "$RENDER_USER" -H env "PATH=${RENDER_HOME}/node/bin:/usr/bin:/bin" bash -c "cd ~ && $1"
+}
+_browser_setup() {
+  if ! id -u "$RENDER_USER" >/dev/null 2>&1; then
+    _info "Creating hidden user '${RENDER_USER}' (sudo asks for your password)..."
+    sudo sysadminctl -addUser "$RENDER_USER" -fullName "aibox render" -shell /bin/zsh -home "$RENDER_HOME" >/dev/null 2>&1 \
+      || _die "sysadminctl could not create the user."
+    sudo dscl . -create "/Users/${RENDER_USER}" IsHidden 1
+  fi
+  sudo mkdir -p "$RENDER_HOME" && sudo chown "${RENDER_USER}:staff" "$RENDER_HOME" && sudo chmod 750 "$RENDER_HOME"
+  # Your home is group-readable by default and render is in staff: close it,
+  # or the browser could read ~/Projects through file:// URLs.
+  if [[ "$(stat -f %Lp "$HOME")" != "700" ]]; then
+    _info "Closing ${HOME} to other local users (chmod 700)."
+    chmod 700 "$HOME"
+  fi
+  local arch
+  case "$(uname -m)" in arm64) arch=darwin-arm64 ;; *) arch=darwin-x64 ;; esac
+  _info "Installing node and Playwright for '${RENDER_USER}' (a few minutes, one time)..."
+  _render_sh '[ -x node/bin/node ] || { f=$(curl -fsSL https://nodejs.org/dist/latest-v22.x/SHASUMS256.txt | grep -o "node-v22[^ ]*'"$arch"'.tar.gz" | head -1) && curl -fsSL "https://nodejs.org/dist/latest-v22.x/$f" | tar xz && rm -rf node && mv "${f%.tar.gz}" node; }'
+  _render_sh '[ -d node_modules/@playwright/test ] || { npm init -y >/dev/null && npm i @playwright/test@latest >/dev/null; }; npx playwright install chromium >/dev/null && node -e "console.log(require(\"@playwright/test/package.json\").version)" > .pw-version'
+  _render_sh 'cat > serve.js <<"EOF"
+// aibox GPU browser server: full Chromium in new-headless mode (Metal via
+// ANGLE), one browser shared by all connecting sessions, each in its own
+// context. Started by `aibox browser` on the Mac; stop with `aibox browser stop`.
+const { chromium } = require("@playwright/test");
+const wsPath = "/" + require("crypto").randomBytes(8).toString("hex");
+chromium.launchServer({ channel: "chromium", headless: true, host: "127.0.0.1", port: '"$BROWSER_PORT"', wsPath })
+  .then(s => console.log("Listening on " + s.wsEndpoint()));
+EOF
+cat > README.md <<"EOF"
+# render - GPU browser server for aibox sessions
+Hidden, unprivileged macOS account created by `aibox browser setup`. No login
+password; used only via sudo. Its one job: run a Playwright browser server on
+the Mac so sandboxed aibox sessions (Docker in Colima) can render WebGL/WebGPU
+with the real GPU instead of SwiftShader.
+Why a separate user: a Playwright browser can open file:// and read whatever
+its account can read. As render it sees /var/render and system files, never
+the home of the person running aibox (which setup makes chmod 700).
+Everything here is private to this account: node/ (official tarball),
+node_modules/ (Playwright), serve.js (the server), server.log, .pw-version.
+Start / stop / status:  aibox browser  |  aibox browser stop  |  aibox browser status
+It must run in its own launchd domain (sudo launchctl asuser <uid> ...),
+which aibox does; a plain sudo -u render makes Chrome die at startup.
+Clients send the header Host: 127.0.0.1:3145 (anything else gets 403).
+Update Playwright:  aibox browser setup   (reinstalls to latest)
+Remove everything:  aibox browser stop; sudo sysadminctl -deleteUser render; sudo rm -rf /var/render
+EOF'
+  _ok "'${RENDER_USER}' is ready (Playwright $(cat "${RENDER_HOME}/.pw-version" 2>/dev/null)). Start the server with: aibox browser"
+}
+_browser_running() { pgrep -u "$RENDER_USER" -f "node serve.js" >/dev/null 2>&1; }
+# Every project inbox gets (or loses) the .browser-url dotfile, which the
+# proposal lister ignores and the container reads at ~/.aibox/proposals/.
+_browser_sync() {
+  local d
+  for d in "${CONFIG_DIR}"/inbox/*/; do
+    [[ -d "$d" ]] || continue
+    if [[ -f "${CONFIG_DIR}/browser.url" ]]; then cp "${CONFIG_DIR}/browser.url" "${d}.browser-url"; else rm -f "${d}.browser-url"; fi
+  done
+}
+_browser_start() {
+  [[ -f "${RENDER_HOME}/serve.js" ]] || _die "Not set up yet — run: aibox browser setup"
+  if ! _browser_running; then
+    _info "Starting the GPU browser server (sudo may ask for your password)..."
+    _render_sh 'rm -f server.log; nohup node serve.js > server.log 2>&1 &'
+    local i=0
+    until grep -q "ws://" "${RENDER_HOME}/server.log" 2>/dev/null; do
+      (( i++ >= 30 )) && _die "The server did not start — see ${RENDER_HOME}/server.log"
+      sleep 1
+    done
+  fi
+  local url ver
+  url="$(grep -o 'ws://[^ ]*' "${RENDER_HOME}/server.log" | tail -1)"
+  ver="$(cat "${RENDER_HOME}/.pw-version" 2>/dev/null)"
+  printf '%s\n%s\n' "${url/127.0.0.1/host.docker.internal}" "$ver" > "${CONFIG_DIR}/browser.url"
+  _browser_sync
+  _ok "GPU browser server running: ${url} (Playwright ${ver})."
+  _info "Sessions find it at ~/.aibox/proposals/.browser-url (CLAUDE.md explains the rest). Stop with: aibox browser stop"
+}
+_browser_stop() {
+  _browser_running && sudo pkill -u "$RENDER_USER" -f "node serve.js" || true
+  rm -f "${CONFIG_DIR}/browser.url"; _browser_sync
+  _ok "GPU browser server stopped."
+}
+cmd_browser() {
+  [[ "$(uname)" == "Darwin" ]] || _die "aibox browser is macOS-only: it runs a GPU browser on the Mac for sessions. On Linux, run a Playwright server with your GPU yourself and give sessions its URL."
+  case "${1:-start}" in
+    setup) _browser_setup ;;
+    start) _browser_start ;;
+    stop)  _browser_stop ;;
+    status) if _browser_running; then _ok "running: $(grep -o 'ws://[^ ]*' "${RENDER_HOME}/server.log" | tail -1)"; else _info "not running — start with: aibox browser"; fi ;;
+    *) _die "Usage: aibox browser [setup|start|stop|status]" ;;
+  esac
+}
+
 # ── Sessions page (host-side, foreground, all projects) ──────────
 # `aibox sessions` runs a small Node server ON THE HOST (node is present by
 # construction — aibox installs via npm), loopback-only, and opens the
@@ -2241,6 +2404,7 @@ case "$CMD" in
   serve)                cmd_serve "$@" ;;
   sessions)             cmd_sessions ;;
   schedule)             cmd_schedule "$@" ;;
+  browser)              cmd_browser "$@" ;;
   onstart-check)        cmd_onstart_check ;;
   rc-resume)            cmd_rc_resume "$@" ;;
   shell)                cmd_shell "$@" ;;
