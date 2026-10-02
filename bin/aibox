@@ -1655,8 +1655,9 @@ _browser_setup() {
 // aibox GPU browser server: full Chromium in new-headless mode (Metal via
 // ANGLE), one browser shared by all connecting sessions, each in its own
 // context. Run by `aibox browser` on the Mac (foreground, Ctrl-C stops it).
-// If the browser exits (a crash, or a client that closes it instead of
-// disconnecting), it is relaunched on the same URL.
+// Closing the LAST window crashes Chromium when this user has no display
+// session (NSWindow close), so the server holds one page open for its
+// lifetime; if the browser still exits, it is relaunched on the same URL.
 const { chromium } = require("@playwright/test");
 const wsPath = "/" + require("crypto").randomBytes(8).toString("hex");
 const fatal = e => { console.error(e); process.exit(1); };
@@ -1664,6 +1665,8 @@ async function serve() {
   const s = await chromium.launchServer({ channel: "chromium", headless: true, host: "127.0.0.1", port: '"$BROWSER_PORT"', wsPath });
   console.log("Listening on " + s.wsEndpoint());
   s.on("close", () => { console.log(new Date().toISOString() + " browser exited - relaunching"); setTimeout(() => serve().catch(fatal), 1000); });
+  try { const keeper = await chromium.connect(s.wsEndpoint()); await (await keeper.newContext()).newPage(); }
+  catch (e) { console.log("keeper page failed: " + e.message); }
 }
 serve().catch(fatal);
 EOF
@@ -1705,7 +1708,9 @@ _browser_sync() {
 }
 _browser_cleanup() {
   rm -f "${CONFIG_DIR}/browser.url"; _browser_sync
-  pgrep -u "$RENDER_USER" -f "node serve.js" >/dev/null 2>&1 && sudo pkill -u "$RENDER_USER" -f "node serve.js" 2>/dev/null || true
+  # Everything of render's: the node server and the Chromium it launched
+  # (the user exists for nothing else).
+  pgrep -u "$RENDER_USER" >/dev/null 2>&1 && sudo pkill -u "$RENDER_USER" 2>/dev/null || true
 }
 # Foreground, like `aibox sessions`: the server's output (and Chromium's,
 # via DEBUG) stays on screen, Ctrl-C ends it, and the advertised URL is
@@ -1713,6 +1718,9 @@ _browser_cleanup() {
 _browser_run() {
   [[ -f "${RENDER_HOME}/serve.js" ]] || _die "Not set up yet — run: aibox browser setup"
   pgrep -u "$RENDER_USER" -f "node serve.js" >/dev/null 2>&1 && _die "A GPU browser server is already running (another terminal?). Stop it there, or: sudo pkill -u ${RENDER_USER} -f 'node serve.js'"
+  # The one thing standing between that browser's file:// and your files is
+  # your home's mode; check it on every run, not only at setup.
+  [[ "$(stat -f %Lp "$HOME")" == "700" ]] || _die "${HOME} is not mode 700, so the '${RENDER_USER}' browser could read it. Fix with: chmod 700 ~"
   local ver line
   ver="$(cat "${RENDER_HOME}/.pw-version" 2>/dev/null)"
   _on_exit _browser_cleanup
