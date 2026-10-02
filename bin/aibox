@@ -41,11 +41,11 @@
 #                             cron on the host. `add`, `rm`, `approve`/`reject`
 #                             proposals that a Claude session wrote, `on`/
 #                             `off`, `log`. No args lists everything.
-#   aibox browser [setup|stop|status]
-#                             Playwright browser server on the Mac, with the
+#   aibox browser [setup]     Playwright browser server on the Mac, with the
 #                             real GPU, that sessions connect to for WebGL/
-#                             WebGPU renders. Runs as a hidden unprivileged
-#                             user; `setup` creates it once. macOS only.
+#                             WebGPU renders. Foreground; Ctrl-C stops it.
+#                             Runs as a hidden unprivileged user; `setup`
+#                             creates that user once. macOS only.
 #   aibox rc-resume <id>      Make one past session of this project
 #                             drivable from claude.ai / the Claude app.
 #   aibox shell [cmd...]      zsh in the container. One argument runs as a
@@ -1671,16 +1671,16 @@ its account can read. As render it sees /var/render and system files, never
 the home of the person running aibox (which setup makes chmod 700).
 Everything here is private to this account: node/ (official tarball),
 node_modules/ (Playwright), serve.js (the server), server.log, .pw-version.
-Start / stop / status:  aibox browser  |  aibox browser stop  |  aibox browser status
+Run:  aibox browser   (foreground, output on screen, Ctrl-C stops it)
 It must run in its own launchd domain (sudo launchctl asuser <uid> ...),
 which aibox does; a plain sudo -u render makes Chrome die at startup.
+By hand:  cd / && sudo launchctl asuser $(id -u render) sudo -u render -H env PATH=/var/render/node/bin:/usr/bin:/bin bash -c "cd ~ && node serve.js"
 Clients send the header Host: 127.0.0.1:3145 (anything else gets 403).
 Update Playwright:  aibox browser setup   (reinstalls to latest)
 Remove everything:  aibox browser stop; sudo sysadminctl -deleteUser render; sudo rm -rf /var/render
 EOF'
   _ok "'${RENDER_USER}' is ready (Playwright $(cat "${RENDER_HOME}/.pw-version" 2>/dev/null)). Start the server with: aibox browser"
 }
-_browser_running() { pgrep -u "$RENDER_USER" -f "node serve.js" >/dev/null 2>&1; }
 # Every project inbox gets (or loses) the .browser-url dotfile, which the
 # proposal lister ignores and the container reads at ~/.aibox/proposals/.
 _browser_sync() {
@@ -1690,38 +1690,35 @@ _browser_sync() {
     if [[ -f "${CONFIG_DIR}/browser.url" ]]; then cp "${CONFIG_DIR}/browser.url" "${d}.browser-url"; else rm -f "${d}.browser-url"; fi
   done
 }
-_browser_start() {
-  [[ -f "${RENDER_HOME}/serve.js" ]] || _die "Not set up yet — run: aibox browser setup"
-  if ! _browser_running; then
-    _info "Starting the GPU browser server (sudo may ask for your password)..."
-    _render_sh 'rm -f server.log; nohup node serve.js > server.log 2>&1 &'
-    local i=0
-    until grep -q "ws://" "${RENDER_HOME}/server.log" 2>/dev/null; do
-      (( i++ >= 30 )) && _die "The server did not start — see ${RENDER_HOME}/server.log"
-      sleep 1
-    done
-  fi
-  local url ver
-  url="$(grep -o 'ws://[^ ]*' "${RENDER_HOME}/server.log" | tail -1)"
-  ver="$(cat "${RENDER_HOME}/.pw-version" 2>/dev/null)"
-  printf '%s\n%s\n' "${url/127.0.0.1/host.docker.internal}" "$ver" > "${CONFIG_DIR}/browser.url"
-  _browser_sync
-  _ok "GPU browser server running: ${url} (Playwright ${ver})."
-  _info "Sessions find it at ~/.aibox/proposals/.browser-url (CLAUDE.md explains the rest). Stop with: aibox browser stop"
-}
-_browser_stop() {
-  _browser_running && sudo pkill -u "$RENDER_USER" -f "node serve.js" || true
+_browser_cleanup() {
   rm -f "${CONFIG_DIR}/browser.url"; _browser_sync
-  _ok "GPU browser server stopped."
+  pgrep -u "$RENDER_USER" -f "node serve.js" >/dev/null 2>&1 && sudo pkill -u "$RENDER_USER" -f "node serve.js" 2>/dev/null || true
+}
+# Foreground, like `aibox sessions`: the server's output (and Chromium's,
+# via DEBUG) stays on screen, Ctrl-C ends it, and the advertised URL is
+# withdrawn from every container on exit.
+_browser_run() {
+  [[ -f "${RENDER_HOME}/serve.js" ]] || _die "Not set up yet — run: aibox browser setup"
+  pgrep -u "$RENDER_USER" -f "node serve.js" >/dev/null 2>&1 && _die "A GPU browser server is already running (another terminal?). Stop it there, or: sudo pkill -u ${RENDER_USER} -f 'node serve.js'"
+  local ver line
+  ver="$(cat "${RENDER_HOME}/.pw-version" 2>/dev/null)"
+  _on_exit _browser_cleanup
+  _info "Starting the GPU browser server as '${RENDER_USER}' (sudo may ask for your password). Ctrl-C stops it."
+  _render_sh 'DEBUG="pw:browser*" node serve.js 2>&1' | while IFS= read -r line; do
+    printf '%s\n' "$line"
+    if [[ "$line" == *"Listening on ws://"* ]]; then
+      printf '%s\n%s\n' "${line##*Listening on }" "$ver" | sed '1s/127\.0\.0\.1/host.docker.internal/' > "${CONFIG_DIR}/browser.url"
+      _browser_sync
+      _ok "Playwright ${ver}. Sessions see it at ~/.aibox/proposals/.browser-url; CLAUDE.md tells them how."
+    fi
+  done
 }
 cmd_browser() {
   [[ "$(uname)" == "Darwin" ]] || _die "aibox browser is macOS-only: it runs a GPU browser on the Mac for sessions. On Linux, run a Playwright server with your GPU yourself and give sessions its URL."
-  case "${1:-start}" in
+  case "${1:-}" in
+    "")    _browser_run ;;
     setup) _browser_setup ;;
-    start) _browser_start ;;
-    stop)  _browser_stop ;;
-    status) if _browser_running; then _ok "running: $(grep -o 'ws://[^ ]*' "${RENDER_HOME}/server.log" | tail -1)"; else _info "not running — start with: aibox browser"; fi ;;
-    *) _die "Usage: aibox browser [setup|start|stop|status]" ;;
+    *)     _die "Usage: aibox browser [setup]   (no argument runs the server in the foreground; Ctrl-C stops it)" ;;
   esac
 }
 
