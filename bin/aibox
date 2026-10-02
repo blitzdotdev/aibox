@@ -1654,11 +1654,18 @@ _browser_setup() {
   _render_sh 'cat > serve.js <<"EOF"
 // aibox GPU browser server: full Chromium in new-headless mode (Metal via
 // ANGLE), one browser shared by all connecting sessions, each in its own
-// context. Started by `aibox browser` on the Mac; stop with `aibox browser stop`.
+// context. Run by `aibox browser` on the Mac (foreground, Ctrl-C stops it).
+// If the browser exits (a crash, or a client that closes it instead of
+// disconnecting), it is relaunched on the same URL.
 const { chromium } = require("@playwright/test");
 const wsPath = "/" + require("crypto").randomBytes(8).toString("hex");
-chromium.launchServer({ channel: "chromium", headless: true, host: "127.0.0.1", port: '"$BROWSER_PORT"', wsPath })
-  .then(s => console.log("Listening on " + s.wsEndpoint()));
+const fatal = e => { console.error(e); process.exit(1); };
+async function serve() {
+  const s = await chromium.launchServer({ channel: "chromium", headless: true, host: "127.0.0.1", port: '"$BROWSER_PORT"', wsPath });
+  console.log("Listening on " + s.wsEndpoint());
+  s.on("close", () => { console.log(new Date().toISOString() + " browser exited - relaunching"); setTimeout(() => serve().catch(fatal), 1000); });
+}
+serve().catch(fatal);
 EOF
 cat > README.md <<"EOF"
 # render - GPU browser server for aibox sessions
