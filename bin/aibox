@@ -1683,10 +1683,16 @@ It must run in its own launchd domain (sudo launchctl asuser <uid> ...),
 which aibox does; a plain sudo -u render makes Chrome die at startup.
 By hand:  cd / && sudo launchctl asuser $(id -u render) sudo -u render -H env PATH=/var/render/node/bin:/usr/bin:/bin bash -c "cd ~ && node serve.js"
 Clients send the header Host: 127.0.0.1:3145 (anything else gets 403).
+Without a display session for this user, closing a page crashes Chromium
+(NSWindow close with no display); serve.js relaunches it on the same URL.
+For concurrent sessions, give it a display session once: set a password
+  PW=$(openssl rand -base64 18); sudo sysadminctl -resetPasswordFor render -newPassword "$PW"; sudo dscl . -create /Users/render IsHidden 0; echo "$PW"
+then log in as "aibox render" via Fast User Switching and switch back.
 Update Playwright:  aibox browser setup   (reinstalls to latest)
 Remove everything:  aibox browser stop; sudo sysadminctl -deleteUser render; sudo rm -rf /var/render
 EOF'
   _ok "'${RENDER_USER}' is ready (Playwright $(cat "${RENDER_HOME}/.pw-version" 2>/dev/null)). Start the server with: aibox browser"
+  _info "Optional, for several sessions rendering at once: give '${RENDER_USER}' a display session (see ${RENDER_HOME}/README.md)."
 }
 # Every project inbox gets (or loses) the .browser-url dotfile, which the
 # proposal lister ignores and the container reads at ~/.aibox/proposals/.
