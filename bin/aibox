@@ -792,16 +792,18 @@ cmd_onstart_check() {
 }
 
 # Wait (in-container, one exec) until the entrypoint's start-up work is
-# done — the marker appears even if its install attempt failed. The binary
-# test doubles as the exit path for containers from older images that never
-# write a marker. Up to 180s: the first install downloads the binary.
-# Exit status: claude binary present.
+# done — its per-boot marker appears even if the install attempt failed, so
+# every restart is covered, not only the first. A container from an image
+# too old to write the marker waits for the claude binary instead. Up to
+# 180s: the first install downloads the binary. Exit status: binary present.
 _wait_ready() {
   docker exec -u aibox "$CONTAINER" sh -c '
+    if grep -q aibox-ready /usr/local/bin/aibox-entrypoint 2>/dev/null; then ready() { [ -e /tmp/aibox-ready ]; }
+    else ready() { [ -x "$HOME/.local/bin/claude" ]; }; fi
     i=0
-    until [ -e /tmp/aibox-ready ] || [ -x "$HOME/.local/bin/claude" ]; do
+    until ready; do
       i=$((i+1)); [ "$i" -ge 180 ] && break
-      [ "$i" -eq 3 ] && echo "Waiting for first-time container setup (claude install)..." >&2
+      [ "$i" -eq 3 ] && echo "Waiting for container start-up (first time: claude install)..." >&2
       sleep 1
     done
     [ -x "$HOME/.local/bin/claude" ]'
@@ -1441,7 +1443,13 @@ function runEntry(name) {   // synchronous; spawned detached by tick
   const fd = fs.openSync(LOG, "a");
   fs.writeSync(fd, "\n" + now().toISOString() + " ▶ " + name + " in " + e.project + "\n");
   const t0 = Date.now();
-  const r = cp.spawnSync(AIBOX, ["shell", containerCmd(e)], { cwd: e.project, stdio: ["ignore", fd, fd] });
+  // Claude Code holds the Mac awake (caffeinate) only when it runs on the
+  // Mac itself; from a container it cannot, so an unattended job on battery
+  // would be frozen by idle sleep. Hold the assertion for the job's lifetime.
+  const argv = ["shell", containerCmd(e)];
+  const r = process.platform === "darwin"
+    ? cp.spawnSync("caffeinate", ["-i", AIBOX, ...argv], { cwd: e.project, stdio: ["ignore", fd, fd] })
+    : cp.spawnSync(AIBOX, argv, { cwd: e.project, stdio: ["ignore", fd, fd] });
   const secs = Math.round((Date.now() - t0) / 1000), code = r.status === null ? "signal " + r.signal : r.status;
   fs.writeSync(fd, now().toISOString() + " ■ " + name + " exit " + code + " (" + secs + "s)\n"); fs.closeSync(fd);
   setState(name, { pid: 0, status: code === 0 ? "ok" : "failed (" + code + ")", finished: now().getTime() });
