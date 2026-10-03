@@ -45,6 +45,21 @@ Claude starts `vite` on 5173 in project `myapp` → open `http://5173.myapp.aibo
 
 Works out of the box in Chrome, Edge, and Firefox (`*.localhost` resolves to loopback natively). Safari needs macOS 26+. CLI tools like `curl` need `--resolve` (the system resolver doesn't do `*.localhost`). If host port 80 is taken, the proxy falls back to 8080 and URLs get `:8080`; `proxy_port` in the config picks any other port.
 
+### GPU rendering
+
+Containers have no GPU, so headless Chromium inside renders WebGL in software. For real GPU renders (WebGL/WebGPU screenshots of a three.js scene, say), run a Playwright browser server **on the Mac** and let sessions connect to it:
+
+```bash
+aibox browser setup    # once: a hidden, unprivileged user with its own node + Playwright (asks for sudo)
+aibox browser          # runs the server in the foreground; prints the ws URL; Ctrl-C stops it
+```
+
+The browser runs as that user inside its own launchd domain, so it can read nothing of yours (setup also closes your home directory to other local users). While it runs, every container sees the URL and Playwright version in a read-only file, `~/.aibox/host/browser.url`, and the shared CLAUDE.md tells sessions how to use it: matching client version, a `Host` header, one shared Chromium with a context per session, pages served over HTTP (your dev servers reach it through the proxy URL). When you stop it the URL is withdrawn, and Claude asks you to start it again when a render needs the GPU. macOS only.
+
+One Chromium quirk: without a display session for that user, closing the *last* open page crashes the browser. The server keeps one page of its own open for its lifetime so that never happens, and relaunches the browser on the same URL if it exits anyway. If you still see "browser exited" on its terminal, give `render` a display session once (`/var/render/README.md` has the command that sets a password; log that user in via Fast User Switching and switch straight back).
+
+What a session gains access to through this, beyond what a container can already reach: a browser process on the Mac running as `render`, which can open `file://` for that user's own files and world-readable system files, and can browse anything the Mac can reach. It cannot touch your home, keychain, screen, or camera.
+
 ## Phone & browser sessions
 
 ```bash
@@ -103,6 +118,7 @@ Sessions merge file-by-file (nothing is ever overwritten or deleted; sources are
 | `aibox run [--copy] <prog> [args]` | Run any program in the sandbox (e.g. `aibox run codex`). `--copy` works the same as above; the program's own flags pass through |
 | `aibox serve` | Sessions UI in the container: start new phone/claude.ai-drivable sessions, resume past ones, stop live ones. `aibox serve stop` ends the UI and every live session of this project |
 | `aibox sessions` | All projects' sessions on one local page (host-side, loopback-only, foreground). Buttons per session: open in Ghostty/Terminal, copy the resume command, or send to your phone |
+| `aibox browser [setup]` | GPU-backed Playwright browser server on the Mac that sessions connect to; foreground, Ctrl-C stops it (see [GPU rendering](#gpu-rendering)). macOS only |
 | `aibox schedule [add\|rm\|approve\|reject\|on\|off\|log]` | Jobs that run inside project sandboxes on a schedule or on container start; no args lists them with next/last run and pending proposals. See [Scheduled jobs](#scheduled-jobs) |
 | `aibox shell [cmd]` | zsh in the container, or run a one-off command |
 | `aibox stop [--all]` | Stop this project's container (`--all`: everything incl. proxy). Loses nothing |
