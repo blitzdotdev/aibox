@@ -302,9 +302,10 @@ if [[ ! -L "$GB" ]]; then
 This container has no GPU: headless Chromium here renders WebGL/WebGPU in
 software (SwiftShader), slowly and with a large memory footprint. The user's
 Mac can run a Playwright browser server with the real GPU (`aibox browser`).
-While it runs, `~/.aibox/proposals/.browser-url` exists in this container:
-line 1 is the ws URL (reachable via host.docker.internal), line 2 the
-Playwright version.
+While it runs, `~/.aibox/host/browser.url` exists in this container (a
+read-only file from the Mac): line 1 is the ws URL (reachable via
+host.docker.internal), line 2 the Playwright version. If connecting fails,
+the server is gone: ask the user to run `aibox browser` again.
 
 Using it:
 - The client must be exactly that Playwright version. Do not change the
@@ -516,9 +517,10 @@ _docker_run() {
   # scheduler which project a proposal came from — the mount is the sender.
   mkdir -p "${CONFIG_DIR}/inbox/${HASH6}"
   printf %s "$PROJECT_DIR" > "${CONFIG_DIR}/inbox/${HASH6}.path"
-  # A running GPU browser server (aibox browser) is advertised to new
-  # containers the same way as to existing ones.
-  [[ -f "${CONFIG_DIR}/browser.url" ]] && cp "${CONFIG_DIR}/browser.url" "${CONFIG_DIR}/inbox/${HASH6}/.browser-url" || true
+  # Host-to-container notices (today: the GPU browser URL) live in one
+  # read-only mount shared by every container; nothing is copied into the
+  # writable inbox, so a container can neither forge nor redirect them.
+  mkdir -p "${CONFIG_DIR}/host"
   docker run -d --name "$CONTAINER" \
     --network "$NETWORK" \
     --hostname "${SLUG:0:63}" \
@@ -530,10 +532,11 @@ _docker_run() {
     --mount "type=volume,src=${VOLUME},dst=/home/aibox/.local/bin,volume-subpath=shared/local-bin" \
     --mount "type=volume,src=${VOLUME},dst=/home/aibox/.local/share/claude,volume-subpath=shared/claude-app" \
     -v "${CONFIG_DIR}/inbox/${HASH6}:/home/aibox/.aibox/proposals" \
+    -v "${CONFIG_DIR}/host:/home/aibox/.aibox/host:ro" \
     -w "$PROJECT_DIR" \
     -e CLAUDE_CONFIG_DIR=/home/aibox/.claude \
     -l "aibox.path=${PROJECT_DIR}" \
-    -l "aibox.layout=3" \
+    -l "aibox.layout=4" \
     "$@" "$IMAGE"
 }
 
@@ -760,6 +763,11 @@ _ensure_container() {
   done
   LOCKS+=("$lock"); _on_exit _unlock_all
 
+  # A GPU browser server that ended without its cleanup (reboot, kill -9)
+  # leaves its URL advertised; withdraw it so sessions ask for a new one.
+  [[ -f "${CONFIG_DIR}/host/browser.url" ]] && ! pgrep -u "$RENDER_USER" -f 'node serve.js' >/dev/null 2>&1 \
+    && rm -f "${CONFIG_DIR}/host/browser.url" || true
+
   local state cur_img cur_layout
   read -r state cur_img cur_layout < <(docker inspect "$CONTAINER" \
     --format '{{.State.Status}} {{.Config.Image}} {{index .Config.Labels "aibox.layout"}}' 2>/dev/null) || true
@@ -770,7 +778,7 @@ _ensure_container() {
   # it never got past Created (a failed docker run leaves the name wedged —
   # docker start can never succeed, and there are no processes to protect).
   # The home volume and project bind survive by construction.
-  if [[ "$state" != "absent" && -n "${cur_img:-}" && ( "$cur_img" != "$IMAGE" || "${cur_layout:-}" != "3" || "$state" == "created" ) ]]; then
+  if [[ "$state" != "absent" && -n "${cur_img:-}" && ( "$cur_img" != "$IMAGE" || "${cur_layout:-}" != "4" || "$state" == "created" ) ]]; then
     local active=0
     if [[ "$state" == "running" ]]; then
       active="$(docker top "$CONTAINER" -o pid,args 2>/dev/null | tail -n +2 | grep -vc 'sleep infinity' || true)"
@@ -1620,16 +1628,24 @@ _remind_proposals() {
 # browser` runs a Playwright browser server ON THE MAC as a hidden,
 # unprivileged user ("render": own node, own Playwright, own home) inside
 # that user's launchd domain (Chrome's Mach services need one). Sessions
-# read the ws URL from ~/.aibox/proposals/.browser-url and connect through
-# host.docker.internal; the browser sees that user's files, never yours.
+# read the ws URL from the read-only ~/.aibox/host/browser.url and connect
+# through host.docker.internal; the browser sees that user's files, never yours.
 RENDER_USER=render
 RENDER_HOME=/var/render
 BROWSER_PORT=3145
+# The render user's uid — only if the account is the one aibox made (home
+# is RENDER_HOME); an unrelated account of the same name is never used.
+_render_uid() {
+  local uid home
+  uid="$(id -u "$RENDER_USER" 2>/dev/null)" || _die "No '${RENDER_USER}' user yet — run: aibox browser setup"
+  home="$(dscl . -read "/Users/${RENDER_USER}" NFSHomeDirectory 2>/dev/null | awk '{print $2}')"
+  [[ "$home" == "$RENDER_HOME" ]] || _die "A '${RENDER_USER}' account exists but is not aibox's (home: ${home:-unknown}, expected ${RENDER_HOME}). Not touching it."
+  printf %s "$uid"
+}
 # Run a shell string as the render user, in its launchd domain, from its
 # home, with its own node first on PATH. sudo asks for your password.
 _render_sh() {
-  local uid
-  uid="$(id -u "$RENDER_USER" 2>/dev/null)" || _die "No '${RENDER_USER}' user yet — run: aibox browser setup"
+  local uid; uid="$(_render_uid)"
   sudo launchctl asuser "$uid" sudo -u "$RENDER_USER" -H env "PATH=${RENDER_HOME}/node/bin:/usr/bin:/bin" bash -c "cd ~ && $1"
 }
 _browser_setup() {
@@ -1639,6 +1655,7 @@ _browser_setup() {
       || _die "sysadminctl could not create the user."
     sudo dscl . -create "/Users/${RENDER_USER}" IsHidden 1
   fi
+  _render_uid >/dev/null
   sudo mkdir -p "$RENDER_HOME" && sudo chown "${RENDER_USER}:staff" "$RENDER_HOME" && sudo chmod 750 "$RENDER_HOME"
   # Your home is group-readable by default and render is in staff: close it,
   # or the browser could read ~/Projects through file:// URLs.
@@ -1650,7 +1667,9 @@ _browser_setup() {
   case "$(uname -m)" in arm64) arch=darwin-arm64 ;; *) arch=darwin-x64 ;; esac
   _info "Installing node and Playwright for '${RENDER_USER}' (a few minutes, one time)..."
   _render_sh '[ -x node/bin/node ] || { f=$(curl -fsSL https://nodejs.org/dist/latest-v22.x/SHASUMS256.txt | grep -o "node-v22[^ ]*'"$arch"'.tar.gz" | head -1) && curl -fsSL "https://nodejs.org/dist/latest-v22.x/$f" | tar xz && rm -rf node && mv "${f%.tar.gz}" node; }'
-  _render_sh '[ -d node_modules/@playwright/test ] || { npm init -y >/dev/null && npm i @playwright/test@latest >/dev/null; }; npx playwright install chromium >/dev/null && node -e "console.log(require(\"@playwright/test/package.json\").version)" > .pw-version'
+  # Rerunning setup is the update path: always resolve @latest, then fetch
+  # the Chromium build that version wants.
+  _render_sh '[ -f package.json ] || npm init -y >/dev/null; npm i @playwright/test@latest >/dev/null && npx playwright install chromium >/dev/null && node -e "console.log(require(\"@playwright/test/package.json\").version)" > .pw-version'
   _render_sh 'cat > serve.js <<"EOF"
 // aibox GPU browser server: full Chromium in new-headless mode (Metal via
 // ANGLE), one browser shared by all connecting sessions, each in its own
@@ -1692,22 +1711,17 @@ For concurrent sessions, give it a display session once: set a password
   PW=$(openssl rand -base64 18); sudo sysadminctl -resetPasswordFor render -newPassword "$PW"; sudo dscl . -create /Users/render IsHidden 0; echo "$PW"
 then log in as "aibox render" via Fast User Switching and switch back.
 Update Playwright:  aibox browser setup   (reinstalls to latest)
-Remove everything:  aibox browser stop; sudo sysadminctl -deleteUser render; sudo rm -rf /var/render
+Remove everything:  stop the server (Ctrl-C), then
+  sudo sysadminctl -deleteUser render; sudo rm -rf /var/render
 EOF'
   _ok "'${RENDER_USER}' is ready (Playwright $(cat "${RENDER_HOME}/.pw-version" 2>/dev/null)). Start the server with: aibox browser"
   _info "Optional, for several sessions rendering at once: give '${RENDER_USER}' a display session (see ${RENDER_HOME}/README.md)."
 }
-# Every project inbox gets (or loses) the .browser-url dotfile, which the
-# proposal lister ignores and the container reads at ~/.aibox/proposals/.
-_browser_sync() {
-  local d
-  for d in "${CONFIG_DIR}"/inbox/*/; do
-    [[ -d "$d" ]] || continue
-    if [[ -f "${CONFIG_DIR}/browser.url" ]]; then cp "${CONFIG_DIR}/browser.url" "${d}.browser-url"; else rm -f "${d}.browser-url"; fi
-  done
-}
+# Runs only for the invocation whose server came up (BROWSER_UP): a second
+# `aibox browser` that lost the port race must not kill the first one.
 _browser_cleanup() {
-  rm -f "${CONFIG_DIR}/browser.url"; _browser_sync
+  [[ -n "${BROWSER_UP:-}" ]] || return 0
+  rm -f "${CONFIG_DIR}/host/browser.url"
   # Everything of render's: the node server and the Chromium it launched
   # (the user exists for nothing else).
   pgrep -u "$RENDER_USER" >/dev/null 2>&1 && sudo pkill -u "$RENDER_USER" 2>/dev/null || true
@@ -1723,16 +1737,19 @@ _browser_run() {
   [[ "$(stat -f %Lp "$HOME")" == "700" ]] || _die "${HOME} is not mode 700, so the '${RENDER_USER}' browser could read it. Fix with: chmod 700 ~"
   local ver line
   ver="$(cat "${RENDER_HOME}/.pw-version" 2>/dev/null)"
+  mkdir -p "${CONFIG_DIR}/host"
   _on_exit _browser_cleanup
   _info "Starting the GPU browser server as '${RENDER_USER}' (sudo may ask for your password). Ctrl-C stops it."
+  shopt -s lastpipe   # the loop runs in this shell, so BROWSER_UP reaches the exit hook
   _render_sh 'DEBUG="pw:browser*" node serve.js 2>&1' | while IFS= read -r line; do
     printf '%s\n' "$line"
     if [[ "$line" == *"Listening on ws://"* ]]; then
-      printf '%s\n%s\n' "${line##*Listening on }" "$ver" | sed '1s/127\.0\.0\.1/host.docker.internal/' > "${CONFIG_DIR}/browser.url"
-      _browser_sync
-      _ok "Playwright ${ver}. Sessions see it at ~/.aibox/proposals/.browser-url; CLAUDE.md tells them how."
+      BROWSER_UP=1
+      printf '%s\n%s\n' "${line##*Listening on }" "$ver" | sed '1s/127\.0\.0\.1/host.docker.internal/' > "${CONFIG_DIR}/host/browser.url"
+      _ok "Playwright ${ver}. Every container sees it at ~/.aibox/host/browser.url; CLAUDE.md tells sessions how."
     fi
   done
+  shopt -u lastpipe
 }
 cmd_browser() {
   [[ "$(uname)" == "Darwin" ]] || _die "aibox browser is macOS-only: it runs a GPU browser on the Mac for sessions. On Linux, run a Playwright server with your GPU yourself and give sessions its URL."
