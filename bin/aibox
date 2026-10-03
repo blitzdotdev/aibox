@@ -763,8 +763,15 @@ _ensure_container() {
 # every aibox run and by the scheduler tick (onstart-check).
 _run_on_start() {
   [[ -f "${CONFIG_DIR}/schedule.json" ]] || return 0
+  # Only once the entrypoint has finished (claude installed, ownership
+  # fixed): a job launched before that would fail and never be retried,
+  # because the marker would already be set. Not ready within 3 min →
+  # leave the marker alone so the next check tries again.
   local first
-  first="$(docker exec -u aibox "$CONTAINER" sh -c '[ -e /tmp/aibox-onstart-done ] || { touch /tmp/aibox-onstart-done && echo RUN; }' 2>/dev/null || true)"
+  first="$(docker exec -u aibox "$CONTAINER" sh -c '
+    i=0
+    until [ -e /tmp/aibox-ready ]; do i=$((i+1)); [ "$i" -ge 180 ] && exit 0; sleep 1; done
+    [ -e /tmp/aibox-onstart-done ] || { touch /tmp/aibox-onstart-done && echo RUN; }' 2>/dev/null || true)"
   [[ "$first" == "RUN" ]] || return 0
   _write_schedule_js
   local c
@@ -784,20 +791,26 @@ cmd_onstart_check() {
   _run_on_start
 }
 
-_ensure_claude_bin() {
-  # Wait (in-container, one exec) until the entrypoint's start-up work is
-  # done — the marker appears even if its install attempt failed. The
-  # binary test doubles as the exit path for containers from older images
-  # that never write a marker. Up to 180s: the first install downloads the
-  # binary.
+# Wait (in-container, one exec) until the entrypoint's start-up work is
+# done — its per-boot marker appears even if the install attempt failed, so
+# every restart is covered, not only the first. A container from an image
+# too old to write the marker waits for the claude binary instead. Up to
+# 180s: the first install downloads the binary. Exit status: binary present.
+_wait_ready() {
   docker exec -u aibox "$CONTAINER" sh -c '
+    if grep -q aibox-ready /usr/local/bin/aibox-entrypoint 2>/dev/null; then ready() { [ -e /tmp/aibox-ready ]; }
+    else ready() { [ -x "$HOME/.local/bin/claude" ]; }; fi
     i=0
-    until [ -e /tmp/aibox-ready ] || [ -x "$HOME/.local/bin/claude" ]; do
+    until ready; do
       i=$((i+1)); [ "$i" -ge 180 ] && break
-      [ "$i" -eq 3 ] && echo "Waiting for first-time container setup (claude install)..." >&2
+      [ "$i" -eq 3 ] && echo "Waiting for container start-up (first time: claude install)..." >&2
       sleep 1
     done
-    [ -x "$HOME/.local/bin/claude" ]' && return 0
+    [ -x "$HOME/.local/bin/claude" ]'
+}
+
+_ensure_claude_bin() {
+  _wait_ready && return 0
   _info "Installing Claude Code into the shared home volume (one-time)..."
   docker exec -u aibox "$CONTAINER" bash -c 'curl -fsSL https://claude.ai/install.sh | bash' || true
   docker exec -u aibox "$CONTAINER" test -x /home/aibox/.local/bin/claude 2>/dev/null \
@@ -913,6 +926,9 @@ cmd_run() {
 
 cmd_shell() {
   _ensure_all
+  # A one-off command (scheduled jobs use this path) must not race the
+  # entrypoint's first-time claude install; a shell can wait a moment too.
+  [[ $# -eq 0 ]] || _wait_ready >/dev/null 2>&1 || true
   if [[ $# -eq 0 ]]; then
     _dexec zsh
   elif [[ $# -eq 1 ]]; then
@@ -1263,8 +1279,12 @@ function lastDue(w, t) {
 }
 function nextDue(w, t) {
   if (w.kind === "every") {
+    // Slots restart at local midnight (lastDue counts from it), so an
+    // interval that doesn't divide 24h (every 7h at 22:00) is next due at
+    // 00:00, not at the rolled-over 04:00.
     const d = new Date(t), slot = (Math.floor((t.getHours() * 60 + t.getMinutes()) / w.minutes) + 1) * w.minutes;
-    d.setHours(0, slot, 0, 0); return d;
+    if (slot >= 1440) { d.setDate(d.getDate() + 1); d.setHours(0, 0, 0, 0); } else d.setHours(0, slot, 0, 0);
+    return d;
   }
   if (w.kind !== "daily" && w.kind !== "weekdays") return null;
   for (let fwd = 0; fwd < 8; fwd++) {
@@ -1423,7 +1443,13 @@ function runEntry(name) {   // synchronous; spawned detached by tick
   const fd = fs.openSync(LOG, "a");
   fs.writeSync(fd, "\n" + now().toISOString() + " ▶ " + name + " in " + e.project + "\n");
   const t0 = Date.now();
-  const r = cp.spawnSync(AIBOX, ["shell", containerCmd(e)], { cwd: e.project, stdio: ["ignore", fd, fd] });
+  // Claude Code holds the Mac awake (caffeinate) only when it runs on the
+  // Mac itself; from a container it cannot, so an unattended job on battery
+  // would be frozen by idle sleep. Hold the assertion for the job's lifetime.
+  const argv = ["shell", containerCmd(e)];
+  const r = process.platform === "darwin"
+    ? cp.spawnSync("caffeinate", ["-i", AIBOX, ...argv], { cwd: e.project, stdio: ["ignore", fd, fd] })
+    : cp.spawnSync(AIBOX, argv, { cwd: e.project, stdio: ["ignore", fd, fd] });
   const secs = Math.round((Date.now() - t0) / 1000), code = r.status === null ? "signal " + r.signal : r.status;
   fs.writeSync(fd, now().toISOString() + " ■ " + name + " exit " + code + " (" + secs + "s)\n"); fs.closeSync(fd);
   setState(name, { pid: 0, status: code === 0 ? "ok" : "failed (" + code + ")", finished: now().getTime() });
