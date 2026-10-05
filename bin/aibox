@@ -211,7 +211,9 @@ _ensure_docker() {
 }
 
 # ── Image ────────────────────────────────────────────────────────
-_build_image() {
+# Writes the image sources (Dockerfile incl. Dockerfile.extra, entrypoint)
+# into CONFIG_DIR; _ensure_image hashes them to know when to rebuild.
+_write_image_src() {
   # Unquoted heredoc so ${NODE_VERSION} interpolates — hence the \\ and
   # \$PATH escapes. Don't quote the delimiter.
   cat > "${CONFIG_DIR}/Dockerfile" <<DOCKERFILE
@@ -267,6 +269,20 @@ if(fs.existsSync(p)){try{s=JSON.parse(fs.readFileSync(p,"utf8"))}catch(e){proces
 if(s.cleanupPeriodDays==null){s.cleanupPeriodDays=3650;fs.writeFileSync(p,JSON.stringify(s,null,2));}
 ' 2>/dev/null || true
 chown -h aibox:aibox /home/aibox/.claude/settings.json 2>/dev/null || true
+# Sleep: Claude Code's own idle-sleep inhibitor (caffeinate) runs only when
+# Claude runs on the Mac, so from here it cannot keep the Mac awake. These
+# hooks mark every prompt and tool call in the project's inbox instead, and
+# `aibox` on the Mac holds the assertion while the mark is fresh (see
+# _awake_watch). Managed settings: the user's own settings.json stays theirs.
+mkdir -p /etc/claude-code
+cat > /etc/claude-code/managed-settings.json <<'JSON'
+{
+  "hooks": {
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "touch \"$HOME/.aibox/proposals/.active\"" }] }],
+    "PostToolUse": [{ "hooks": [{ "type": "command", "command": "touch \"$HOME/.aibox/proposals/.active\"" }] }]
+  }
+}
+JSON
 # Teach every session how to find and revive this project's past sessions.
 CM=/home/aibox/.claude/CLAUDE.md
 if [[ ! -L "$CM" ]] && ! grep -q 'aibox:sessions' "$CM" 2>/dev/null; then
@@ -299,13 +315,22 @@ fi
 touch /tmp/aibox-ready
 exec "$@"
 ENTRYPOINT
-  _info "Building ${IMAGE} (one-time; rebuilt only when aibox is updated or node_version changes)..."
-  docker build --pull -t "$IMAGE" "$CONFIG_DIR"
+}
+_image_src_hash() { cat "${CONFIG_DIR}/Dockerfile" "${CONFIG_DIR}/entrypoint.sh" | { sha256sum || shasum -a 256; } 2>/dev/null | cut -c1-12; }
+_build_image() {
+  _write_image_src
+  _info "Building ${IMAGE} (one-time; rebuilt when aibox, node_version or Dockerfile.extra change)..."
+  docker build --pull --label "aibox.src=$(_image_src_hash)" -t "$IMAGE" "$CONFIG_DIR"
   _ok "Image built."
 }
 
+# The tag carries the aibox version, which a git checkout keeps as "dev", so
+# the baked-in sources are compared too: a pulled entrypoint change (or an
+# edited Dockerfile.extra) rebuilds, and containers follow (_ensure_container).
 _ensure_image() {
-  docker image inspect "$IMAGE" >/dev/null 2>&1 || _build_image
+  _write_image_src
+  [[ "$(docker image inspect "$IMAGE" --format '{{index .Config.Labels "aibox.src"}}' 2>/dev/null)" == "$(_image_src_hash)" ]] \
+    || _build_image
 }
 
 # ── Dev-server proxy (Caddy) ─────────────────────────────────────
@@ -708,17 +733,19 @@ _ensure_container() {
   done
   LOCKS+=("$lock"); _on_exit _unlock_all
 
-  local state cur_img cur_layout
+  local state cur_img cur_layout img_id
   read -r state cur_img cur_layout < <(docker inspect "$CONTAINER" \
-    --format '{{.State.Status}} {{.Config.Image}} {{index .Config.Labels "aibox.layout"}}' 2>/dev/null) || true
+    --format '{{.State.Status}} {{.Image}} {{index .Config.Labels "aibox.layout"}}' 2>/dev/null) || true
   state="${state:-absent}"
+  img_id="$(docker image inspect "$IMAGE" --format '{{.Id}}' 2>/dev/null || true)"
 
-  # Recreate when the image changed (new aibox version or node_version), the
-  # container predates the current volume layout (its mounts are stale), or
-  # it never got past Created (a failed docker run leaves the name wedged —
-  # docker start can never succeed, and there are no processes to protect).
-  # The home volume and project bind survive by construction.
-  if [[ "$state" != "absent" && -n "${cur_img:-}" && ( "$cur_img" != "$IMAGE" || "${cur_layout:-}" != "3" || "$state" == "created" ) ]]; then
+  # Recreate when the image changed (by id, so a rebuild under the same tag
+  # counts: new aibox version, node_version, entrypoint), the container
+  # predates the current volume layout (its mounts are stale), or it never
+  # got past Created (a failed docker run leaves the name wedged — docker
+  # start can never succeed, and there are no processes to protect). The
+  # home volume and project bind survive by construction.
+  if [[ "$state" != "absent" && -n "${cur_img:-}" && -n "$img_id" && ( "$cur_img" != "$img_id" || "${cur_layout:-}" != "3" || "$state" == "created" ) ]]; then
     local active=0
     if [[ "$state" == "running" ]]; then
       active="$(docker top "$CONTAINER" -o pid,args 2>/dev/null | tail -n +2 | grep -vc 'sleep infinity' || true)"
@@ -844,8 +871,27 @@ _dexec() {
   for var in $(compgen -A export | grep '^ANTHROPIC_' || true); do
     env_args+=(-e "${var}=${!var}")
   done
+  [[ "${tty_args[*]}" == "-it" ]] && _awake_watch
   docker exec "${tty_args[@]}" -u aibox -w "$PROJECT_DIR" "${env_args[@]}" "$CONTAINER" "$@"
 }
+
+# Keep the Mac awake while the agent in this project works. Claude Code's
+# own caffeinate runs only when Claude runs on the Mac; in the container its
+# hooks (managed settings, written by the entrypoint) touch .active in this
+# project's inbox on every prompt and tool call, and this watcher holds an
+# idle-sleep assertion while that mark is under 3 minutes old — the policy
+# Claude applies natively. Idle at the prompt, the Mac sleeps as usual;
+# closing the lid sleeps regardless. One watcher per interactive session.
+_awake_watch() {
+  [[ "$(uname)" == "Darwin" ]] && command -v caffeinate >/dev/null 2>&1 || return 0
+  local mark="${CONFIG_DIR}/inbox/${HASH6}/.active"
+  ( while kill -0 "$$" 2>/dev/null; do
+      if [[ -n "$(find "$mark" -maxdepth 0 -mmin -3 2>/dev/null)" ]]; then caffeinate -i -t 120 || true; else sleep 30; fi
+    done ) >/dev/null 2>&1 &
+  AWAKE_PID=$!
+  _on_exit _awake_stop
+}
+_awake_stop() { [[ -n "${AWAKE_PID:-}" ]] && kill "$AWAKE_PID" 2>/dev/null || true; }
 
 # ── Disposable copy container (--copy) ───────────────────────────
 # A fresh container per run on a snapshot of the project — no bind mount, so
@@ -2212,6 +2258,10 @@ cmd_update() {
     _info "Updating via Homebrew..."
     brew update || _die "brew update failed."
     brew upgrade aibox || _die "brew upgrade aibox failed."
+  elif git -C "$(dirname "$script_path")" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    local dir; dir="$(git -C "$(dirname "$script_path")" rev-parse --show-toplevel)"
+    _info "Updating the git checkout at ${dir} (branch $(git -C "$dir" rev-parse --abbrev-ref HEAD))..."
+    git -C "$dir" pull --ff-only || _die "git pull failed — local changes, or the branch has no upstream."
   elif command -v npm >/dev/null 2>&1 && npm list -g aibox-cli >/dev/null 2>&1; then
     _info "Updating via npm..."
     # install@latest, not `npm update`: update won't cross major versions.

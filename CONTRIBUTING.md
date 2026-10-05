@@ -16,7 +16,7 @@ To test locally, symlink into your PATH:
 ln -sf "$(pwd)/bin/aibox" /usr/local/bin/aibox
 ```
 
-Dev-mode note: a checkout runs as version `dev`, so the image tag doesn't change between your edits — after modifying the embedded Dockerfile or entrypoint, force a rebuild with `docker rmi aibox:dev-node<version>` (releases bump the tag, so users get rebuilds automatically).
+Dev-mode note: a checkout runs as version `dev`, so the image tag doesn't change between your edits. The image carries a hash of its sources (`aibox.src` label: the embedded Dockerfile, `Dockerfile.extra`, the entrypoint), and `aibox` rebuilds when it differs and recreates containers (by image id) once they are idle — so editing or pulling the entrypoint takes effect on the next run without `docker rmi`. `aibox update` in a checkout runs `git pull --ff-only` on the current branch.
 
 ## Publishing
 
