@@ -1633,6 +1633,7 @@ _remind_proposals() {
 # through host.docker.internal; the browser sees that user's files, never yours.
 RENDER_USER=render
 RENDER_HOME=/var/render
+RENDER_GROUP=aibox-render
 BROWSER_PORT=3145
 # The render user's uid — only if the account is the one aibox made (home
 # is RENDER_HOME); an unrelated account of the same name is never used.
@@ -1642,6 +1643,26 @@ _render_uid() {
   home="$(dscl . -read "/Users/${RENDER_USER}" NFSHomeDirectory 2>/dev/null | awk '{print $2}')"
   [[ "$home" == "$RENDER_HOME" ]] || _die "A '${RENDER_USER}' account exists but is not aibox's (home: ${home:-unknown}, expected ${RENDER_HOME}). Not touching it."
   printf %s "$uid"
+}
+# render's primary group is its own, not staff: on macOS staff membership
+# comes from the primary group, and as a staff member the browser could read
+# every account's staff-readable home through file://. Run on every start
+# (cheap without changes; sudo only to fix an older install).
+_render_isolate() {
+  local gid
+  if ! dscl . -read "/Groups/${RENDER_GROUP}" >/dev/null 2>&1; then
+    _info "Giving '${RENDER_USER}' its own group '${RENDER_GROUP}' (sudo may ask for your password)..."
+    sudo dseditgroup -o create -r "aibox render" "$RENDER_GROUP" || _die "Could not create the group ${RENDER_GROUP}."
+  fi
+  gid="$(dscl . -read "/Groups/${RENDER_GROUP}" PrimaryGroupID 2>/dev/null | awk '{print $2}')"
+  [[ -n "$gid" ]] || _die "Could not read the group id of ${RENDER_GROUP}."
+  [[ "$(id -g "$RENDER_USER")" == "$gid" ]] || sudo dscl . -create "/Users/${RENDER_USER}" PrimaryGroupID "$gid"
+  if dsmemberutil checkmembership -U "$RENDER_USER" -G staff 2>/dev/null | grep -q 'is a member'; then
+    sudo dseditgroup -o edit -d "$RENDER_USER" -t user staff >/dev/null 2>&1 || true
+    dsmemberutil checkmembership -U "$RENDER_USER" -G staff 2>/dev/null | grep -q 'is a member' \
+      && _die "'${RENDER_USER}' is still in the staff group, so its browser could read other accounts' homes. Remove it with: sudo dseditgroup -o edit -d ${RENDER_USER} -t user staff"
+  fi
+  return 0
 }
 # Run a shell string as the render user, in its launchd domain, from its
 # home, with its own node first on PATH. sudo asks for your password.
@@ -1660,9 +1681,12 @@ _browser_setup() {
     sudo dscl . -create "/Users/${RENDER_USER}" IsHidden 1
   fi
   _render_uid >/dev/null
+  _render_isolate
+  # Group staff on the directory (not on the user): you can read
+  # .pw-version and serve.js, render can't read your staff-readable files.
   sudo mkdir -p "$RENDER_HOME" && sudo chown "${RENDER_USER}:staff" "$RENDER_HOME" && sudo chmod 750 "$RENDER_HOME"
-  # Your home is group-readable by default and render is in staff: close it,
-  # or the browser could read ~/Projects through file:// URLs.
+  # render isn't in staff, but a home that is world-readable (755) is still
+  # open to it: close it, or the browser could read ~/Projects via file://.
   if [[ "$(stat -f %Lp "$HOME")" != "700" ]]; then
     _info "Closing ${HOME} to other local users (chmod 700)."
     chmod 700 "$HOME"
@@ -1701,7 +1725,9 @@ the Mac so sandboxed aibox sessions (Docker in Colima) can render WebGL/WebGPU
 with the real GPU instead of SwiftShader.
 Why a separate user: a Playwright browser can open file:// and read whatever
 its account can read. As render it sees /var/render and system files, never
-the home of the person running aibox (which setup makes chmod 700).
+the home of the person running aibox (which setup makes chmod 700). Its
+primary group is aibox-render, not staff, so staff-readable homes of other
+accounts are closed to it as well.
 Everything here is private to this account: node/ (official tarball),
 node_modules/ (Playwright), serve.js (the server), server.log, .pw-version.
 Run:  aibox browser   (foreground, output on screen, Ctrl-C stops it)
@@ -1730,9 +1756,13 @@ EOF'
 _browser_cleanup() {
   [[ -n "${BROWSER_UP:-}" ]] || return 0
   rm -f "${CONFIG_DIR}/host/browser.url"
-  # Everything of render's: the node server and the Chromium it launched
-  # (the user exists for nothing else).
-  pgrep -u "$RENDER_USER" >/dev/null 2>&1 && sudo pkill -u "$RENDER_USER" 2>/dev/null || true
+  # The node server and the Chromium it launched, nothing else of render's:
+  # with a display session (README), Dock and Finder run as render too.
+  if pgrep -u "$RENDER_USER" -f "node serve.js|ms-playwright/chromium" >/dev/null 2>&1; then
+    sudo pkill -u "$RENDER_USER" -f "node serve.js" 2>/dev/null || true
+    sudo pkill -u "$RENDER_USER" -f "ms-playwright/chromium" 2>/dev/null || true
+  fi
+  return 0
 }
 # Foreground, like `aibox sessions`: the server's output (and Chromium's,
 # via DEBUG) stays on screen, Ctrl-C ends it, and the advertised URL is
@@ -1744,12 +1774,19 @@ _browser_run() {
     _info "First run: setting up the '${RENDER_USER}' user, node and Playwright (later updates: aibox browser setup)."
     _browser_setup auto
   fi
+  _render_uid >/dev/null
+  _render_isolate
   pgrep -u "$RENDER_USER" -f "node serve.js" >/dev/null 2>&1 && _die "A GPU browser server is already running (another terminal?). Stop it there, or: sudo pkill -u ${RENDER_USER} -f 'node serve.js'"
   # The one thing standing between that browser's file:// and your files is
   # your home's mode; check it on every run, not only at setup.
   [[ "$(stat -f %Lp "$HOME")" == "700" ]] || _die "${HOME} is not mode 700, so the '${RENDER_USER}' browser could read it. Fix with: chmod 700 ~"
-  local ver line
+  local ver line rc status
   ver="$(cat "${RENDER_HOME}/.pw-version" 2>/dev/null)"
+  # The server's exit status, written by the process substitution (bash 3.2
+  # can't wait on one, and its status is otherwise lost).
+  status="$(mktemp "${TMPDIR:-/tmp}/aibox-browser.XXXXXX")"
+  BROWSER_STATUS="$status"
+  _on_exit _browser_status_cleanup
   mkdir -p "${CONFIG_DIR}/host"
   _on_exit _browser_cleanup
   _info "Starting the GPU browser server as '${RENDER_USER}' (sudo may ask for your password). Ctrl-C stops it."
@@ -1762,8 +1799,14 @@ _browser_run() {
       printf '%s\n%s\n' "${line##*Listening on }" "$ver" | sed '1s/127\.0\.0\.1/host.docker.internal/' > "${CONFIG_DIR}/host/browser.url"
       _ok "Playwright ${ver}. Every container sees it at ~/.aibox/host/browser.url; CLAUDE.md tells sessions how."
     fi
-  done < <(_render_sh 'DEBUG="pw:browser*" node serve.js 2>&1')
+  done < <(rc=0; _render_sh 'DEBUG="pw:browser*" node serve.js 2>&1' || rc=$?; echo "$rc" > "$status")
+  # EOF can arrive a moment before the status is written.
+  for _ in 1 2 3 4 5 6 7 8 9 10; do [[ -s "$status" ]] && break; sleep 0.2; done
+  rc="$(cat "$status" 2>/dev/null)"
+  [[ -n "${BROWSER_UP:-}" ]] || _die "The browser server stopped before it was listening (exit status ${rc:-unknown}); its output is above. If port ${BROWSER_PORT} is taken, see by what: lsof -iTCP:${BROWSER_PORT} -sTCP:LISTEN"
+  [[ "${rc:-0}" == 0 ]] || _die "The browser server stopped (exit status ${rc}); its output is above."
 }
+_browser_status_cleanup() { [[ -n "${BROWSER_STATUS:-}" ]] && rm -f "$BROWSER_STATUS"; return 0; }
 cmd_browser() {
   [[ "$(uname)" == "Darwin" ]] || _die "aibox browser is macOS-only: it runs a GPU browser on the Mac for sessions. On Linux, run a Playwright server with your GPU yourself and give sessions its URL."
   case "${1:-}" in
