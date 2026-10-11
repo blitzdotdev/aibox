@@ -2097,10 +2097,10 @@ _do_backup() {
   name="${prefix}-${VERSION_TAG}-$(date -u +%Y%m%d-%H%M%S).tar.gz" || return 1
   # Progress goes to stderr: stdout is the path the caller captures. The tar
   # is silent and takes minutes on a big volume, so say so up front and, on
-  # a terminal, tick the growing file size and elapsed time.
-  local size
-  size="$(docker run --rm -v "${VOLUME}:/v:ro" "$HELPER_IMAGE" du -sh /v 2>/dev/null | cut -f1)"
-  _info "Backing up ${VOLUME} (${size:-?}) → ${dir}/${name}" >&2
+  # a terminal, tick the growing file size and elapsed time. No size scan
+  # first: a du of a big volume is itself a silent full walk (`aibox status`
+  # shows the size).
+  _info "Backing up ${VOLUME} → ${dir}/${name}" >&2
   _info "Compressing — this can take a few minutes (Ctrl-C cancels cleanly)." >&2
   local tick="" start=$SECONDS rc=0
   trap '[[ -n "$tick" ]] && kill "$tick" 2>/dev/null; rm -f "${dir}/${name}"; printf "\n" >&2; exit 130' INT TERM
