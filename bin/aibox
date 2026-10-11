@@ -2095,9 +2095,31 @@ _do_backup() {
   mkdir -p "$dir" || return 1
   dir="$(cd "$dir" && pwd)" || return 1
   name="${prefix}-${VERSION_TAG}-$(date -u +%Y%m%d-%H%M%S).tar.gz" || return 1
+  # Progress goes to stderr: stdout is the path the caller captures. The tar
+  # is silent and takes minutes on a big volume, so say so up front and, on
+  # a terminal, tick the growing file size and elapsed time. No size scan
+  # first: a du of a big volume is itself a silent full walk (`aibox status`
+  # shows the size).
+  _info "Backing up ${VOLUME} → ${dir}/${name}" >&2
+  _info "Compressing — this can take a few minutes (Ctrl-C cancels cleanly)." >&2
+  local tick="" start=$SECONDS rc=0
+  trap '[[ -n "$tick" ]] && kill "$tick" 2>/dev/null; rm -f "${dir}/${name}"; printf "\n" >&2; exit 130' INT TERM
+  if [[ -t 2 ]]; then
+    ( while sleep 2; do
+        printf '\r  %s written · %dm%02ds ' \
+          "$(ls -lh "${dir}/${name}" 2>/dev/null | awk '{print $5}')" \
+          $(( (SECONDS - start) / 60 )) $(( (SECONDS - start) % 60 ))
+      done ) >&2 &
+    tick=$!
+  fi
   docker run --rm -v "${VOLUME}:/home/aibox:ro" -v "${dir}:/backup" "$HELPER_IMAGE" \
-    tar czf "/backup/${name}" -C /home/aibox . >/dev/null || return 1
-  [[ -s "${dir}/${name}" ]] || return 1
+    tar czf "/backup/${name}" -C /home/aibox . >/dev/null || rc=1
+  if [[ -n "$tick" ]]; then
+    kill "$tick" 2>/dev/null; wait "$tick" 2>/dev/null
+    printf '\r\033[K' >&2
+  fi
+  trap - INT TERM
+  [[ $rc -eq 0 && -s "${dir}/${name}" ]] || { rm -f "${dir}/${name}"; return 1; }
   echo "${dir}/${name}"
 }
 
