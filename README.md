@@ -60,27 +60,6 @@ One Chromium quirk: without a display session for that user, closing the *last* 
 
 What a session gains access to through this, beyond what a container can already reach: a browser process on the Mac running as `render`, which can open `file://` for that user's own files and world-readable system files, and can browse anything the Mac can reach. It cannot touch your home, keychain, screen, or camera.
 
-#### Sharing it with agents elsewhere
-
-```bash
-aibox browser --share              # same server, plus a link for agents outside this Mac
-aibox browser answer <id> always   # answer a request from the terminal instead of the dialog
-```
-
-`--share` also prints an [agent-socket](https://github.com/blitzdotdev/agent-socket) link (and copies it to the clipboard). Paste it into a cloud Claude session, or any chat that can make HTTPS calls, and that agent can render on your Mac's GPU. The link reads as its own instructions. The agent uploads its page and assets (served to the browser at `https://app.aibox/`), opens it, runs JS in it and gets screenshots back. Ctrl-C ends the link.
-
-The shared browser is a separate Chromium from the one your containers use, and the boundary is fixed in aibox:
-
-- Every request goes through a proxy that refuses hosts you haven't allowed, IP literals, ports other than 80/443, and any name that resolves to a private, loopback or link-local address, checked on the address it then connects to. Your dev servers, the aibox proxy, your router and anything else on your network are out of reach.
-- The agent's code runs only inside pages, in Chromium's sandbox, as `render`.
-
-Inside that boundary, what changes needs no new aibox version:
-
-- **Hosts.** If a page needs a CDN or an API, the agent calls `/request` with the hosts and a one-line reason. A dialog on the Mac asks Deny / Allow this session / Always allow, and the agent continues as soon as you click. "Always" goes to `~/.aibox/share/allow`, one host per line (`*.example.com` works), which you can also edit by hand.
-- **Tools.** The agent can turn a page script into its own tool on the same link with `/define`, and needs no approval for it. Asking to keep it shows a dialog, and kept tools live in `~/.aibox/share/tools/` and load on every `--share`.
-
-Without a GUI (over ssh), the request shows in the server's terminal with the `aibox browser answer` command to run. The relay is `https://agentsocket.dev` unless `share_relay` in the config points at your own: it is one Cloudflare Worker, see agent-socket's self-hosting doc. The relay forwards calls but stores none of them. Anyone holding the link can use the shared browser until you stop it, so paste it only where you mean to.
-
 ## Phone & browser sessions
 
 ```bash
@@ -157,7 +136,6 @@ Sessions merge file-by-file (nothing is ever overwritten or deleted; sources are
 node_version=24        # base image: node:<this>-bookworm
 proxy_port=80          # host port for the dev-server proxy
 backup_dir=~/aibox-backups
-share_relay=https://agentsocket.dev   # agent-socket relay for `aibox browser --share`
 ```
 
 The image is `node:<version>-bookworm` (Debian) plus a few basics (zsh, sudo, ripgrep, fzf, jq, less, procps, curl) — Claude apt-installs anything else on demand, and it persists across stop/start. To make custom tooling survive image rebuilds too, put extra Dockerfile lines in `~/.aibox/Dockerfile.extra`.
