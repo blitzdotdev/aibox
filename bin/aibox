@@ -1873,6 +1873,7 @@ _browser_run() {
       BROWSER_UP=1
       printf '%s\n%s\n' "${line##*Listening on }" "$ver" | sed '1s/127\.0\.0\.1/host.docker.internal/' > "${CONFIG_DIR}/host/browser.url"
       _ok "Playwright ${ver}. Every container sees it at ~/.aibox/host/browser.url; CLAUDE.md tells sessions how."
+      _browser_stale_warn
     fi
   done < <(rc=0; _render_sh 'DEBUG="pw:browser*" node serve.js 2>&1' || rc=$?; echo "$rc" > "$status")
   # EOF can arrive a moment before the status is written.
@@ -1882,6 +1883,19 @@ _browser_run() {
   [[ "${rc:-0}" == 0 ]] || _die "The browser server stopped (exit status ${rc}); its output is above."
 }
 _browser_status_cleanup() { [[ -n "${BROWSER_STATUS:-}" ]] && rm -f "$BROWSER_STATUS"; return 0; }
+# Containers made before the host-directory mount (layout < 4) can't see
+# ~/.aibox/host: mounts are fixed at creation, and aibox keeps such a
+# container while sessions or dev servers still run in it.
+_browser_stale_warn() {
+  local ids stale
+  ids="$(docker ps -q --filter label=aibox.slug 2>/dev/null | tr '\n' ' ' || true)"
+  [[ -z "${ids// /}" ]] && return 0
+  # shellcheck disable=SC2086
+  stale="$(docker inspect --format '{{index .Config.Labels "aibox.layout"}} {{.Name}}' $ids 2>/dev/null \
+    | awk '$1 != "4" { sub(/^\//, "", $2); print $2 }' | tr '\n' ' ' || true)"
+  [[ -n "${stale// /}" ]] && _warn "Running containers made before this feature don't see the browser: ${stale% }. Exit their sessions and dev servers, then in that project run: aibox stop && aibox"
+  return 0
+}
 cmd_browser() {
   [[ "$(uname)" == "Darwin" ]] || _die "aibox browser is macOS-only: it runs a GPU browser on the Mac for sessions. On Linux, run a Playwright server with your GPU yourself and give sessions its URL."
   case "${1:-}" in
