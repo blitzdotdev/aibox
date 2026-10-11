@@ -41,12 +41,15 @@
 #                             cron on the host. `add`, `rm`, `approve`/`reject`
 #                             proposals that a Claude session wrote, `on`/
 #                             `off`, `log`. No args lists everything.
-#   aibox browser [setup]     Playwright browser server on the Mac, with the
+#   aibox browser [--share]   Playwright browser server on the Mac, with the
 #                             real GPU, that sessions connect to for WebGL/
 #                             WebGPU renders. Foreground; Ctrl-C stops it.
 #                             Runs as a hidden unprivileged user, created
 #                             on first run; `setup` updates Playwright.
-#                             macOS only.
+#                             --share also prints an agent-socket link for
+#                             agents elsewhere (uploads + allowed hosts
+#                             only; `answer <id> allow|always|deny` answers
+#                             their requests). macOS only.
 #   aibox rc-resume <id>      Make one past session of this project
 #                             drivable from claude.ai / the Claude app.
 #   aibox shell [cmd...]      zsh in the container. One argument runs as a
@@ -121,6 +124,7 @@ _die()  { echo -e "${_R}✗${_N} $*" >&2; exit 1; }
 NODE_VERSION=24
 PROXY_PORT=80
 BACKUP_DIR="${HOME}/aibox-backups"
+SHARE_RELAY="https://agentsocket.dev"
 if [[ -f "${CONFIG_DIR}/config" ]]; then
   # `|| [[ -n "$k" ]]`: don't drop the last line when the file has no
   # trailing newline.
@@ -131,6 +135,7 @@ if [[ -f "${CONFIG_DIR}/config" ]]; then
       node_version) NODE_VERSION="$v" ;;
       proxy_port)   PROXY_PORT="$v" ;;
       backup_dir)   BACKUP_DIR="$v" ;;
+      share_relay)  SHARE_RELAY="$v" ;;
     esac
   done < "${CONFIG_DIR}/config"
 fi
@@ -1723,6 +1728,12 @@ _render_sh() {
   local uid; uid="$(_render_uid)"
   ( cd / && sudo launchctl asuser "$uid" sudo -u "$RENDER_USER" -H env "PATH=${RENDER_HOME}/node/bin:/usr/bin:/bin" npm_config_update_notifier=false bash -c "cd ~ && $1" )
 }
+# Bump when serve.js/share.mjs/README change: the next run rewrites them.
+BROWSER_REV=2
+SHARE_DIR="${CONFIG_DIR}/share"
+# Write stdin to a file in render's home. Plain sudo -u is enough for files
+# (only Chrome needs render's launchd domain).
+_render_write() { ( cd / && sudo -u "$RENDER_USER" tee "${RENDER_HOME}/$1" >/dev/null ); }
 _browser_setup() {
   local auto="${1:-}"
   if ! id -u "$RENDER_USER" >/dev/null 2>&1; then
@@ -1744,30 +1755,546 @@ _browser_setup() {
   _info "Installing node and Playwright for '${RENDER_USER}' (a few minutes, one time)..."
   _render_sh '[ -x node/bin/node ] || { f=$(curl -fsSL https://nodejs.org/dist/latest-v22.x/SHASUMS256.txt | grep -o "node-v22[^ ]*'"$arch"'.tar.gz" | head -1) && curl -fsSL "https://nodejs.org/dist/latest-v22.x/$f" | tar xz && rm -rf node && mv "${f%.tar.gz}" node; }'
   # Rerunning setup is the update path: always resolve @latest, then fetch
-  # the Chromium build that version wants.
-  _render_sh '[ -f package.json ] || npm init -y >/dev/null; npm i @playwright/test@latest >/dev/null && npx playwright install chromium >/dev/null && node -e "console.log(require(\"@playwright/test/package.json\").version)" > .pw-version'
-  _render_sh 'cat > serve.js <<"EOF"
+  # the Chromium build that version wants. The agent-socket SDK is only
+  # loaded by --share.
+  _render_sh '[ -f package.json ] || npm init -y >/dev/null; npm i @playwright/test@latest @agent-socket/sdk@^0.2 >/dev/null && npx playwright install chromium >/dev/null && node -e "console.log(require(\"@playwright/test/package.json\").version)" > .pw-version'
+  _browser_files
+  if [[ -n "$auto" ]]; then
+    _ok "'${RENDER_USER}' is ready (Playwright $(cat "${RENDER_HOME}/.pw-version" 2>/dev/null))."
+    return 0
+  fi
+  _ok "'${RENDER_USER}' is ready (Playwright $(cat "${RENDER_HOME}/.pw-version" 2>/dev/null)). Start the server with: aibox browser"
+  _info "Optional, for several sessions rendering at once: give '${RENDER_USER}' a display session (see ${RENDER_HOME}/README.md)."
+}
+# The files aibox owns in render's home. Rewritten by setup and whenever
+# BROWSER_REV moves, so a pulled aibox reaches them without a full setup.
+_browser_files() {
+  _render_sh '[ -d node_modules/@agent-socket/sdk ] || npm i @agent-socket/sdk@^0.2 >/dev/null'
+  _render_write serve.js <<SERVE_JS
 // aibox GPU browser server: full Chromium in new-headless mode (Metal via
 // ANGLE), one browser shared by all connecting sessions, each in its own
-// context. Run by `aibox browser` on the Mac (foreground, Ctrl-C stops it).
+// context. Run by \`aibox browser\` on the Mac (foreground, Ctrl-C stops it).
 // Closing the LAST window crashes Chromium when this user has no display
 // session (NSWindow close), so the server holds one page open for its
 // lifetime; if the browser still exits, it is relaunched on the same URL.
+// With AIBOX_SHARE (a relay URL) it also shares a separate, locked-down
+// browser through an agent-socket link: see share.mjs.
 const { chromium } = require("@playwright/test");
 const wsPath = "/" + require("crypto").randomBytes(8).toString("hex");
 const fatal = e => { console.error(e); process.exit(1); };
 async function serve() {
-  const s = await chromium.launchServer({ channel: "chromium", headless: true, host: "127.0.0.1", port: '"$BROWSER_PORT"', wsPath });
+  // No Playwright signal handlers: they exit the process at once, before
+  // share.mjs can end its link. aibox stops everything of render's anyway.
+  const s = await chromium.launchServer({ channel: "chromium", headless: true, host: "127.0.0.1", port: ${BROWSER_PORT}, wsPath,
+    handleSIGINT: false, handleSIGTERM: false, handleSIGHUP: false });
   console.log("Listening on " + s.wsEndpoint());
   s.on("close", () => { console.log(new Date().toISOString() + " browser exited - relaunching"); setTimeout(() => serve().catch(fatal), 1000); });
   try { const keeper = await chromium.connect(s.wsEndpoint()); await (await keeper.newContext()).newPage(); }
   catch (e) { console.log("keeper page failed: " + e.message); }
 }
 serve().catch(fatal);
-EOF
-cat > README.md <<"EOF"
+if (process.env.AIBOX_SHARE) {
+  import("./share.mjs")
+    .then(m => m.start({ chromium, launchOptions: { channel: "chromium" }, relay: process.env.AIBOX_SHARE, playwrightVersion: require("@playwright/test/package.json").version }))
+    .catch(e => console.log("share: could not start: " + e.message));
+}
+SERVE_JS
+  _render_write share.mjs <<'AIBOX_SHARE_MJS'
+// aibox share: the Mac's GPU browser for agents anywhere, through an
+// agent-socket link. Loaded by serve.js when `aibox browser --share` runs.
+//
+// The boundary is fixed here; everything inside it is free:
+// - its own Chromium (not the one containers share), every request forced
+//   through the filtering proxy below, which refuses hosts not on the
+//   allowlist, IP literals, ports other than 80/443, and any name that
+//   resolves to a private, loopback or link-local address (checked on the
+//   address it then connects to, so DNS rebinding can't slip through);
+// - agent code runs only inside pages (Chromium's sandbox, as `render`);
+// - widening (a new host, keeping a tool) needs the user's click: an `ask`
+//   line goes to aibox on stdout, the answer comes back on stdin.
+// Uploaded files are served at https://app.aibox/ from memory.
+import { connect, endSession } from "@agent-socket/sdk";
+import http from "node:http";
+import net from "node:net";
+import dns from "node:dns/promises";
+import readline from "node:readline";
+import crypto from "node:crypto";
+
+const ORIGIN = "https://app.aibox";
+const LIMITS = {
+  pages: 8, fileBytes: 64 << 20, files: 2000, imageBytes: 2_800_000, resultChars: 256_000,
+  opMs: 25_000, idleMs: 15 * 60_000, tools: 30, askMs: 15 * 60_000, hostsPerAsk: 10, logLines: 100,
+};
+const HOST_RE = /^(\*\.)?([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,62}$/;
+const FILE_RE = /^(?!.*(^|\/)\.\.?(\/|$))[A-Za-z0-9._\-/]{1,256}$/;
+const TOOL_RE = /^\/[a-z0-9][a-z0-9_-]{0,63}$/;
+const TYPES = {
+  html: "text/html", htm: "text/html", js: "text/javascript", mjs: "text/javascript", css: "text/css",
+  json: "application/json", map: "application/json", txt: "text/plain", svg: "image/svg+xml",
+  png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp",
+  avif: "image/avif", ktx2: "image/ktx2", hdr: "application/octet-stream", exr: "application/octet-stream",
+  glb: "model/gltf-binary", gltf: "model/gltf+json", bin: "application/octet-stream", wasm: "application/wasm",
+  woff2: "font/woff2", woff: "font/woff", ttf: "font/ttf", mp4: "video/mp4", webm: "video/webm",
+  mp3: "audio/mpeg", wav: "audio/wav", ogg: "audio/ogg",
+};
+
+const out = (line) => process.stdout.write(line + "\n");
+// Agent-supplied text (reasons, error messages) reaches the owner's terminal:
+// no control characters, so no escape sequences.
+const clean = (t) => String(t).replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, "?");
+const log = (msg) => out("share: " + clean(msg).replace(/[\r\n]+/g, " | "));
+// Events for aibox carry its per-run key, so no other output (an agent's
+// error text, Chromium's logs) can pass for one.
+const KEY = process.env.AIBOX_SHARE_KEY || "";
+const event = (e) => out("@@aibox" + (KEY ? ":" + KEY : "") + " " + e);
+const b64 = (s) => Buffer.from(s, "utf8").toString("base64");
+const err = (status, code, message, extra = {}) => ({ status, body: { error: { code, message, ...extra } } });
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const withTimeout = (p, ms, what) => Promise.race([p, sleep(ms).then(() => { throw Object.assign(new Error(what + " timed out after " + ms + " ms"), { code: "timeout" }); })]);
+function parse(body) {
+  if (!body) return {};
+  try { const v = JSON.parse(body); return v && typeof v === "object" && !Array.isArray(v) ? v : null; } catch { return null; }
+}
+
+// ── network: allowlist + filtering proxy ─────────────────────────────
+const allowed = new Set();
+const refused = new Map(); // host -> why the proxy refused it (newest 200)
+// Separate lists: a BlockList checks IPv4 addresses against IPv6 rules as
+// IPv4-mapped, so one ::ffff:0:0/96 rule would refuse every IPv4 address.
+const private4 = new net.BlockList(), private6 = new net.BlockList();
+for (const [a, p] of [["0.0.0.0", 8], ["10.0.0.0", 8], ["100.64.0.0", 10], ["127.0.0.0", 8], ["169.254.0.0", 16],
+  ["172.16.0.0", 12], ["192.0.0.0", 24], ["192.168.0.0", 16], ["198.18.0.0", 15], ["224.0.0.0", 3]]) private4.addSubnet(a, p, "ipv4");
+for (const [a, p] of [["::", 127], ["fc00::", 7], ["fe80::", 10], ["ff00::", 8], ["::ffff:0:0", 96],
+  ["64:ff9b::", 96], ["2002::", 16], ["2001::", 32]]) private6.addSubnet(a, p, "ipv6");
+export const privateAddr = (ip) => net.isIPv4(ip) ? private4.check(ip, "ipv4") : private6.check(ip, "ipv6");
+
+export function hostAllowed(host) {
+  const h = host.toLowerCase().replace(/\.$/, "");
+  if (allowed.has(h)) return true;
+  for (let i = h.indexOf("."); i >= 0; i = h.indexOf(".", i + 1)) if (allowed.has("*" + h.slice(i))) return true;
+  return false;
+}
+export const validHost = (h) => typeof h === "string" && h.length <= 253 && HOST_RE.test(h);
+
+// Reason a connection may not be made, or the address to connect to.
+async function vet(host, port) {
+  host = (host || "").toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
+  const deny = (reason) => {
+    refused.delete(host); refused.set(host, reason);
+    if (refused.size > 200) refused.delete(refused.keys().next().value);
+    return { reason };
+  };
+  if (net.isIP(host)) return deny("IP addresses are never reachable; use a hostname");
+  if (port !== 443 && port !== 80) return deny("only ports 80 and 443");
+  if (!hostAllowed(host)) return deny("not allowed yet; ask with POST /request");
+  let addrs;
+  try { addrs = await dns.lookup(host, { all: true, verbatim: true }); } catch { return deny("does not resolve"); }
+  if (!addrs.length) return deny("does not resolve");
+  for (const a of addrs) if (privateAddr(a.address)) return deny("resolves to a private address");
+  return { address: addrs[0].address, host };
+}
+
+function startProxy() {
+  const server = http.createServer(async (req, res) => {
+    let u;
+    try { u = new URL(req.url); } catch { res.writeHead(400).end(); return; }
+    if (u.protocol !== "http:") { res.writeHead(400).end(); return; }
+    const v = await vet(u.hostname, Number(u.port || 80));
+    if (v.reason) { res.writeHead(403, { "content-type": "text/plain", "x-aibox-blocked": "1" }).end("aibox: " + u.hostname + ": " + v.reason); return; }
+    const headers = { ...req.headers, host: u.host };
+    delete headers["proxy-connection"]; delete headers["proxy-authorization"];
+    const up = http.request({ host: v.address, port: Number(u.port || 80), method: req.method, path: u.pathname + u.search, headers }, (r) => {
+      res.writeHead(r.statusCode, r.headers); r.pipe(res);
+    });
+    up.on("error", () => res.destroy());
+    req.pipe(up);
+  });
+  server.on("connect", async (req, sock, head) => {
+    sock.on("error", () => {});
+    const i = req.url.lastIndexOf(":");
+    const v = await vet(req.url.slice(0, i), Number(req.url.slice(i + 1)));
+    if (v.reason) { sock.end("HTTP/1.1 403 Forbidden\r\n\r\n"); return; }
+    const up = net.connect(Number(req.url.slice(i + 1)), v.address, () => {
+      sock.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+      if (head?.length) up.write(head);
+      up.pipe(sock); sock.pipe(up);
+    });
+    up.on("error", () => sock.destroy());
+    sock.on("close", () => up.destroy());
+  });
+  return new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve(server)));
+}
+
+// ── files served at https://app.aibox/ ───────────────────────────────
+const files = new Map(); // path -> { buf, type }
+let fileBytes = 0;
+const typeOf = (p) => TYPES[(p.split(".").pop() || "").toLowerCase()] || "application/octet-stream";
+function putFile(f) {
+  if (!f || typeof f.path !== "string" || !FILE_RE.test(f.path.replace(/^\/+/, ""))) return "bad path (letters, digits, . _ - /; no ..)";
+  if (typeof f.data !== "string") return "data must be a string";
+  const path = f.path.replace(/^\/+/, "");
+  const enc = f.encoding === "base64" ? "base64" : "utf8";
+  const chunk = Buffer.from(f.data, enc);
+  const prev = files.get(path);
+  const buf = f.append && prev ? Buffer.concat([prev.buf, chunk]) : chunk;
+  const next = fileBytes - (prev?.buf.length || 0) + buf.length;
+  if (next > LIMITS.fileBytes) return "over the " + (LIMITS.fileBytes >> 20) + " MiB total for files";
+  if (!prev && files.size >= LIMITS.files) return "too many files";
+  const type = typeof f.content_type === "string" && /^[\w.+-]+\/[\w.+-]+$/.test(f.content_type) ? f.content_type : (prev && f.append ? prev.type : typeOf(path));
+  files.set(path, { buf, type });
+  fileBytes = next;
+  return { path, bytes: buf.length };
+}
+async function serveFile(route) {
+  let p = decodeURIComponent(new URL(route.request().url()).pathname).replace(/^\/+/, "");
+  if (p === "" || p.endsWith("/")) p += "index.html";
+  const f = files.get(p);
+  if (!f) return route.fulfill({ status: 404, contentType: "text/plain", body: "not uploaded: " + p });
+  return route.fulfill({ status: 200, contentType: f.type, body: f.buf, headers: { "cache-control": "no-store", "access-control-allow-origin": "*" } });
+}
+
+// ── browser and pages ────────────────────────────────────────────────
+let browser = null, gpuInfo = null, proxyPort = 0, chromiumRef = null, launchOpts = {}, stopping = false;
+const pages = new Map(); // id -> { ctx, page, logs: [], last }
+async function launch() {
+  browser = await chromiumRef.launch({
+    ...launchOpts, headless: true,
+    // Playwright's own handlers would exit the process before stop() can
+    // end the link; stop() closes this browser itself.
+    handleSIGINT: false, handleSIGTERM: false, handleSIGHUP: false,
+    args: [...(launchOpts.args || []),
+      "--proxy-server=http://127.0.0.1:" + proxyPort, "--proxy-bypass-list=<-loopback>",
+      "--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1",
+      "--force-webrtc-ip-handling-policy=disable_non_proxied_udp", "--webrtc-ip-handling-policy=disable_non_proxied_udp"],
+  });
+  // Same crash guard as serve.js: never let the last window close.
+  await (await browser.newContext()).newPage().catch(() => {});
+  browser.on("disconnected", () => {
+    pages.clear(); browser = null;
+    if (stopping) return;
+    log("browser exited - relaunching (open pages are gone)");
+    setTimeout(() => launch().catch((e) => log("relaunch failed: " + e.message)), 1000);
+  });
+}
+const ready = async () => { for (let i = 0; !browser && i < 50; i++) await sleep(100); if (!browser) throw Object.assign(new Error("browser is restarting"), { code: "unavailable" }); return browser; };
+
+// Console output and blocked hosts since the last call, for this page.
+function report(p) {
+  const r = {};
+  if (p?.logs.length) r.console = p.logs.splice(0);
+  if (p?.blocked.size) {
+    r.blocked = [...p.blocked].map(([host, reason]) => ({ host, reason }));
+    r.hint = "Blocked hosts: upload what you need with POST /files (served at " + ORIGIN + "/), or ask for the host with POST /request.";
+    p.blocked.clear();
+  }
+  return r;
+}
+function pageOf(id) {
+  const p = pages.get(id);
+  if (!p) throw Object.assign(new Error("no page " + JSON.stringify(id) + " (open pages: " + ([...pages.keys()].join(", ") || "none") + ")"), { code: "no_page" });
+  p.last = Date.now();
+  return p;
+}
+async function openPage(a) {
+  if (pages.size >= LIMITS.pages) throw Object.assign(new Error("at most " + LIMITS.pages + " pages; close some with POST /close"), { code: "too_many_pages" });
+  const target = new URL(typeof a.url === "string" && a.url ? a.url : "index.html", ORIGIN + "/");
+  if (!/^https?:$/.test(target.protocol)) throw Object.assign(new Error("only http(s) URLs"), { code: "bad_url" });
+  if (target.origin !== ORIGIN && !hostAllowed(target.hostname)) {
+    throw Object.assign(new Error(target.hostname + " is not allowed yet: upload the page with POST /files and open it by path, or POST /request for the host"), { code: "host_not_allowed" });
+  }
+  const w = Math.min(Math.max(a.width | 0 || 1280, 16), 4096), h = Math.min(Math.max(a.height | 0 || 720, 16), 4096);
+  const scale = Math.min(Math.max(Number(a.scale) || 1, 0.25), 3);
+  const ctx = await (await ready()).newContext({ viewport: { width: w, height: h }, deviceScaleFactor: scale, serviceWorkers: "block", acceptDownloads: false });
+  await ctx.route(ORIGIN + "/**", serveFile);
+  const page = await ctx.newPage();
+  const id = crypto.randomBytes(3).toString("hex");
+  const rec = { ctx, page, logs: [], blocked: new Map(), last: Date.now() };
+  const block = (url) => { let h = ""; try { h = new URL(url).hostname.replace(/^\[|\]$/g, ""); } catch {} rec.blocked.set(h, refused.get(h) || "blocked"); };
+  const push = (s) => { if (rec.logs.length < LIMITS.logLines) rec.logs.push(s.slice(0, 500)); };
+  page.on("console", (m) => push(m.type() + ": " + m.text()));
+  page.on("pageerror", (e) => push("pageerror: " + (e.stack || e.message)));
+  page.on("requestfailed", (r) => {
+    const why = r.failure()?.errorText || "";
+    if (/TUNNEL_CONNECTION_FAILED|NAME_NOT_RESOLVED/.test(why)) block(r.url());
+    else push("requestfailed: " + r.url().slice(0, 200) + " " + why);
+  });
+  page.on("response", (r) => { if (r.status() === 403 && r.headers()["x-aibox-blocked"]) block(r.url()); });
+  pages.set(id, rec);
+  const wait = ["load", "domcontentloaded", "networkidle", "commit"].includes(a.wait) ? a.wait : "load";
+  const resp = await page.goto(target.href, { waitUntil: wait, timeout: LIMITS.opMs - 2000 }).catch((e) => { push("goto: " + e.message.split("\n")[0]); return null; });
+  return { page: id, url: target.href, http_status: resp?.status() ?? null, viewport: { width: w, height: h, scale } };
+}
+async function closePage(id) {
+  const p = pages.get(id);
+  if (!p) return false;
+  pages.delete(id);
+  await p.ctx.close().catch(() => {});
+  return true;
+}
+setInterval(() => { for (const [id, p] of pages) if (Date.now() - p.last > LIMITS.idleMs) closePage(id); }, 60_000).unref();
+
+function serialize(v) {
+  const s = JSON.stringify(v === undefined ? null : v);
+  return s.length > LIMITS.resultChars ? { result_truncated: s.slice(0, LIMITS.resultChars) } : { result: JSON.parse(s) };
+}
+async function evalIn(p, js, arg) {
+  if (typeof js !== "string" || !js.trim()) throw Object.assign(new Error("js must be the body of an async function; return a JSON value"), { code: "bad_js" });
+  // A string expression runs through CDP, so a page's own CSP can't block it.
+  return withTimeout(p.page.evaluate("(async (arg) => {\n" + js + "\n})(" + JSON.stringify(arg ?? null) + ")"), LIMITS.opMs - 2000, "js");
+}
+async function shoot(p, a = {}) {
+  const frames = Math.min(Math.max(a.frames ?? 2, 0), 120);
+  if (frames) await withTimeout(p.page.evaluate((n) => new Promise((r) => { const f = () => (--n <= 0 ? r() : requestAnimationFrame(f)); requestAnimationFrame(f); }), frames), 10_000, "frames").catch(() => {});
+  const type = a.type === "jpeg" ? "jpeg" : "png";
+  const opts = { type, fullPage: !!a.full_page, omitBackground: !!a.omit_background && type === "png", timeout: LIMITS.opMs - 5000 };
+  if (type === "jpeg") opts.quality = Math.min(Math.max(a.quality | 0 || 85, 1), 100);
+  if (a.clip && typeof a.clip === "object") opts.clip = { x: +a.clip.x || 0, y: +a.clip.y || 0, width: +a.clip.width || 1, height: +a.clip.height || 1 };
+  const buf = typeof a.selector === "string" ? await p.page.locator(a.selector).first().screenshot(opts) : await p.page.screenshot(opts);
+  if (buf.length > LIMITS.imageBytes) {
+    throw Object.assign(new Error("image is " + buf.length + " bytes, over " + LIMITS.imageBytes + ": use type jpeg, a lower quality, a clip/selector or a smaller viewport/scale"), { code: "image_too_large" });
+  }
+  return { type, bytes: buf.length, data: buf.toString("base64") };
+}
+async function gpu() {
+  if (gpuInfo) return gpuInfo;
+  const ctx = await (await ready()).newContext();
+  try {
+    const page = await ctx.newPage();
+    gpuInfo = await withTimeout(page.evaluate(async () => {
+      const c = document.createElement("canvas"), gl = c.getContext("webgl2") || c.getContext("webgl");
+      const ext = gl && gl.getExtension("WEBGL_debug_renderer_info");
+      let webgpu = null;
+      try { const ad = navigator.gpu && await navigator.gpu.requestAdapter(); webgpu = ad ? (ad.info ? { vendor: ad.info.vendor, architecture: ad.info.architecture } : true) : false; } catch { webgpu = false; }
+      return { webgl: gl ? (gl instanceof WebGL2RenderingContext ? 2 : 1) : 0, renderer: ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : (gl ? gl.getParameter(gl.RENDERER) : null), webgpu };
+    }), 10_000, "gpu probe");
+  } finally { await ctx.close().catch(() => {}); }
+  return gpuInfo;
+}
+
+// ── approvals (stdout `@@aibox ask`, stdin `answer`) ─────────────────
+const asks = new Map(); // id -> { kind, hosts?, tool?, taskId?, timer }
+let session = null;
+function ask(kind, text, extra) {
+  const id = crypto.randomBytes(3).toString("hex");
+  const a = { kind, ...extra };
+  a.timer = setTimeout(() => answer(id, "timeout"), LIMITS.askMs);
+  asks.set(id, a);
+  event("ask " + id + " " + kind + " " + b64(text) + (a.hosts ? " " + a.hosts.join(" ") : ""));
+  return id;
+}
+function answer(id, choice) {
+  const a = asks.get(id);
+  if (!a) return log("no pending request " + id);
+  asks.delete(id); clearTimeout(a.timer);
+  event("done " + id);
+  const yes = choice === "allow" || choice === "always";
+  if (a.kind === "hosts") {
+    if (yes) for (const h of a.hosts) allowed.add(h);
+    if (choice === "always") event("persist-hosts " + a.hosts.join(" "));
+    log((yes ? "allowed " : "refused ") + a.hosts.join(", ") + (choice === "always" ? " (always)" : yes ? " (this session)" : choice === "timeout" ? " (no answer)" : ""));
+    // Throws while the relay link is down; the agent's poll then just never completes.
+    try { session?.completeTask(a.taskId, { body: { approved: yes, answer: choice, hosts: a.hosts, allowed_hosts: [...allowed] } }); }
+    catch (e) { log("could not tell the agent: " + e.message); }
+  } else if (a.kind === "keep") {
+    if (choice === "always") { event("persist-tool " + a.tool.path.slice(1) + " " + b64(JSON.stringify(a.tool))); log("kept tool " + a.tool.path); }
+    else log("tool " + a.tool.path + " stays for this session only");
+  }
+}
+
+// ── agent-defined tools (run in pages, so no approval to define) ─────
+const defined = new Map(); // path -> def
+function validTool(d) {
+  if (!d || typeof d !== "object") return "body must be an object";
+  if (typeof d.path !== "string" || !TOOL_RE.test(d.path)) return "path must look like /orbit_shots (a-z 0-9 _ -)";
+  if (builtins.some((t) => t.path === d.path || t.path.startsWith(d.path + "/"))) return d.path + " is a built-in";
+  if (typeof d.description !== "string" || !d.description.trim() || d.description.length > 4000) return "description: 1-4000 characters";
+  if (typeof d.js !== "string" || !d.js.trim() || d.js.length > 32_000) return "js: the body of an async function, at most 32000 characters";
+  if (d.input_schema !== undefined && (typeof d.input_schema !== "object" || JSON.stringify(d.input_schema).length > 16_000)) return "input_schema: a JSON Schema object";
+  if (d.url !== undefined && typeof d.url !== "string") return "url must be a string";
+  if (!defined.has(d.path) && defined.size >= LIMITS.tools) return "at most " + LIMITS.tools + " defined tools";
+  return null;
+}
+const pick = (d) => ({ path: d.path, description: d.description, js: d.js, input_schema: d.input_schema, url: d.url, width: d.width, height: d.height, scale: d.scale, wait: d.wait, screenshot: d.screenshot });
+function definedTool(d) {
+  return {
+    path: d.path, description: d.description + "\n\n(Agent-defined. Body: your arguments as JSON, passed to the tool's js as `arg`; add \"page\": \"<id>\" to run in an open page instead of a fresh one.)",
+    input_schema: d.input_schema || { type: "object" },
+    handler: guard(d.path, async (a) => {
+      let id = typeof a.page === "string" ? a.page : null, opened = false;
+      if (id) pageOf(id); else { id = (await openPage({ url: d.url, width: d.width, height: d.height, scale: d.scale, wait: d.wait })).page; opened = true; }
+      try {
+        const p = pageOf(id);
+        const r = serialize(await evalIn(p, d.js, a));
+        if (d.screenshot) r.image = await shoot(p, typeof d.screenshot === "object" ? d.screenshot : {});
+        return { ...r, ...(opened ? {} : { page: id }), ...report(p) };
+      } finally { if (opened) await closePage(id); }
+    }),
+  };
+}
+function define(d, quiet) {
+  const why = validTool(d);
+  if (why) return why;
+  defined.set(d.path, pick(d));
+  if (!quiet) log("tool " + d.path + " defined");
+  return null;
+}
+const toolList = () => [...builtins, ...[...defined.values()].map(definedTool)];
+let syncing = Promise.resolve();
+const syncTools = () => (syncing = syncing.then(() => session?.updateTools(toolList(), agentsMd())).catch((e) => log("tool update failed: " + e.message)));
+
+// Every handler: parse, log one line, map thrown errors to HTTP answers.
+function guard(name, fn) {
+  return async ({ body }) => {
+    const a = parse(body);
+    if (!a) return err(400, "bad_json", "the body must be a JSON object");
+    const t = Date.now();
+    try {
+      const r = await fn(a);
+      log(name + " (" + (Date.now() - t) + " ms)");
+      return r;
+    } catch (e) {
+      log(name + " failed: " + e.message.split("\n")[0]);
+      const status = { no_page: 404, too_many_pages: 429, host_not_allowed: 403, image_too_large: 413, timeout: 504, unavailable: 503 }[e.code] || 400;
+      return err(status, e.code || "failed", e.message.split("\n").slice(0, 3).join(" "), report(null));
+    }
+  };
+}
+
+const builtins = [
+  { method: "GET", path: "/info", description: "GPU (WebGL renderer, WebGPU), Chromium and Playwright versions, allowed hosts, open pages, uploaded files, limits and agent-defined tools.",
+    handler: guard("info", async () => ({
+      gpu: await gpu(), chromium: (await ready()).version(), playwright: PW, origin: ORIGIN,
+      allowed_hosts: [...allowed], pages: [...pages.keys()], files: { count: files.size, bytes: fileBytes },
+      tools: [...defined.keys()], limits: LIMITS,
+    })) },
+  { path: "/files", description: "Upload files, served at " + ORIGIN + "/<path> to pages opened here. Body: {\"files\": [{\"path\": \"index.html\", \"data\": \"...\", \"encoding\": \"utf8\" | \"base64\", \"append\": false, \"content_type\": optional}]}. A request body is at most 1 MiB, so send big files in base64 pieces with append: true. Content type comes from the extension.",
+    input_schema: { type: "object", required: ["files"], properties: { files: { type: "array", items: { type: "object", required: ["path", "data"], properties: {
+      path: { type: "string" }, data: { type: "string" }, encoding: { enum: ["utf8", "base64"] }, append: { type: "boolean" }, content_type: { type: "string" } } } } } },
+    handler: guard("files", async (a) => {
+      if (!Array.isArray(a.files) || !a.files.length) throw Object.assign(new Error("files: a non-empty array"), { code: "bad_files" });
+      const stored = [], errors = [];
+      for (const f of a.files) { const r = putFile(f); typeof r === "string" ? errors.push({ path: f?.path, error: r }) : stored.push(r); }
+      return { stored, errors, total: { count: files.size, bytes: fileBytes } };
+    }) },
+  { method: "GET", path: "/files", description: "List uploaded files with sizes.",
+    handler: guard("files list", async () => ({ files: [...files].map(([path, f]) => ({ path, bytes: f.buf.length, type: f.type })), bytes: fileBytes })) },
+  { path: "/files/delete", description: "Delete uploaded files. Body: {\"paths\": [...]} or {\"all\": true}.",
+    handler: guard("files delete", async (a) => {
+      const ps = a.all ? [...files.keys()] : Array.isArray(a.paths) ? a.paths : [];
+      for (const p of ps) { const f = files.get(p); if (f) { fileBytes -= f.buf.length; files.delete(p); } }
+      return { deleted: ps.length, total: { count: files.size, bytes: fileBytes } };
+    }) },
+  { path: "/page", description: "Open a page in a fresh, isolated context. Body: {\"url\": \"index.html\" (a path under " + ORIGIN + "/, or an https URL on an allowed host), \"width\": 1280, \"height\": 720, \"scale\": 1, \"wait\": \"load\" | \"domcontentloaded\" | \"networkidle\"}. Returns the page id, plus console output and blocked hosts so far.",
+    input_schema: { type: "object", properties: { url: { type: "string" }, width: { type: "integer" }, height: { type: "integer" }, scale: { type: "number" }, wait: { type: "string" } } },
+    handler: guard("page", async (a) => { const r = await openPage(a); return { ...r, ...report(pages.get(r.page)) }; }) },
+  { path: "/eval", description: "Run JavaScript in a page. Body: {\"page\": \"<id>\", \"js\": \"<body of an async function>\", \"arg\": <any JSON>}. Use `return` to send back a JSON value (truncated past 256k characters). Also returns console output since the last call.",
+    input_schema: { type: "object", required: ["page", "js"], properties: { page: { type: "string" }, js: { type: "string" }, arg: {} } },
+    handler: guard("eval", async (a) => { const p = pageOf(a.page); return { ...serialize(await evalIn(p, a.js, a.arg)), ...report(p) }; }) },
+  { path: "/screenshot", description: "Screenshot a page after `frames` animation frames (default 2). Body: {\"page\": \"<id>\", \"type\": \"png\" | \"jpeg\", \"quality\": 85, \"full_page\": false, \"selector\": optional, \"clip\": {x,y,width,height} optional, \"omit_background\": false, \"frames\": 2}. Returns {type, bytes, data} with data in base64 (e.g. `jq -r .data | base64 -d > shot.png`). Images over ~2.8 MB are refused: use jpeg or a smaller clip.",
+    input_schema: { type: "object", required: ["page"], properties: { page: { type: "string" }, type: { enum: ["png", "jpeg"] }, quality: { type: "integer" }, full_page: { type: "boolean" }, selector: { type: "string" }, clip: { type: "object" }, omit_background: { type: "boolean" }, frames: { type: "integer" } } },
+    handler: guard("screenshot", async (a) => { const p = pageOf(a.page); return { ...(await shoot(p, a)), ...report(p) }; }) },
+  { path: "/close", description: "Close a page. Body: {\"page\": \"<id>\"} or {\"all\": true}. Idle pages close after 15 minutes anyway.",
+    handler: guard("close", async (a) => {
+      const ids = a.all ? [...pages.keys()] : [a.page];
+      let n = 0; for (const id of ids) if (await closePage(id)) n++;
+      return { closed: n, pages: [...pages.keys()] };
+    }) },
+  { path: "/request", description: "Ask the user to let pages reach more hosts (a CDN, an API). Body: {\"hosts\": [\"cdn.jsdelivr.net\", \"*.example.com\"], \"reason\": \"one line the user will see\"}. The user gets a dialog on their Mac; this returns 202 with a taskId: poll <link base>/_as_tasks/<taskId> every few seconds until it answers {approved, allowed_hosts}. Uploading what you need with /files needs no approval.",
+    input_schema: { type: "object", required: ["hosts", "reason"], properties: { hosts: { type: "array", items: { type: "string" } }, reason: { type: "string" } } },
+    handler: guard("request", async (a) => {
+      const hosts = Array.isArray(a.hosts) ? [...new Set(a.hosts.map((h) => String(h).toLowerCase()))] : [];
+      const bad = hosts.filter((h) => !validHost(h));
+      if (!hosts.length || hosts.length > LIMITS.hostsPerAsk || bad.length) {
+        throw Object.assign(new Error("hosts: 1-" + LIMITS.hostsPerAsk + " hostnames like cdn.jsdelivr.net or *.example.com" + (bad.length ? " (bad: " + bad.join(", ") + ")" : "")), { code: "bad_hosts" });
+      }
+      // A plain host a wildcard already covers isn't missing; a wildcard is
+      // missing unless that exact wildcard was granted.
+      const missing = hosts.filter((h) => !allowed.has(h) && (h.startsWith("*.") || !hostAllowed(h)));
+      if (!missing.length) return { approved: true, answer: "already", allowed_hosts: [...allowed] };
+      const reason = clean(String(a.reason || "").replace(/\s+/g, " ").trim()).slice(0, 300) || "(no reason given)";
+      const taskId = crypto.randomUUID();
+      const id = ask("hosts", "A remote agent asks to let the shared browser reach:\n\n  " + missing.join("\n  ") + "\n\nIts reason: " + reason, { hosts: missing, taskId });
+      log("request " + id + ": " + missing.join(", ") + " - " + reason);
+      return { status: 202, taskId };
+    }) },
+  { path: "/define", description: "Add your own tool to this link, live: it opens a fresh page at `url` (default index.html), runs `js` with your call's body as `arg`, optionally screenshots, and closes the page. Body: {\"path\": \"/orbit_shots\", \"description\": \"...\", \"js\": \"<body of an async function>\", \"input_schema\": optional, \"url\": optional, \"width\"/\"height\"/\"scale\"/\"wait\": optional, \"screenshot\": false | true | {screenshot options}, \"keep\": false}. Re-fetch the tool list afterwards. Defining needs no approval; keep: true asks the user to keep it for future sessions. Redefining a path replaces it.",
+    input_schema: { type: "object", required: ["path", "description", "js"], properties: { path: { type: "string" }, description: { type: "string" }, js: { type: "string" }, input_schema: { type: "object" }, url: { type: "string" }, screenshot: {}, keep: { type: "boolean" } } },
+    handler: guard("define", async (a) => {
+      const why = define(a);
+      if (why) throw Object.assign(new Error(why), { code: "bad_tool" });
+      await syncTools();
+      let keep = null;
+      if (a.keep) { keep = "asked the user"; ask("keep", "A remote agent asks to keep its tool " + a.path + " for future shared sessions:\n\n" + clean(a.description.slice(0, 600)), { tool: pick(a) }); }
+      return { defined: a.path, keep, tools: [...defined.keys()] };
+    }) },
+  { path: "/undefine", description: "Remove an agent-defined tool for this session. Body: {\"path\": \"/orbit_shots\"}.",
+    handler: guard("undefine", async (a) => { const had = defined.delete(a.path); if (had) await syncTools(); return { removed: had, tools: [...defined.keys()] }; }) },
+];
+
+let PW = null;
+function agentsMd() {
+  return `# GPU browser on a Mac (aibox)
+
+A real Chromium with the Mac's GPU (Metal), shared with you by its owner. Use it to render WebGL/WebGPU (three.js and the like) and get screenshots back.
+
+Typical flow:
+1. \`GET /info\` - GPU, versions, what is allowed.
+2. \`POST /files\` - upload your page and assets; they are served at ${ORIGIN}/<path>. Bundle or inline your libraries: pages can reach no other host unless the owner allows it.
+3. \`POST /page\` with {"url": "index.html"} - opens it, returns a page id.
+4. \`POST /eval\` to drive the scene, \`POST /screenshot\` to get an image (base64 in \`data\`).
+5. \`POST /close\` when done.
+
+Network: pages reach only ${ORIGIN}/ (your uploads) and hosts the owner allowed${allowed.size ? " (now: " + [...allowed].join(", ") + ")" : " (none yet)"}. Private and local network addresses are never reachable. Blocked requests are listed under \`blocked\` in the next reply. To use a CDN or API, \`POST /request\` with the hosts and a one-line reason, then poll the returned task until the owner answers.
+
+Your own tools: \`POST /define\` turns a page script into a tool on this same link (no approval needed); re-fetch the tool list after.
+${defined.size ? "\nAgent-defined tools now: " + [...defined.keys()].join(", ") + "\n" : ""}
+Limits: request bodies 1 MiB (upload big files in base64 pieces with append), images about 2.8 MB, ${LIMITS.pages} open pages, calls time out after about ${Math.round(LIMITS.opMs / 1000)} s, idle pages close after 15 minutes. The link stops working when the owner stops sharing.
+`;
+}
+
+// ── start ────────────────────────────────────────────────────────────
+export async function start({ chromium, launchOptions = {}, relay, playwrightVersion = null, input = process.stdin }) {
+  chromiumRef = chromium; launchOpts = launchOptions; PW = playwrightVersion;
+  proxyPort = (await startProxy()).address().port;
+  // Control lines from aibox: hello | allow <host> | tool <base64 json> | answer <id> <choice>
+  readline.createInterface({ input }).on("line", (line) => { try {
+    const [cmd, x, y] = line.trim().split(/\s+/);
+    if (cmd === "hello") event("ctl-ok");
+    else if (cmd === "allow" && validHost(x)) allowed.add(x);
+    else if (cmd === "tool" && x) {
+      let d = null; try { d = JSON.parse(Buffer.from(x, "base64").toString("utf8")); } catch {}
+      const why = define(d, true); if (why) log("saved tool skipped: " + why); else syncTools();
+    } else if (cmd === "answer" && x) answer(x, ["allow", "always", "deny"].includes(y) ? y : "deny");
+  } catch (e) { log("control line failed: " + e.message); } });
+  await launch();
+  session = await connect({
+    baseUrl: relay, appId: "aibox-gpu-browser", appDescription: "Chromium with the Mac's GPU, for WebGL/WebGPU renders",
+    agentsMd: agentsMd(), tools: toolList(),
+    onSessionChanged: ({ tokensRemapped }) => { for (const url of Object.values(tokensRemapped || {})) event("link " + url); },
+  });
+  await syncTools();
+  const link = await session.mintAgentToken({ label: "aibox" });
+  event("link " + link.url);
+  // Ctrl-C and aibox's cleanup both signal us: end the session once, and
+  // make sure the relay heard it. close() only starts the socket's close, and
+  // exiting right after can drop the frame, leaving the link held (503) for
+  // the relay's grace period instead of dead; endSession confirms.
+  const stop = async () => {
+    if (stopping) return;
+    stopping = true;
+    const held = { baseUrl: relay, sessionId: session.sessionId, secret: session.resumeSecret };
+    session.close();
+    if (held.secret) await withTimeout(endSession(held), 3000, "end").catch(() => {});
+    await withTimeout(browser?.close() ?? Promise.resolve(), 3000, "browser close").catch(() => {});
+    process.exit(0);
+  };
+  for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"]) process.on(sig, stop);
+  return { session, link };
+}
+AIBOX_SHARE_MJS
+  _render_write README.md <<'EOF'
 # render - GPU browser server for aibox sessions
-Hidden, unprivileged macOS account created by `aibox browser setup`. No login
+Hidden, unprivileged macOS account created by `aibox browser`. No login
 password; used only via sudo. Its one job: run a Playwright browser server on
 the Mac so sandboxed aibox sessions (Docker in Colima) can render WebGL/WebGPU
 with the real GPU instead of SwiftShader.
@@ -1775,8 +2302,10 @@ Why a separate user: a Playwright browser can open file:// and read whatever
 its account can read. As render it sees /var/render and system files, never
 the home of the person running aibox (which setup makes chmod 700).
 Everything here is private to this account: node/ (official tarball),
-node_modules/ (Playwright), serve.js (the server), server.log, .pw-version.
+node_modules/ (Playwright, agent-socket SDK), serve.js (the server),
+share.mjs (`aibox browser --share`), .pw-version, .aibox-rev.
 Run:  aibox browser   (foreground, output on screen, Ctrl-C stops it)
+      aibox browser --share   (also prints a link for agents anywhere)
 It must run in its own launchd domain (sudo launchctl asuser <uid> ...),
 which aibox does; a plain sudo -u render makes Chrome die at startup.
 By hand:  cd / && sudo launchctl asuser $(id -u render) sudo -u render -H env PATH=/var/render/node/bin:/usr/bin:/bin bash -c "cd ~ && node serve.js"
@@ -1789,13 +2318,8 @@ then log in as "aibox render" via Fast User Switching and switch back.
 Update Playwright:  aibox browser setup   (reinstalls to latest)
 Remove everything:  stop the server (Ctrl-C), then
   sudo sysadminctl -deleteUser render; sudo rm -rf /var/render
-EOF'
-  if [[ -n "$auto" ]]; then
-    _ok "'${RENDER_USER}' is ready (Playwright $(cat "${RENDER_HOME}/.pw-version" 2>/dev/null))."
-    return 0
-  fi
-  _ok "'${RENDER_USER}' is ready (Playwright $(cat "${RENDER_HOME}/.pw-version" 2>/dev/null)). Start the server with: aibox browser"
-  _info "Optional, for several sessions rendering at once: give '${RENDER_USER}' a display session (see ${RENDER_HOME}/README.md)."
+EOF
+  printf '%s\n' "$BROWSER_REV" | _render_write .aibox-rev
 }
 # Runs only for the invocation whose server came up (BROWSER_UP): a second
 # `aibox browser` that lost the port race must not kill the first one.
@@ -1806,42 +2330,195 @@ _browser_cleanup() {
   # (the user exists for nothing else).
   pgrep -u "$RENDER_USER" >/dev/null 2>&1 && sudo pkill -u "$RENDER_USER" 2>/dev/null || true
 }
+
+# ── Sharing (--share): the same browser for agents anywhere ──────────
+# share.mjs (in render's home) holds an agent-socket link and enforces the
+# boundary. This side owns what persists and every approval: share.mjs
+# writes `@@aibox:<per-run key> <event>` lines to stdout (only lines with
+# the key count, so agent text echoed in logs can't fake one), and reads `allow <host>`,
+# `tool <base64 json>` and `answer <id> <allow|always|deny>` on its stdin, a
+# FIFO (~/.aibox/browser.ctl) that `aibox browser answer` can also write to.
+# Persistent state is plain files you can edit: ~/.aibox/share/allow (one
+# host per line) and ~/.aibox/share/tools/<name>.json.
+_valid_host() {
+  local re='^(\*\.)?([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,62}$'
+  [[ ${#1} -le 253 && "$1" =~ $re ]]
+}
+_b64d() { printf %s "$1" | base64 -D 2>/dev/null || printf %s "$1" | base64 -d; }
+_share_preload() {
+  echo hello
+  local h f
+  if [[ -f "${SHARE_DIR}/allow" ]]; then
+    while IFS= read -r h || [[ -n "$h" ]]; do
+      h="${h%%#*}"; h="${h//[[:space:]]/}"
+      [[ -n "$h" ]] || continue
+      if _valid_host "$h"; then echo "allow $h"; else echo "share: skipping '${h}' in ${SHARE_DIR}/allow (not a hostname)" >&2; fi
+    done < "${SHARE_DIR}/allow"
+  fi
+  for f in "${SHARE_DIR}"/tools/*.json; do
+    [[ -f "$f" ]] && echo "tool $(base64 < "$f" | tr -d '\n')"
+  done
+  return 0
+}
+# Kill a background dialog and everything under it (the osascript sits two
+# levels down, inside the $(...)). Kids are listed before the parent dies so
+# none is orphaned. Usually it already exited: never let set -e see that.
+_share_kill() {
+  local kids c
+  kids="$(pgrep -P "$1" 2>/dev/null || true)"
+  kill "$1" 2>/dev/null || true
+  for c in $kids; do _share_kill "$c"; done
+}
+_share_cleanup() {
+  local d
+  for d in ${SHARE_DIALOGS:-}; do _share_kill "${d#*:}"; done
+  [[ -n "${SHARE_PRELOAD:-}" ]] && _share_kill "$SHARE_PRELOAD"
+  exec 3>&- 2>/dev/null || true
+  rm -f "${CONFIG_DIR}/browser.ctl"
+}
+# One dialog per request, in the background so the server's output keeps
+# flowing. No GUI (ssh) → no answer here; `aibox browser answer` still works.
+_share_dialog() {
+  local id="$1" kind="$2" text="$3" buttons dflt cancel r c
+  if [[ "$kind" == hosts ]]; then
+    buttons='{"Deny", "Allow this session", "Always allow"}'; dflt="Allow this session"; cancel="Deny"
+  else
+    buttons='{"Session only", "Keep"}'; dflt="Keep"; cancel="Session only"
+  fi
+  r="$(osascript -e 'on run argv' \
+    -e "display dialog (item 1 of argv) with title \"aibox shared browser\" buttons ${buttons} default button \"${dflt}\" cancel button \"${cancel}\" with icon caution giving up after 600" \
+    -e 'end run' "$text" 2>&1)" || true
+  case "$r" in
+    *"gave up:true"*|*"(-128)"*) c=deny ;;
+    *"Always allow"*|*"returned:Keep"*) c=always ;;
+    *"Allow this session"*) c=allow ;;
+    *) return 0 ;;
+  esac
+  echo "answer ${id} ${c}" >&3 2>/dev/null || true
+}
+_share_event() {
+  local ev=() name
+  read -r -a ev <<< "$1"
+  case "${ev[0]:-}" in
+    ctl-ok) SHARE_CTL=1 ;;
+    link)
+      [[ "${ev[1]:-}" == https://* ]] || return 0
+      echo
+      _ok "Sharing. Paste this link into the agent's chat (copied to the clipboard):"
+      echo "    ${ev[1]}"
+      printf %s "${ev[1]}" | pbcopy 2>/dev/null || true
+      _info "Anyone with the link can use this browser until you stop (Ctrl-C). Pages reach only uploads and hosts you allow."
+      [[ -n "${SHARE_CTL:-}" ]] || _warn "The browser did not confirm its control channel: approvals and ${SHARE_DIR}/allow may not reach it."
+      echo ;;
+    ask)
+      local id="${ev[1]:-}" kind="${ev[2]:-}" text
+      [[ "$id" =~ ^[0-9a-f]{6}$ && ( "$kind" == hosts || "$kind" == keep ) ]] || return 0
+      text="$(_b64d "${ev[3]:-}" | tr -d '\000-\010\013-\037\177')"
+      echo; _warn "Request ${id} from the remote agent:"
+      printf '%s\n' "$text" | sed 's/^/    /'
+      if [[ "$kind" == hosts ]]; then
+        _info "Answer in the dialog, or here: aibox browser answer ${id} allow|always|deny"
+      else
+        _info "Answer in the dialog, or here: aibox browser answer ${id} always (keep) | deny (session only)"
+      fi
+      echo
+      ( _share_dialog "$id" "$kind" "$text" ) &
+      SHARE_DIALOGS="${SHARE_DIALOGS:-} ${id}:$!" ;;
+    done)
+      # Settled (dialog, terminal or timeout): close its dialog if still up.
+      local d keep=""
+      for d in ${SHARE_DIALOGS:-}; do
+        if [[ "${d%%:*}" == "${ev[1]:-}" ]]; then _share_kill "${d#*:}"; else keep="${keep} ${d}"; fi
+      done
+      SHARE_DIALOGS="$keep" ;;
+    persist-hosts)
+      mkdir -p "$SHARE_DIR"
+      local h
+      for h in "${ev[@]:1}"; do
+        _valid_host "$h" || continue
+        grep -qxF -- "$h" "${SHARE_DIR}/allow" 2>/dev/null || echo "$h" >> "${SHARE_DIR}/allow"
+      done
+      _ok "Always allowed (saved in ${SHARE_DIR}/allow): ${ev[*]:1}" ;;
+    persist-tool)
+      name="${ev[1]:-}"
+      [[ "$name" =~ ^[a-z0-9][a-z0-9_-]{0,63}$ ]] || return 0
+      mkdir -p "${SHARE_DIR}/tools"
+      _b64d "${ev[2]:-}" > "${SHARE_DIR}/tools/${name}.json"
+      _ok "Kept tool /${name} for future shares (${SHARE_DIR}/tools/${name}.json)" ;;
+  esac
+}
+_share_answer() {
+  local ctl="${CONFIG_DIR}/browser.ctl"
+  [[ "${1:-}" =~ ^[0-9a-f]{6}$ ]] && [[ "${2:-}" == allow || "${2:-}" == always || "${2:-}" == deny ]] \
+    || _die "Usage: aibox browser answer <id> allow|always|deny   (the id is in the request on the browser's terminal)"
+  [[ -p "$ctl" ]] && pgrep -u "$RENDER_USER" -f "node serve.js" >/dev/null 2>&1 \
+    || _die "No shared browser is running (start one with: aibox browser --share)."
+  echo "answer $1 $2" > "$ctl"
+  _ok "Sent: $2 for request $1 (the browser's terminal shows the result)."
+}
+
 # Foreground, like `aibox sessions`: the server's output (and Chromium's,
 # via DEBUG) stays on screen, Ctrl-C ends it, and the advertised URL is
-# withdrawn from every container on exit.
+# withdrawn from every container on exit. With "share", also an agent-socket
+# link for agents outside this Mac (cloud sessions, other chats).
 _browser_run() {
+  local share="${1:-}"
   # First run sets up on its own; `aibox browser setup` stays as the update
-  # path (latest Playwright and its Chromium).
+  # path (latest Playwright and its Chromium). A newer aibox rewrites only
+  # its own files.
   if [[ ! -f "${RENDER_HOME}/serve.js" ]]; then
     _info "First run: setting up the '${RENDER_USER}' user, node and Playwright (later updates: aibox browser setup)."
     _browser_setup auto
+  elif [[ "$(cat "${RENDER_HOME}/.aibox-rev" 2>/dev/null)" != "$BROWSER_REV" ]]; then
+    _info "Updating the browser server's files (sudo may ask for your password)..."
+    _browser_files
   fi
   pgrep -u "$RENDER_USER" -f "node serve.js" >/dev/null 2>&1 && _die "A GPU browser server is already running (another terminal?). Stop it there, or: sudo pkill -u ${RENDER_USER} -f 'node serve.js'"
   # The one thing standing between that browser's file:// and your files is
   # your home's mode; check it on every run, not only at setup.
   [[ "$(stat -f %Lp "$HOME")" == "700" ]] || _die "${HOME} is not mode 700, so the '${RENDER_USER}' browser could read it. Fix with: chmod 700 ~"
-  local ver line
+  local ver line cmd='DEBUG="pw:browser*" node serve.js 2>&1'
   ver="$(cat "${RENDER_HOME}/.pw-version" 2>/dev/null)"
   mkdir -p "${CONFIG_DIR}/host"
   _on_exit _browser_cleanup
-  _info "Starting the GPU browser server as '${RENDER_USER}' (sudo may ask for your password). Ctrl-C stops it."
+  if [[ -n "$share" ]]; then
+    local re='^https://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._/-]*)?$'
+    [[ "$SHARE_RELAY" =~ $re ]] || _die "share_relay in ${CONFIG_DIR}/config must be an https URL (got: ${SHARE_RELAY})"
+    local ctl="${CONFIG_DIR}/browser.ctl"
+    rm -f "$ctl" && mkfifo -m 600 "$ctl" || _die "Could not create ${ctl}"
+    exec 3<>"$ctl"
+    _on_exit _share_cleanup
+    SHARE_KEY="$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n')"
+    [[ ${#SHARE_KEY} -eq 24 ]] || _die "Could not read /dev/urandom"
+    cmd="AIBOX_SHARE=${SHARE_RELAY} AIBOX_SHARE_KEY=${SHARE_KEY} ${cmd}"
+    # In the background: a long allowlist or many saved tools must not
+    # block on the FIFO before the server starts reading it.
+    ( _share_preload >&3 ) &
+    SHARE_PRELOAD=$!
+    _info "Starting the GPU browser server as '${RENDER_USER}', shared through ${SHARE_RELAY} (sudo may ask for your password). Ctrl-C stops both."
+  else
+    _info "Starting the GPU browser server as '${RENDER_USER}' (sudo may ask for your password). Ctrl-C stops it."
+  fi
   # Process substitution, not a pipe: the loop must run in this shell so
   # BROWSER_UP reaches the exit hook, and macOS's bash 3.2 has no lastpipe.
   while IFS= read -r line; do
+    if [[ -n "${SHARE_KEY:-}" && "$line" == "@@aibox:${SHARE_KEY} "* ]]; then _share_event "${line#@@aibox:${SHARE_KEY} }"; continue; fi
     printf '%s\n' "$line"
     if [[ "$line" == *"Listening on ws://"* ]]; then
       BROWSER_UP=1
       printf '%s\n%s\n' "${line##*Listening on }" "$ver" | sed '1s/127\.0\.0\.1/host.docker.internal/' > "${CONFIG_DIR}/host/browser.url"
       _ok "Playwright ${ver}. Every container sees it at ~/.aibox/host/browser.url; CLAUDE.md tells sessions how."
     fi
-  done < <(_render_sh 'DEBUG="pw:browser*" node serve.js 2>&1')
+  done < <(if [[ -n "$share" ]]; then _render_sh "$cmd" <&3; else _render_sh "$cmd"; fi)
 }
 cmd_browser() {
   [[ "$(uname)" == "Darwin" ]] || _die "aibox browser is macOS-only: it runs a GPU browser on the Mac for sessions. On Linux, run a Playwright server with your GPU yourself and give sessions its URL."
   case "${1:-}" in
-    "")    _browser_run ;;
-    setup) _browser_setup ;;
-    *)     _die "Usage: aibox browser [setup]   (no argument runs the server in the foreground; Ctrl-C stops it)" ;;
+    "")              _browser_run ;;
+    --share|share)   _browser_run share ;;
+    setup)           _browser_setup ;;
+    answer)          shift; _share_answer "$@" ;;
+    *)               _die "Usage: aibox browser [--share | setup | answer <id> allow|always|deny]   (no argument runs the server in the foreground; Ctrl-C stops it)" ;;
   esac
 }
 
