@@ -44,8 +44,9 @@
 #   aibox browser [setup]     Playwright browser server on the Mac, with the
 #                             real GPU, that sessions connect to for WebGL/
 #                             WebGPU renders. Foreground; Ctrl-C stops it.
-#                             Runs as a hidden unprivileged user; `setup`
-#                             creates that user once. macOS only.
+#                             Runs as a hidden unprivileged user, created
+#                             on first run; `setup` updates Playwright.
+#                             macOS only.
 #   aibox rc-resume <id>      Make one past session of this project
 #                             drivable from claude.ai / the Claude app.
 #   aibox shell [cmd...]      zsh in the container. One argument runs as a
@@ -1637,18 +1638,21 @@ BROWSER_PORT=3145
 # is RENDER_HOME); an unrelated account of the same name is never used.
 _render_uid() {
   local uid home
-  uid="$(id -u "$RENDER_USER" 2>/dev/null)" || _die "No '${RENDER_USER}' user yet — run: aibox browser setup"
+  uid="$(id -u "$RENDER_USER" 2>/dev/null)" || _die "No '${RENDER_USER}' user yet — run: aibox browser"
   home="$(dscl . -read "/Users/${RENDER_USER}" NFSHomeDirectory 2>/dev/null | awk '{print $2}')"
   [[ "$home" == "$RENDER_HOME" ]] || _die "A '${RENDER_USER}' account exists but is not aibox's (home: ${home:-unknown}, expected ${RENDER_HOME}). Not touching it."
   printf %s "$uid"
 }
 # Run a shell string as the render user, in its launchd domain, from its
 # home, with its own node first on PATH. sudo asks for your password.
+# Launched from / : the caller's cwd is inside a mode-700 home render can't
+# enter, and bash complains (getcwd) before its own `cd ~` runs.
 _render_sh() {
   local uid; uid="$(_render_uid)"
-  sudo launchctl asuser "$uid" sudo -u "$RENDER_USER" -H env "PATH=${RENDER_HOME}/node/bin:/usr/bin:/bin" bash -c "cd ~ && $1"
+  ( cd / && sudo launchctl asuser "$uid" sudo -u "$RENDER_USER" -H env "PATH=${RENDER_HOME}/node/bin:/usr/bin:/bin" npm_config_update_notifier=false bash -c "cd ~ && $1" )
 }
 _browser_setup() {
+  local auto="${1:-}"
   if ! id -u "$RENDER_USER" >/dev/null 2>&1; then
     _info "Creating hidden user '${RENDER_USER}' (sudo asks for your password)..."
     sudo sysadminctl -addUser "$RENDER_USER" -fullName "aibox render" -shell /bin/zsh -home "$RENDER_HOME" >/dev/null 2>&1 \
@@ -1714,6 +1718,10 @@ Update Playwright:  aibox browser setup   (reinstalls to latest)
 Remove everything:  stop the server (Ctrl-C), then
   sudo sysadminctl -deleteUser render; sudo rm -rf /var/render
 EOF'
+  if [[ -n "$auto" ]]; then
+    _ok "'${RENDER_USER}' is ready (Playwright $(cat "${RENDER_HOME}/.pw-version" 2>/dev/null))."
+    return 0
+  fi
   _ok "'${RENDER_USER}' is ready (Playwright $(cat "${RENDER_HOME}/.pw-version" 2>/dev/null)). Start the server with: aibox browser"
   _info "Optional, for several sessions rendering at once: give '${RENDER_USER}' a display session (see ${RENDER_HOME}/README.md)."
 }
@@ -1730,7 +1738,12 @@ _browser_cleanup() {
 # via DEBUG) stays on screen, Ctrl-C ends it, and the advertised URL is
 # withdrawn from every container on exit.
 _browser_run() {
-  [[ -f "${RENDER_HOME}/serve.js" ]] || _die "Not set up yet — run: aibox browser setup"
+  # First run sets up on its own; `aibox browser setup` stays as the update
+  # path (latest Playwright and its Chromium).
+  if [[ ! -f "${RENDER_HOME}/serve.js" ]]; then
+    _info "First run: setting up the '${RENDER_USER}' user, node and Playwright (later updates: aibox browser setup)."
+    _browser_setup auto
+  fi
   pgrep -u "$RENDER_USER" -f "node serve.js" >/dev/null 2>&1 && _die "A GPU browser server is already running (another terminal?). Stop it there, or: sudo pkill -u ${RENDER_USER} -f 'node serve.js'"
   # The one thing standing between that browser's file:// and your files is
   # your home's mode; check it on every run, not only at setup.
