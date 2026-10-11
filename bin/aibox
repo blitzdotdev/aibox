@@ -1750,6 +1750,9 @@ _render_sh() {
 _browser_setup() {
   local auto="${1:-}"
   if ! id -u "$RENDER_USER" >/dev/null 2>&1; then
+    # No account yet, so a ${RENDER_HOME} that exists belongs to something
+    # else; the setup below would chown it and write into it.
+    [[ -e "$RENDER_HOME" ]] && _die "${RENDER_HOME} exists but there is no '${RENDER_USER}' user, so it isn't aibox's. Not touching it; move it aside if it's unused, then run: aibox browser"
     _info "Creating hidden user '${RENDER_USER}' (sudo asks for your password)..."
     sudo sysadminctl -addUser "$RENDER_USER" -fullName "aibox render" -shell /bin/zsh -home "$RENDER_HOME" >/dev/null 2>&1 \
       || _die "sysadminctl could not create the user."
