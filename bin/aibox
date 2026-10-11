@@ -1753,16 +1753,16 @@ _browser_run() {
   mkdir -p "${CONFIG_DIR}/host"
   _on_exit _browser_cleanup
   _info "Starting the GPU browser server as '${RENDER_USER}' (sudo may ask for your password). Ctrl-C stops it."
-  shopt -s lastpipe   # the loop runs in this shell, so BROWSER_UP reaches the exit hook
-  _render_sh 'DEBUG="pw:browser*" node serve.js 2>&1' | while IFS= read -r line; do
+  # Process substitution, not a pipe: the loop must run in this shell so
+  # BROWSER_UP reaches the exit hook, and macOS's bash 3.2 has no lastpipe.
+  while IFS= read -r line; do
     printf '%s\n' "$line"
     if [[ "$line" == *"Listening on ws://"* ]]; then
       BROWSER_UP=1
       printf '%s\n%s\n' "${line##*Listening on }" "$ver" | sed '1s/127\.0\.0\.1/host.docker.internal/' > "${CONFIG_DIR}/host/browser.url"
       _ok "Playwright ${ver}. Every container sees it at ~/.aibox/host/browser.url; CLAUDE.md tells sessions how."
     fi
-  done
-  shopt -u lastpipe
+  done < <(_render_sh 'DEBUG="pw:browser*" node serve.js 2>&1')
 }
 cmd_browser() {
   [[ "$(uname)" == "Darwin" ]] || _die "aibox browser is macOS-only: it runs a GPU browser on the Mac for sessions. On Linux, run a Playwright server with your GPU yourself and give sessions its URL."
