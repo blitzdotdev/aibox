@@ -1582,8 +1582,11 @@ function tick() {
     }
     // on-start entries: aibox checks a per-boot marker in the container and
     // runs them once; skipped quietly when docker or the container is down.
+    // The timeout must outlast onstart-check's own 180 s wait for the
+    // entrypoint (plus docker start): killed mid-wait, its docker exec would
+    // carry on, set the per-boot marker and launch nothing.
     for (const project of [...new Set(es.filter(e => e.when === "on-start").map(e => e.project))])
-      cp.spawnSync(AIBOX, ["onstart-check"], { cwd: project, stdio: "ignore", timeout: 120000 });
+      cp.spawnSync(AIBOX, ["onstart-check"], { cwd: project, stdio: "ignore", timeout: 300000 });
     const p = pendingToAsk()[0]; if (p) detach(["ask", p.id, p.hash]);
   } finally { try { fs.rmdirSync(lock); } catch (e) {} }
 }
