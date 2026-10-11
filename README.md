@@ -51,11 +51,11 @@ Works out of the box in Chrome, Edge, and Firefox (`*.localhost` resolves to loo
 Containers have no GPU, so headless Chromium inside renders WebGL in software. For real GPU renders (WebGL/WebGPU screenshots of a three.js scene, say), run a Playwright browser server **on the Mac** and let sessions connect to it:
 
 ```bash
-aibox browser setup    # once: a hidden, unprivileged user with its own node + Playwright (asks for sudo)
 aibox browser          # runs the server in the foreground; prints the ws URL; Ctrl-C stops it
+aibox browser setup    # update Playwright to latest (the first `aibox browser` sets up on its own)
 ```
 
-The browser runs as that user inside its own launchd domain, so it can read nothing of yours (setup also closes your home directory to other local users). While it runs, every container sees the URL and Playwright version in a read-only file, `~/.aibox/host/browser.url`, and the shared CLAUDE.md tells sessions how to use it: matching client version, a `Host` header, one shared Chromium with a context per session, pages served over HTTP (your dev servers reach it through the proxy URL). When you stop it the URL is withdrawn, and Claude asks you to start it again when a render needs the GPU. macOS only.
+The first run creates a hidden, unprivileged user with its own node and Playwright (it asks for sudo). The browser runs as that user inside its own launchd domain, so it can read nothing of yours (setup also closes your home directory to other local users). While it runs, every container sees the URL and Playwright version in a read-only file, `~/.aibox/host/browser.url`, and the shared CLAUDE.md tells sessions how to use it: matching client version, a `Host` header, one shared Chromium with a context per session, pages served over HTTP (your dev servers reach it through the proxy URL). When you stop it the URL is withdrawn, and Claude asks you to start it again when a render needs the GPU. macOS only.
 
 One Chromium quirk: without a display session for that user, closing the *last* open page crashes the browser. The server keeps one page of its own open for its lifetime so that never happens, and relaunches the browser on the same URL if it exits anyway. If you still see "browser exited" on its terminal, give `render` a display session once (`/var/render/README.md` has the command that sets a password; log that user in via Fast User Switching and switch straight back).
 
