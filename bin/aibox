@@ -41,6 +41,10 @@
 #                             cron on the host. `add`, `rm`, `approve`/`reject`
 #                             proposals that a Claude session wrote, `on`/
 #                             `off`, `log`. No args lists everything.
+#   aibox skill [...]         Claude skills shared by every project (they
+#                             live in the shared ~/.claude/skills). `add
+#                             <folder>` installs a folder with a SKILL.md,
+#                             `rm <name>` removes one; no args lists them.
 #   aibox rc-resume <id>      Make one past session of this project
 #                             drivable from claude.ai / the Claude app.
 #   aibox shell [cmd...]      zsh in the container. One argument runs as a
@@ -284,6 +288,14 @@ if [[ ! -L "$CM" ]] && ! grep -q 'aibox:schedule' "$CM" 2>/dev/null; then
 
 <!-- aibox:schedule -->
 - You cannot schedule anything yourself; the host runs approved jobs inside this container. To propose one: first write the prompt file (if any), then write `~/.aibox/proposals/<name>` (name: a-z, 0-9, dashes) with two lines: the schedule (`daily 08:00`, `weekdays 18:30`, `every 30m`, `every 2h`, or `on-start`) and either `claude <prompt-file>` (a self-contained prompt file in this project — it runs later as a fresh headless session with no memory of this chat, so put everything it needs in the file) or `run <shell command>` (one line, at most 200 chars). Then tell the user to approve it with `aibox schedule approve <name>` on their machine (a dialog also offers it on a Mac); the job's output lands in ~/.aibox/schedule.log there.
+NOTES
+  chown -h aibox:aibox "$CM" 2>/dev/null || true
+fi
+if [[ ! -L "$CM" ]] && ! grep -q 'aibox:shared' "$CM" 2>/dev/null; then
+  cat >> "$CM" <<'NOTES'
+
+<!-- aibox:shared -->
+- Every aibox project shares `~/.claude` (settings, CLAUDE.md, skills) and `~/.local/bin`; the rest of `~` is private to this project. To give all projects a skill, put it in `~/.claude/skills/<name>/SKILL.md`; to give them a tool, put a self-contained executable (a copy, not a symlink into this project's files, which other projects can't see) in `~/.local/bin`. Logins and config a tool keeps elsewhere in `~` stay per project. On the host, `aibox skill add <folder>` does the same for a skill.
 NOTES
   chown -h aibox:aibox "$CM" 2>/dev/null || true
 fi
@@ -1998,6 +2010,70 @@ SESSJS
     node "${CONFIG_DIR}/sessions-ui.js"
 }
 
+# ── Shared skills ────────────────────────────────────────────────
+# ~/.claude is the shared claude-cfg slice, so a skill in ~/.claude/skills/<name>/
+# is seen by every project's Claude. `aibox skill add` copies a skill folder from
+# the host into it (inside any container, copying into ~/.claude/skills does the
+# same). Runs as root in a throwaway helper: never follows a symlink planted in
+# the shared slice (every project can write there).
+cmd_skill() {
+  local sub="${1:-ls}"
+  [[ $# -gt 0 ]] && shift
+  _ensure_docker
+  docker volume inspect "$VOLUME" >/dev/null 2>&1 \
+    || _die "No ${VOLUME} volume yet — run aibox once first."
+  case "$sub" in
+    ls|list)
+      docker run --rm -v "${VOLUME}:/v:ro" "$HELPER_IMAGE" sh -c '
+        d=/v/shared/claude-cfg/skills
+        [ -d "$d" ] && [ ! -L "$d" ] || exit 0
+        for s in "$d"/*/; do
+          [ -f "${s}SKILL.md" ] || continue
+          n="${s%/}"; n="${n##*/}"
+          desc="$(sed -n "s/^description:[[:space:]]*//p" "${s}SKILL.md" | head -1 | cut -c1-90)"
+          printf "%-24s %s\n" "$n" "$desc"
+        done' ;;
+    add)
+      [[ $# -eq 1 ]] || _die "Usage: aibox skill add <folder containing SKILL.md>"
+      local src name
+      src="$(cd "$1" 2>/dev/null && pwd)" || _die "Not a folder: $1"
+      [[ -f "${src}/SKILL.md" ]] || _die "No SKILL.md in ${src}"
+      # Name from the SKILL.md frontmatter (what Claude registers it as), else the folder name.
+      name="$(awk 'NR==1 && !/^---/ {exit} /^---/ {n++; if (n==2) exit; next} n==1 && /^name:/ {sub(/^name:[ \t]*/, ""); gsub(/["'"'"'\r]/, ""); print; exit}' "${src}/SKILL.md")"
+      [[ -n "$name" ]] || name="$(basename "$src")"
+      [[ "$name" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]] \
+        || _die "Skill name must be lowercase letters, digits and dashes (got '${name}')."
+      docker run --rm -e "N=${name}" -v "${VOLUME}:/v" -v "${src}:/src:ro" "$HELPER_IMAGE" sh -c '
+        set -e
+        d=/v/shared/claude-cfg/skills
+        [ -L "$d" ] && { echo "refusing: $d is a symlink" >&2; exit 1; }
+        mkdir -p "$d"
+        tmp="$d/.$N.aibox-new"
+        rm -rf "$tmp"
+        cp -R /src "$tmp"
+        find "$tmp" -exec chown -h 1000:1000 {} +
+        rm -rf "$d/$N"
+        mv "$tmp" "$d/$N"
+        chown -h 1000:1000 "$d"' \
+        || _die "Could not install the skill (docker error above)."
+      _ok "Installed skill '${name}' for every project (~/.claude/skills/${name}). New Claude sessions pick it up." ;;
+    rm|remove)
+      [[ $# -eq 1 && "$1" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]] || _die "Usage: aibox skill rm <name>"
+      local rc=0
+      docker run --rm -e "N=$1" -v "${VOLUME}:/v" "$HELPER_IMAGE" sh -c '
+        d=/v/shared/claude-cfg/skills
+        [ -L "$d" ] && exit 2
+        [ -e "$d/$N" ] || [ -L "$d/$N" ] || exit 3
+        rm -rf "$d/$N"' || rc=$?
+      case "$rc" in
+        0) _ok "Removed skill '$1'." ;;
+        3) _die "No skill named '$1'. See: aibox skill ls" ;;
+        *) _die "Could not remove the skill (docker error above)." ;;
+      esac ;;
+    *) _die "Usage: aibox skill [ls | add <folder> | rm <name>]" ;;
+  esac
+}
+
 cmd_stop() {
   _ensure_docker
   if [[ "${1:-}" == "--all" ]]; then
@@ -2241,6 +2317,7 @@ case "$CMD" in
   serve)                cmd_serve "$@" ;;
   sessions)             cmd_sessions ;;
   schedule)             cmd_schedule "$@" ;;
+  skill|skills)         cmd_skill "$@" ;;
   onstart-check)        cmd_onstart_check ;;
   rc-resume)            cmd_rc_resume "$@" ;;
   shell)                cmd_shell "$@" ;;

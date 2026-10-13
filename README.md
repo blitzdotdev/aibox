@@ -67,6 +67,22 @@ Every job runs **inside that project's sandbox**: `claude` entries as a fresh he
 
 Ask Claude in any session to "summarize my open PRs every weekday morning" and it writes a **proposal** (`~/.aibox/proposals/<name>` inside its container, which is a host-side inbox) — nothing runs until you approve it: a dialog on your Mac shows exactly what would run (Approve / Reject / Later), or `aibox schedule approve <name>`, and every aibox run prints a reminder while proposals wait. Approval is tied to the reviewed contents, names are unique across projects, containers cannot write the registry, the registry cannot express a host command, and `aibox schedule off` stops the ticker without forgetting the entries.
 
+## Shared skills and tools
+
+Two parts of the home volume are shared by every project: `~/.claude` (Claude's settings, the user-level CLAUDE.md
+and **skills**) and `~/.local/bin`. So anything installed there once is available in every sandbox:
+
+- **Skills:** `aibox skill add ./path/to/my-skill` copies a folder containing a `SKILL.md` into the shared
+  `~/.claude/skills/<name>/` (the name comes from the SKILL.md frontmatter). New Claude sessions in any project
+  pick it up. `aibox skill` lists installed skills, `aibox skill rm <name>` removes one. From inside a container,
+  copying the folder into `~/.claude/skills/` does the same thing.
+- **Tools:** put a self-contained executable in `~/.local/bin` from inside any container. Use a copy, not a
+  symlink into a project directory (other projects don't mount it).
+
+A tool's own login or config elsewhere in `~` (e.g. `~/.config/<tool>`) stays private to the project that
+created it, so each project signs in separately. That keeps credentials per project. The shared CLAUDE.md
+explains these locations to Claude, so you can also just ask a session to "install this skill for every project".
+
 ## Backup & restore
 
 Everything worth keeping is in one volume, so backup is one file:
@@ -104,6 +120,7 @@ Sessions merge file-by-file (nothing is ever overwritten or deleted; sources are
 | `aibox serve` | Sessions UI in the container: start new phone/claude.ai-drivable sessions, resume past ones, stop live ones. `aibox serve stop` ends the UI and every live session of this project |
 | `aibox sessions` | All projects' sessions on one local page (host-side, loopback-only, foreground). Buttons per session: open in Ghostty/Terminal, copy the resume command, or send to your phone |
 | `aibox schedule [add\|rm\|approve\|reject\|on\|off\|log]` | Jobs that run inside project sandboxes on a schedule or on container start; no args lists them with next/last run and pending proposals. See [Scheduled jobs](#scheduled-jobs) |
+| `aibox skill [add <folder>\|rm <name>]` | Claude skills shared by every project; no args lists them. See [Shared skills and tools](#shared-skills-and-tools) |
 | `aibox shell [cmd]` | zsh in the container, or run a one-off command |
 | `aibox stop [--all]` | Stop this project's container (`--all`: everything incl. proxy). Loses nothing |
 | `aibox status` | Containers with live memory + disk use, dev URLs, Docker disk totals, home volume size |
