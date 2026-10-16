@@ -5,39 +5,13 @@ on:
 jobs:
   mac:
     runs-on: macos-latest
-    timeout-minutes: 25
+    timeout-minutes: 20
     steps:
       - uses: actions/setup-node@v4
         with: { node-version: '22' }
-      - name: Which way of starting Chromium as an account with no window-server session survives a closed context, and gets Metal?
+      - name: aibox's new server (headless shell + Metal, launchctl asuser, no-display account) with two clients
         run: |
           set +e
-          mkdir -p /tmp/diag && cd /tmp/diag && npm i --no-save --silent playwright-core@1.64.0
-          PLAYWRIGHT_BROWSERS_PATH=/tmp/diag-browsers npx playwright-core install chromium chromium-headless-shell >/dev/null 2>&1
-          chmod -R a+rX /tmp/diag /tmp/diag-browsers
-          cat > t.mjs <<'EOF'
-          process.env.DEBUG = "pw:browser"
-          const errs = []
-          process.stderr.write = (c) => { for (const l of String(c).split("\n")) if (/ERROR|FATAL|Check failed|signal|exception/i.test(l) && !/cv_display_link|dbus|dock_plist|mach_vm_read/.test(l) && errs.length < 6) errs.push(l.slice(0, 220)); return true }
-          const { chromium } = await import("/tmp/diag/node_modules/playwright-core/index.mjs")
-          const [channel, ...args] = process.argv.slice(2)
-          const out = []
-          try {
-            const b = await chromium.launch({ channel, headless: true, args })
-            let gone = false; b.on("disconnected", () => { gone = true })
-            const keep = await (await b.newContext()).newPage()
-            const ren = async (p) => p.evaluate(() => { const g = document.createElement("canvas").getContext("webgl2"); const e = g && g.getExtension("WEBGL_debug_renderer_info"); return e ? g.getParameter(e.UNMASKED_RENDERER_WEBGL) : String(!!g) })
-            const c = await b.newContext(); const p = await c.newPage(); const r = await ren(p)
-            const p2 = await c.newPage(); await p2.close()            // close one page, context stays
-            await new Promise((r) => setTimeout(r, 1500))
-            const afterPage = gone
-            await c.close()                                            // close a whole context
-            await new Promise((r) => setTimeout(r, 2500))
-            out.push((gone ? "FAIL" : "ok") + " | page.close: " + (afterPage ? "crash" : "ok") + " | context.close: " + (gone ? "crash" : "ok") + " | renderer: " + r)
-            if (!gone) await b.close()
-          } catch (e) { out.push("FAIL launch: " + String(e.message).split("\n")[0]) }
-          console.log(out.join("\n")); for (const l of errs) console.log("   ", l)
-          EOF
           uid=4501; while dscl /Search -search /Users UniqueID $uid 2>/dev/null | grep -q .; do uid=$((uid+1)); done
           sudo dscl . -create /Users/diaguser
           sudo dscl . -create /Users/diaguser UniqueID $uid
@@ -46,32 +20,46 @@ jobs:
           sudo dscl . -create /Users/diaguser NFSHomeDirectory /tmp/diaghome
           sudo mkdir -p /tmp/diaghome && sudo chown $uid:20 /tmp/diaghome
           node=$(command -v node)
-          ENVV="env PLAYWRIGHT_BROWSERS_PATH=/tmp/diag-browsers TMPDIR=/tmp/diaghome"
-          run() { echo "== $1"; shift; (cd / && "$@" $ENVV "$node" /tmp/diag/t.mjs "${T[@]}" 2>&1 | tail -8); }
-          GPU="--use-angle=metal --enable-gpu --ignore-gpu-blocklist"
-          T=(chromium);                         run "A asuser, chromium (aibox today)" sudo launchctl asuser $uid sudo -u diaguser -H
-          T=(chromium);                         run "B plain sudo -u, chromium" sudo -u diaguser -H
-          T=(chromium-headless-shell);          run "C asuser, headless shell" sudo launchctl asuser $uid sudo -u diaguser -H
-          T=(chromium-headless-shell $GPU);     run "D asuser, headless shell + metal flags" sudo launchctl asuser $uid sudo -u diaguser -H
-          T=(chromium-headless-shell --use-angle=metal); run "E asuser, headless shell + --use-angle=metal" sudo launchctl asuser $uid sudo -u diaguser -H
-          T=(chromium-headless-shell $GPU);     run "F plain sudo -u, headless shell + metal flags" sudo -u diaguser -H
-          T=(chromium);                         run "G bsexec 1 (system bootstrap), chromium" sudo launchctl bsexec 1 sudo -u diaguser -H
-          T=(chromium-headless-shell $GPU);     run "H bsexec 1, headless shell + metal flags" sudo launchctl bsexec 1 sudo -u diaguser -H
-          # I: a LaunchDaemon in the system domain with UserName (no asuser at all)
-          for v in "chromium" "chromium-headless-shell --use-angle=metal --enable-gpu --ignore-gpu-blocklist"; do
-            echo "== I LaunchDaemon UserName=diaguser: $v"
-            args=""; for a in $v; do args="$args<string>$a</string>"; done
-            sudo tee /Library/LaunchDaemons/diag.browser.plist >/dev/null <<PL
-          <?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0"><dict><key>Label</key><string>diag.browser</string><key>UserName</key><string>diaguser</string>
-          <key>WorkingDirectory</key><string>/</string>
-          <key>EnvironmentVariables</key><dict><key>PLAYWRIGHT_BROWSERS_PATH</key><string>/tmp/diag-browsers</string><key>TMPDIR</key><string>/tmp/diaghome</string><key>HOME</key><string>/tmp/diaghome</string></dict>
-          <key>ProgramArguments</key><array><string>$node</string><string>/tmp/diag/t.mjs</string>$args</array>
-          <key>StandardOutPath</key><string>/tmp/diaghome/daemon.out</string><key>StandardErrorPath</key><string>/tmp/diaghome/daemon.err</string></dict></plist>
-          PL
-            sudo rm -f /tmp/diaghome/daemon.out; sudo launchctl bootstrap system /Library/LaunchDaemons/diag.browser.plist
-            for i in $(seq 1 40); do sudo test -s /tmp/diaghome/daemon.out && sudo grep -qE "^(ok|FAIL)" /tmp/diaghome/daemon.out && break; sleep 1; done
-            sudo cat /tmp/diaghome/daemon.out | tail -8; sudo tail -3 /tmp/diaghome/daemon.err
-            sudo launchctl bootout system/diag.browser 2>/dev/null; sudo rm -f /Library/LaunchDaemons/diag.browser.plist
-          done
-          sw_vers
+          # The account's own install, the way aibox setup does it.
+          sudo -u diaguser -H bash -c 'cd ~ && npm init -y >/dev/null && npm i --silent @playwright/test@1.64.0 >/dev/null && npx playwright install chromium >/dev/null 2>&1 && ls Library/Caches/ms-playwright'
+          sudo -u diaguser -H tee /tmp/diaghome/serve.js >/dev/null <<'EOF'
+          const { chromium } = require("@playwright/test");
+          const wsPath = "/" + require("crypto").randomBytes(8).toString("hex");
+          const fatal = e => { console.error(e); process.exit(1); };
+          async function serve() {
+            const s = await chromium.launchServer({ channel: "chromium-headless-shell", headless: true, args: ["--use-angle=metal"],
+              host: "127.0.0.1", port: 3145, wsPath });
+            console.log("Listening on " + s.wsEndpoint());
+            s.on("close", () => { console.log(new Date().toISOString() + " browser exited - relaunching"); setTimeout(() => serve().catch(fatal), 1000); });
+          }
+          serve().catch(fatal);
+          EOF
+          (cd / && sudo launchctl asuser $uid sudo -u diaguser -H env PATH=$(dirname $node):/usr/bin:/bin bash -c 'cd ~ && DEBUG=pw:browser node serve.js' > /tmp/server.log 2>&1 &)
+          for i in $(seq 1 60); do grep -q "Listening on" /tmp/server.log && break; sleep 1; done
+          url=$(grep -o 'ws://[^ ]*' /tmp/server.log | head -1); echo "server: $url"
+          mkdir -p /tmp/cl && cd /tmp/cl && npm i --silent --no-save playwright-core@1.64.0 >/dev/null
+          cat > c.mjs <<'EOF'
+          import { chromium } from "playwright-core"
+          const url = process.argv[2]
+          const probe = (p) => p.evaluate(async () => {
+            const g = document.createElement("canvas").getContext("webgl2"); const e = g && g.getExtension("WEBGL_debug_renderer_info")
+            const gl = e ? g.getParameter(e.UNMASKED_RENDERER_WEBGL) : String(!!g)
+            let gpu = "no navigator.gpu"; if (navigator.gpu) { const a = await navigator.gpu.requestAdapter(); gpu = a ? "adapter ok" + (a.info ? " (" + (a.info.vendor || "") + " " + (a.info.architecture || "") + ")" : "") : "no adapter" }
+            return gl + " | WebGPU: " + gpu })
+          const a = await chromium.connect(url), b = await chromium.connect(url)
+          let bGone = false; b.on("disconnected", () => { bGone = true })
+          const bc = await b.newContext(), bp = await bc.newPage(); await bp.goto("about:blank")
+          console.log("B before:", await probe(bp))
+          for (let round = 1; round <= 3; round++) {
+            const ac = await a.newContext(), ap = await ac.newPage(); console.log("A round " + round + ":", await probe(ap))
+            const ap2 = await ac.newPage(); await ap2.close(); await ap.close(); await ac.close()
+            await new Promise((r) => setTimeout(r, 1500))
+            console.log("after A closed page+context (round " + round + "): B " + (bGone ? "DISCONNECTED" : "still connected"))
+          }
+          await a.close(); await new Promise((r) => setTimeout(r, 1500))
+          console.log("after A disconnected: B " + (bGone ? "DISCONNECTED" : "still connected"))
+          try { console.log("B after:", await probe(bp)); console.log(bGone ? "RESULT: FAIL" : "RESULT: PASS") } catch (e) { console.log("RESULT: FAIL B broken:", e.message.split("\n")[0]) }
+          await b.close()
+          EOF
+          node c.mjs "$url" 2>&1 | tail -20
+          echo "--- server log (relaunches / signals):"; grep -E "Listening|exited|signal|SIG" /tmp/server.log | tail -10
