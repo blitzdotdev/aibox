@@ -49,6 +49,15 @@
 #                             macOS only.
 #   aibox rc-resume <id>      Make one past session of this project
 #                             drivable from claude.ai / the Claude app.
+#   aibox recover [--rc] [--detached]
+#                             Reopen every session (all projects) that a
+#                             VM crash or Docker restart cut off, each in
+#                             its own terminal window — or, with
+#                             --detached, as a remote-control session
+#                             with no window. --rc turns on remote control
+#                             in the windows too. Lists them and asks
+#                             first (--yes skips; --list only lists;
+#                             --forget drops the list).
 #   aibox shell [cmd...]      zsh in the container. One argument runs as a
 #                             shell string (pipes/globs work); several run
 #                             as a safely-quoted command.
@@ -196,10 +205,17 @@ _unlock() {
 _ensure_docker() {
   command -v docker >/dev/null 2>&1 \
     || _die "docker CLI not found. Install a runtime first, e.g.: brew install colima docker && colima start"
+  _disk_warn
   docker info >/dev/null 2>&1 && return 0
+  local hung=""
   if command -v colima >/dev/null 2>&1; then
     _info "Docker daemon not running. Starting Colima..."
-    colima start
+    # "already running" with no daemon: the VM is wedged (e.g. it hit a full
+    # disk and macOS's Virtualization framework put it in an error state).
+    local out; out="$(mktemp)"
+    colima start 2>&1 | tee "$out" >&2 || true
+    grep -q 'already running' "$out" && hung=1
+    rm -f "$out"
   elif [[ -d /Applications/OrbStack.app ]]; then
     _info "Docker daemon not running. Starting OrbStack..."
     open -a OrbStack
@@ -209,11 +225,25 @@ _ensure_docker() {
   else
     _die "Docker daemon not running. Start it (Linux: sudo systemctl start docker; macOS: open your Docker app) and retry."
   fi
-  local i=0
+  local i=0 limit=60   # seconds; a VM that says it's already up gets less
+  [[ -n "$hung" ]] && limit=10
   until docker info >/dev/null 2>&1; do
-    (( i++ >= 60 )) && _die "Docker daemon did not come up. Try again in a moment."   # 60s
+    if (( i++ >= limit )); then
+      [[ -n "$hung" ]] && _die "Colima says its VM is running, but Docker inside it doesn't answer — the VM is stuck. Restart it (containers, sessions and files are kept): colima stop -f && colima start"
+      _die "Docker daemon did not come up. Try again in a moment."
+    fi
     sleep 1
   done
+}
+
+# Colima's VM (and with it every session) dies when the Mac's disk fills:
+# its disk image grows as containers write. Warn while there is still room.
+_disk_warn() {
+  local kb
+  kb="$(df -Pk "$HOME" 2>/dev/null | awk 'NR==2 {print $4}')"
+  [[ "$kb" =~ ^[0-9]+$ ]] || return 0
+  (( kb < 20 * 1024 * 1024 )) && _warn "Only $(( kb / 1024 / 1024 )) GB free on this disk. Docker's VM stops — and every session with it — when the disk fills up. Free some space (docker system df shows what Docker holds)."
+  return 0
 }
 
 # ── Image ────────────────────────────────────────────────────────
@@ -280,15 +310,91 @@ chown -h aibox:aibox /home/aibox/.claude/settings.json 2>/dev/null || true
 # hooks mark every prompt and tool call in the project's inbox instead, and
 # `aibox` on the Mac holds the assertion while the mark is fresh (see
 # _awake_watch). Managed settings: the user's own settings.json stays theirs.
+#
+# Recovery: the session hooks keep one file per running interactive session
+# in the inbox's .live/ (named by session id; see aibox-live below). A
+# session that ends normally removes its file, so whatever is still there
+# when this container starts again was cut off — VM crash, Docker restart —
+# and moves to .live/cut/, which `aibox recover` on the Mac reopens. Only
+# this container's own entries move: a --copy container mounts the same
+# inbox.
 mkdir -p /etc/claude-code
 cat > /etc/claude-code/managed-settings.json <<'JSON'
 {
   "hooks": {
-    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "touch \"$HOME/.aibox/proposals/.active\"" }] }],
-    "PostToolUse": [{ "hooks": [{ "type": "command", "command": "touch \"$HOME/.aibox/proposals/.active\"" }] }]
+    "UserPromptSubmit": [{ "hooks": [
+      { "type": "command", "command": "touch \"$HOME/.aibox/proposals/.active\"" },
+      { "type": "command", "command": "/usr/local/bin/aibox-live busy" }] }],
+    "PostToolUse": [{ "hooks": [{ "type": "command", "command": "touch \"$HOME/.aibox/proposals/.active\"" }] }],
+    "Stop": [{ "hooks": [{ "type": "command", "command": "/usr/local/bin/aibox-live idle" }] }],
+    "SessionStart": [{ "hooks": [{ "type": "command", "command": "/usr/local/bin/aibox-live start" }] }],
+    "SessionEnd": [{ "hooks": [{ "type": "command", "command": "/usr/local/bin/aibox-live end" }] }]
   }
 }
 JSON
+cat > /usr/local/bin/aibox-live <<'LIVE'
+#!/bin/bash
+# Claude Code hook (managed settings, written by aibox's entrypoint). Keeps
+# ~/.aibox/proposals/.live/<session-id> — on the Mac that is
+# ~/.aibox/inbox/<project>/.live/ — so `aibox recover` can reopen sessions
+# a crash cut off. start: the session runs (also after /clear or /resume,
+# which switch ids); end: it exited normally; busy/idle: mid-task or not.
+# Silent and always exits 0: hook output would reach the session.
+exec >/dev/null 2>&1
+umask 077
+d="$HOME/.aibox/proposals/.live"
+id="$(head -c 65536 | jq -r '.session_id // empty')"
+[[ "$id" =~ ^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$ ]] || exit 0
+case "${1:-}" in
+  start)
+    [[ "${AIBOX_CONTAINER:-}" =~ ^aibox-[a-z0-9_-]+$ ]] || exit 0
+    # The claude process: the nearest ancestor whose argv[0] is claude.
+    p=$PPID args=()
+    for _ in 1 2 3 4 5; do
+      mapfile -d '' args < "/proc/$p/cmdline" || exit 0
+      [[ "${args[0]##*/}" == claude ]] && break
+      args=()
+      p="$(ps -o ppid= -p "$p" | tr -d ' ')"
+      [[ "$p" =~ ^[0-9]+$ && "$p" -gt 1 ]] || exit 0
+    done
+    [[ ${#args[@]} -gt 0 ]] || exit 0
+    yolo=0 rc=0 detached=0
+    for a in "${args[@]:1}"; do
+      case "$a" in
+        -p|--print) exit 0 ;;   # one-shot runs (scheduled jobs) are not sessions to reopen
+        --dangerously-skip-permissions) yolo=1 ;;
+        --remote-control|--remote-control=*) rc=1 ;;
+      esac
+    done
+    # Started detached (sessions UI, rc-resume): claude runs under `script`
+    # (directly, or via the shell script -c starts).
+    q=$p
+    for _ in 1 2; do
+      q="$(ps -o ppid= -p "$q" | tr -d ' ')"
+      [[ "$q" =~ ^[0-9]+$ && "$q" -gt 1 ]] || break
+      [[ "$(ps -o comm= -p "$q")" == script ]] && { detached=1; break; }
+    done
+    mkdir -p "$d" || exit 0
+    printf 'ctr=%s\nyolo=%s\nrc=%s\ndetached=%s\n' "$AIBOX_CONTAINER" "$yolo" "$rc" "$detached" > "$d/.$id.tmp" \
+      && mv -f "$d/.$id.tmp" "$d/$id"
+    # Reopened by hand after a crash: no longer one to recover.
+    rm -f "$d/$id.busy" "$d/cut/$id" "$d/cut/$id.busy" ;;
+  end)  rm -f "$d/$id" "$d/$id.busy" ;;
+  busy) [[ -f "$d/$id" ]] && : > "$d/$id.busy" ;;
+  idle) rm -f "$d/$id.busy" ;;
+esac
+exit 0
+LIVE
+chmod 755 /usr/local/bin/aibox-live
+# As aibox, like the hooks: files root made in the inbox would be root's on
+# a Linux host, and neither the hooks nor `aibox recover` could remove them.
+[[ "${AIBOX_CONTAINER:-}" =~ ^aibox-[a-z0-9_-]+$ ]] && runuser -u aibox -- bash -c '
+  live=/home/aibox/.aibox/proposals/.live
+  for f in "$live"/*; do
+    [[ -f "$f" && ! -L "$f" && "${f##*/}" =~ ^[0-9a-f-]{36}$ ]] || continue
+    grep -qx "ctr=$1" "$f" || continue
+    mkdir -p "$live/cut" && mv -f "$f" "$live/cut/" && { [[ ! -f "$f.busy" ]] || mv -f "$f.busy" "$live/cut/"; }
+  done' aibox-live-cut "$AIBOX_CONTAINER" 2>/dev/null || true
 # Teach every session how to find and revive this project's past sessions.
 CM=/home/aibox/.claude/CLAUDE.md
 if [[ ! -L "$CM" ]] && ! grep -q 'aibox:sessions' "$CM" 2>/dev/null; then
@@ -561,6 +667,7 @@ _docker_run() {
     -v "${CONFIG_DIR}/host:/home/aibox/.aibox/host:ro" \
     -w "$PROJECT_DIR" \
     -e CLAUDE_CONFIG_DIR=/home/aibox/.claude \
+    -e "AIBOX_CONTAINER=${CONTAINER}" \
     -l "aibox.path=${PROJECT_DIR}" \
     -l "aibox.layout=4" \
     "$@" "$IMAGE"
@@ -914,6 +1021,7 @@ _ensure_all() {
     _ok "Container ready. Dev servers: $(_dev_url)"
   fi
   _remind_proposals
+  _remind_recover
 }
 
 # ── exec plumbing ────────────────────────────────────────────────
@@ -1025,7 +1133,13 @@ cmd_run() {
     local perm_flag=--allow-dangerously-skip-permissions
     [[ "$yolo" == "true" ]] && perm_flag=--dangerously-skip-permissions
     set -- "${args[@]}"; shift   # program args without the leading "claude"
-    _dexec claude "$perm_flag" "$@"
+    local rc=0
+    _dexec claude "$perm_flag" "$@" || rc=$?
+    # Killed with its container (VM crash, docker kill), Claude never
+    # restores the terminal: focus reports and its keyboard mode keep
+    # arriving as ^[[I, 9;5u... at the shell prompt. Undo them.
+    [[ "$rc" -ne 0 && -t 1 ]] && printf '\e[<u\e[?1004l\e[?2004l\e[?1000l\e[?1002l\e[?1003l\e[?1006l\e[?25h'
+    return "$rc"
   else
     _dexec "${args[@]}"
   fi
@@ -1309,6 +1423,167 @@ cmd_rc_resume() {
   docker exec -d -u aibox -w "$PROJECT_DIR" "$CONTAINER" \
     script -qfc "claude --resume $1 --remote-control" /dev/null
   _ok "Session registering — it appears in the claude.ai / Claude app list shortly."
+}
+
+# ── Recover: reopen sessions a crash cut off ─────────────────────
+# The containers' session hooks keep ~/.aibox/inbox/<hash6>/.live/<id> per
+# running session (see aibox-live in the entrypoint); a container start
+# moves its leftovers to .live/cut/. Cut off = in cut/, or still in .live/
+# while the container that wrote it isn't running. The inbox is writable
+# from the container, so everything read here is validated, symlinks are
+# skipped, and the project path comes from the host-written <hash6>.path,
+# never from the entry.
+#
+# Prints one line per cut-off session:
+#   <entry file>|<project dir>|<session id>|<yolo>|<rc>|<detached>|<busy>
+_live_cut() {
+  local inbox="${CONFIG_DIR}/inbox" running h dir project f id k v ctr yolo rc det busy seen=" "
+  [[ -d "$inbox" ]] || return 0
+  running=" $(docker ps --filter label=aibox.slug --format '{{.Names}}' 2>/dev/null | tr '\n' ' ')"
+  for dir in "$inbox"/*/.live "$inbox"/*/.live/cut; do
+    [[ -d "$dir" && ! -L "$dir" && ! -L "${dir%/cut}" ]] || continue
+    h="${dir#"$inbox"/}"; h="${h%%/*}"
+    project="$(head -c 4096 "${inbox}/${h}.path" 2>/dev/null)" || continue
+    [[ -n "$project" && -d "$project" ]] || continue
+    for f in "$dir"/*; do
+      id="${f##*/}"
+      [[ "$id" =~ ^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$ && -f "$f" && ! -L "$f" ]] || continue
+      [[ "$seen" == *" $id "* ]] && continue
+      ctr="" yolo=0 rc=0 det=0
+      while IFS='=' read -r k v; do
+        case "$k" in
+          ctr)      [[ "$v" =~ ^aibox-[a-z0-9_-]+$ ]] && ctr="$v" ;;
+          yolo)     [[ "$v" == 1 ]] && yolo=1 ;;
+          rc)       [[ "$v" == 1 ]] && rc=1 ;;
+          detached) [[ "$v" == 1 ]] && det=1 ;;
+        esac
+      done < <(head -c 1024 "$f")
+      [[ -n "$ctr" ]] || continue
+      # A --copy container's session belongs to its snapshot, which is gone
+      # with the container; reopening it against the real project would
+      # hand it the bind mount it never had.
+      if [[ "$ctr" == *-copy-* ]]; then
+        [[ "$running" == *" $ctr "* ]] || rm -f "$f" "$f.busy"
+        continue
+      fi
+      [[ "$dir" == */cut || "$running" != *" $ctr "* ]] || continue
+      busy=0; [[ -f "$f.busy" ]] && busy=1
+      seen+="$id "
+      printf '%s|%s|%s|%s|%s|%s|%s\n' "$f" "$project" "$id" "$yolo" "$rc" "$det" "$busy"
+    done
+  done
+}
+
+# One-line nudge on ordinary runs. Counts only .live/cut/ (a find, no
+# docker calls): containers restart with Docker (--restart unless-stopped),
+# and their entrypoint files the leftovers there.
+_remind_recover() {
+  [[ -n "${AIBOX_RECOVERING:-}" ]] && return 0   # a window `aibox recover` opened
+  local n
+  n="$(find "${CONFIG_DIR}/inbox" -mindepth 4 -maxdepth 4 -path '*/.live/cut/*' -type f ! -name '*.busy' 2>/dev/null | wc -l | tr -d ' ' || true)"
+  [[ "${n:-0}" -gt 0 ]] && _info "${n} session(s) were cut off when Docker or the VM stopped — reopen them all with: aibox recover"
+  return 0
+}
+
+# A deliberate `aibox stop` ends sessions on purpose: drop their recovery
+# entries (all of them with an empty argument) so they aren't offered back.
+_live_forget() {
+  local dir f
+  for dir in "${CONFIG_DIR}"/inbox/*/.live "${CONFIG_DIR}"/inbox/*/.live/cut; do
+    [[ -d "$dir" && ! -L "$dir" && ! -L "${dir%/cut}" ]] || continue
+    for f in "$dir"/*; do
+      [[ -f "$f" && ! -L "$f" && "${f##*/}" =~ ^[0-9a-f-]{36}$ ]] || continue
+      [[ -z "$1" ]] || grep -qx "ctr=$1" "$f" 2>/dev/null || continue
+      rm -f "$f" "$f.busy"
+    done
+  done
+}
+
+# The terminal app to open sessions in: the one aibox runs in when it can
+# run a .command file, else Ghostty if installed, else Terminal.
+_terminal_app() {
+  case "${TERM_PROGRAM:-}" in
+    ghostty)        echo Ghostty; return ;;
+    iTerm.app)      echo iTerm; return ;;
+    Apple_Terminal) echo Terminal; return ;;
+  esac
+  [[ -d /Applications/Ghostty.app ]] && echo Ghostty || echo Terminal
+}
+
+cmd_recover() {
+  local mode="" rc_all=false yes=false list=false forget=false a
+  for a in "$@"; do
+    case "$a" in
+      --detached) mode=detached ;;
+      --rc)       rc_all=true ;;
+      -y|--yes)   yes=true ;;
+      --list)     list=true ;;
+      --forget)   forget=true ;;
+      *) _die "Usage: aibox recover [--rc] [--detached] [--yes] [--list] [--forget]" ;;
+    esac
+  done
+  _ensure_docker
+  local lines f project id yolo rc det busy n=0 how app
+  lines="$(_live_cut)"
+  if [[ -z "$lines" ]]; then
+    _ok "Nothing to reopen: no session was cut off. (Older sessions: aibox sessions)"
+    return 0
+  fi
+  if [[ "$forget" == "true" ]]; then
+    while IFS='|' read -r f _; do rm -f "$f" "$f.busy"; n=$((n+1)); done <<< "$lines"
+    _ok "Forgot ${n} cut-off session(s); their transcripts stay (aibox sessions lists them)."
+    return 0
+  fi
+  app="$(_terminal_app)"
+  [[ "$(uname)" == "Darwin" ]] || app=""
+  echo "Sessions cut off when their container stopped:"
+  while IFS='|' read -r f project id yolo rc det busy; do
+    n=$((n+1))
+    how="terminal"
+    [[ "$det" == 1 || "$mode" == detached ]] && how="detached, remote control"
+    [[ "$how" == terminal && ( "$rc" == 1 || "$rc_all" == "true" ) ]] && how="terminal, remote control"
+    [[ "$yolo" == 1 ]] && how+=", --yolo"
+    printf '  %-28s %s  %-9s (%s)\n' "$(basename "$project")" "${id:0:8}" "$([[ "$busy" == 1 ]] && echo mid-task || echo idle)" "$how"
+  done <<< "$lines"
+  [[ "$list" == "true" ]] && return 0
+  if [[ "$yes" != "true" ]]; then
+    _confirm "Reopen these ${n} session(s)?" || { _info "Left as is. Drop them from this list with: aibox recover --forget"; return 0; }
+  fi
+
+  # Build and container checks once, here, rather than in every new window
+  # at the same moment.
+  _ensure_image
+  local bin cmdfile dir="${CONFIG_DIR}/open" args opened=0 detached=0 printed=0
+  bin="$(_aibox_bin)"
+  mkdir -p "$dir"
+  while IFS='|' read -r f project id yolo rc det busy; do
+    if [[ "$det" == 1 || "$mode" == detached ]]; then
+      ( cd "$project" && AIBOX_RECOVERING=1 "$bin" rc-resume "$id" </dev/null ) && detached=$((detached+1)) || _warn "Could not reopen ${id} in ${project}"
+    else
+      args="--resume $(printf '%q' "$id")"
+      [[ "$yolo" == 1 ]] && args+=" --yolo"
+      [[ "$rc" == 1 || "$rc_all" == "true" ]] && args+=" --remote-control"
+      if [[ -n "$app" ]]; then
+        # One executable .command file per session, opened by the terminal
+        # app — the same launcher the sessions page uses. On failure it
+        # holds the window open so the error can be read.
+        cmdfile="${dir}/${id}.command"
+        printf '#!/bin/bash\ncd %q && AIBOX_RECOVERING=1 %q %s || { echo; echo "[exited $?] press Enter to close"; read -r _; }\n' \
+          "$project" "$bin" "$args" > "$cmdfile"
+        chmod 700 "$cmdfile"
+        open -a "$app" "$cmdfile" </dev/null && opened=$((opened+1)) || _warn "Could not open ${app} for ${id}"
+        sleep 0.5   # each window starts its own aibox; don't start them all in the same instant
+      else
+        [[ "$printed" == 0 ]] && echo "Run each in its own terminal:"
+        printf '  cd %q && aibox %s\n' "$project" "$args"
+        printed=$((printed+1))
+      fi
+    fi
+    rm -f "$f" "$f.busy"   # a reopened session registers itself again
+  done <<< "$lines"
+  [[ "$opened" -gt 0 ]] && _ok "Opened ${opened} session(s) in ${app}."
+  [[ "$detached" -gt 0 ]] && _ok "${detached} session(s) running detached — they appear in claude.ai and the Claude app shortly."
+  return 0
 }
 
 # ── Schedule (host-side jobs that run inside project sandboxes) ──
@@ -2359,11 +2634,13 @@ cmd_stop() {
     fi
     [[ -z "$names" ]] && { _info "No aibox containers running."; return 0; }
     echo "$names" | xargs docker stop >/dev/null
+    _live_forget ""
     _ok "Stopped: ${slugs}(state preserved)."
   elif [[ -n "${1:-}" ]]; then
     _die "Usage: aibox stop [--all]"
   elif [[ "$(_state "$CONTAINER")" == "running" ]]; then
     docker stop "$CONTAINER" >/dev/null
+    _live_forget "$CONTAINER"
     _ok "Stopped ${SLUG} (state preserved — run aibox to start it again)."
   else
     _info "Not running: ${SLUG}"
@@ -2616,6 +2893,7 @@ case "$CMD" in
   browser)              cmd_browser "$@" ;;
   onstart-check)        cmd_onstart_check ;;
   rc-resume)            cmd_rc_resume "$@" ;;
+  recover)              cmd_recover "$@" ;;
   shell)                cmd_shell "$@" ;;
   stop)                 cmd_stop "$@" ;;
   status)               cmd_status ;;

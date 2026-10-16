@@ -69,6 +69,18 @@ aibox serve
 
 runs a small sessions UI at `http://45789.<project>.aibox.localhost`. **New session** starts a fresh session you drive from claude.ai/code or the Claude phone app ([Remote Control](https://code.claude.com/docs/en/remote-control)); **Resume** brings any past session back the same way; live sessions show as such and can be stopped. Every session is one detached claude process inside the project's container — closing your terminal changes nothing, and registration is outbound-only HTTPS (no ports, nothing exposed). Any Claude session can pull the same tricks on request — the shared CLAUDE.md teaches it the commands, so you can also say "start me a new session" from your phone in any live chat. `aibox serve stop` ends the UI and every live session of this project. On a remote Linux box, reach the UI with `ssh -L 8080:127.0.0.1:80 host` and open the same URL with `:8080`; the phone side needs no tunnel at all.
 
+## After a crash
+
+If Docker's VM dies (a full Mac disk is the usual cause) or Docker restarts, every running session dies with it. The conversations are safe on disk, and
+
+```bash
+aibox recover
+```
+
+lists every session, across all projects, that was running at the time, and after you confirm, reopens each one with `--resume` in its own terminal window: the terminal you run it from if that's Ghostty, iTerm or Terminal, otherwise Ghostty if installed, else Terminal. Sessions that ran detached (`aibox serve`, `rc-resume`) come back detached, with Remote Control. `--rc` turns on Remote Control in the windows too, so you can carry on from the phone; `--detached` reopens everything without windows, as Remote Control sessions only; `--yes` skips the question; `--list` only lists; `--forget` drops the list. Sessions started with `--yolo` come back with it. The list shows which sessions were mid-task, but a reopened session waits for you; nothing is re-run on its own.
+
+How it knows: hooks in the container keep one small file per running interactive session in `~/.aibox/inbox/<project>/.live/`, removed when the session exits normally (`/clear` and `/resume` update it). When a container starts, it moves the leftovers to `.live/cut/`; any `aibox` run then reminds you they're there. `aibox stop` clears its project's list, since stopping is deliberate. Headless runs (`-p`, scheduled jobs) and `--copy` sessions aren't tracked. This tracking starts once a project's container has been recreated with this version, which happens on the next `aibox` run when nothing is running in it.
+
 ## Scheduled jobs
 
 ```bash
@@ -119,6 +131,7 @@ Sessions merge file-by-file (nothing is ever overwritten or deleted; sources are
 | `aibox run [--copy] <prog> [args]` | Run any program in the sandbox (e.g. `aibox run codex`). `--copy` works the same as above; the program's own flags pass through |
 | `aibox serve` | Sessions UI in the container: start new phone/claude.ai-drivable sessions, resume past ones, stop live ones. `aibox serve stop` ends the UI and every live session of this project |
 | `aibox sessions` | All projects' sessions on one local page (host-side, loopback-only, foreground). Buttons per session: open in Ghostty/Terminal, copy the resume command, or send to your phone |
+| `aibox recover [--rc] [--detached]` | Reopen every session a VM crash or Docker restart cut off, each in its own terminal window or detached with Remote Control. Lists them and asks first. See [After a crash](#after-a-crash) |
 | `aibox browser [setup]` | GPU-backed Playwright browser server on the Mac that sessions connect to; foreground, Ctrl-C stops it (see [GPU rendering](#gpu-rendering)). macOS only |
 | `aibox schedule [add\|rm\|approve\|reject\|on\|off\|log]` | Jobs that run inside project sandboxes on a schedule or on container start; no args lists them with next/last run and pending proposals. See [Scheduled jobs](#scheduled-jobs) |
 | `aibox shell [cmd]` | zsh in the container, or run a one-off command |
@@ -151,7 +164,9 @@ brew install colima docker && colima start --cpu 4 --memory 8
 
 Give the VM real memory: Colima's default is 2 GiB, shared by every container, and one forgotten headless browser or a couple of dev servers will starve Claude in it (it gets OOM-killed or hangs). Size it for your machine — e.g. `--memory 16` on a 24 GB Mac — and resize any time with `colima stop && colima start --memory N`. Docker's "legacy builder is deprecated" line during the image build is harmless; `brew install docker-buildx` (plus the symlink its install notes print) silences it.
 
-aibox auto-starts an installed-but-stopped runtime; it won't install one for you.
+Keep free space on the Mac's disk: the VM's disk image grows as containers write, and when the Mac's disk fills up, macOS stops the VM with every session in it. aibox warns when less than 20 GB is free. `docker system df` shows what Docker holds; `docker image prune -a` and removing old stopped containers free the most.
+
+aibox auto-starts an installed-but-stopped runtime; it won't install one for you. If Colima says it's "already running" but Docker doesn't answer, its VM is stuck; aibox says so, and `colima stop -f && colima start` brings it back (containers and files are kept).
 
 Note on the dev-server proxy port: the proxy asks Docker for `127.0.0.1:80` only, but some Colima versions ignore the loopback restriction and publish the port on your LAN. Everything behind it is your own sandboxed dev traffic, but if that matters to you, keep Colima current (or use OrbStack/Docker Desktop).
 
