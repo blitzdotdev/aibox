@@ -1977,8 +1977,8 @@ _remind_proposals() {
 # Containers get no GPU (Colima, Docker Desktop and OrbStack pass none
 # through), so headless Chromium inside renders WebGL on the CPU. `aibox
 # browser` runs a Playwright browser server ON THE MAC as a hidden,
-# unprivileged user ("render": own node, own Playwright, own home) inside
-# that user's launchd domain (Chrome's Mach services need one). Sessions
+# unprivileged user ("render": own node, own Playwright, own home), started
+# with sudo -u (see _render_sh for the launchd-domain fallback). Sessions
 # read the ws URL from the read-only ~/.aibox/host/browser.url and connect
 # through host.docker.internal; the browser sees that user's files, never yours.
 RENDER_USER=render
@@ -2014,13 +2014,24 @@ _render_isolate() {
   fi
   return 0
 }
-# Run a shell string as the render user, in its launchd domain, from its
-# home, with its own node first on PATH. sudo asks for your password.
-# Launched from / : the caller's cwd is inside a mode-700 home render can't
-# enter, and bash complains (getcwd) before its own `cd ~` runs.
+# Run a shell string as the render user, from its home, with its own node
+# first on PATH. sudo asks for your password. Launched from / : the
+# caller's cwd is inside a mode-700 home render can't enter, and bash
+# complains (getcwd) before its own `cd ~` runs.
+# How: a plain `sudo -u`. RENDER_START=asuser runs it inside render's own
+# launchd domain instead (`launchctl asuser`), the fallback for a Mac where
+# Chromium can't start the plain way. Under asuser, an account with no
+# display session crashes Chromium whenever a context closes (seen on
+# macOS CI: SIGSEGV after context.close(), GPU or not, while plain sudo -u
+# kept running on Metal), which drops every connected session.
+RENDER_START=sudo
 _render_sh() {
-  local uid; uid="$(_render_uid)"
-  ( cd / && sudo launchctl asuser "$uid" sudo -u "$RENDER_USER" -H env "PATH=${RENDER_HOME}/node/bin:/usr/bin:/bin" npm_config_update_notifier=false bash -c "cd ~ && $1" )
+  local as=(sudo -u "$RENDER_USER" -H env "PATH=${RENDER_HOME}/node/bin:/usr/bin:/bin" npm_config_update_notifier=false bash -c "cd ~ && $1")
+  if [[ "$RENDER_START" == asuser ]]; then
+    ( cd / && sudo launchctl asuser "$(_render_uid)" "${as[@]}" )
+  else
+    ( cd / && "${as[@]}" )
+  fi
 }
 _browser_setup() {
   local auto="${1:-}"
@@ -2055,9 +2066,11 @@ _browser_setup() {
 // aibox GPU browser server: full Chromium in new-headless mode (Metal via
 // ANGLE), one browser shared by all connecting sessions, each in its own
 // context. Run by `aibox browser` on the Mac (foreground, Ctrl-C stops it).
-// Closing the LAST window crashes Chromium when this user has no display
-// session (NSWindow close), so the server holds one page open for its
-// lifetime; if the browser still exits, it is relaunched on the same URL.
+// Started inside the launchd domain of this user (the fallback when a plain
+// sudo -u cannot start Chromium), closing a window can crash Chromium when
+// this user has no display session (NSWindow close). The server holds one
+// page open for its lifetime so the LAST one never closes, and relaunches
+// the browser on the same URL if it exits anyway.
 const { chromium } = require("@playwright/test");
 const wsPath = "/" + require("crypto").randomBytes(8).toString("hex");
 const fatal = e => { console.error(e); process.exit(1); };
@@ -2084,13 +2097,14 @@ accounts are closed to it as well.
 Everything here is private to this account: node/ (official tarball),
 node_modules/ (Playwright), serve.js (the server), server.log, .pw-version.
 Run:  aibox browser   (foreground, output on screen, Ctrl-C stops it)
-It must run in its own launchd domain (sudo launchctl asuser <uid> ...),
-which aibox does; a plain sudo -u render makes Chrome die at startup.
-By hand:  cd / && sudo launchctl asuser $(id -u render) sudo -u render -H env PATH=/var/render/node/bin:/usr/bin:/bin bash -c "cd ~ && node serve.js"
+aibox starts it with a plain sudo -u render. If Chromium cannot start that
+way on a Mac, aibox retries inside the launchd domain of render (launchctl
+asuser); there, closing a page can crash Chromium (NSWindow close with no
+display), and serve.js relaunches it on the same URL.
+By hand:  cd / && sudo -u render -H env PATH=/var/render/node/bin:/usr/bin:/bin bash -c "cd ~ && node serve.js"
 Clients send the header Host: 127.0.0.1:3145 (anything else gets 403).
-Without a display session for this user, closing a page crashes Chromium
-(NSWindow close with no display); serve.js relaunches it on the same URL.
-For concurrent sessions, give it a display session once: set a password
+If the browser keeps relaunching ("browser exited" in the output), give
+render a display session once: set a password
   PW=$(openssl rand -base64 18); sudo sysadminctl -resetPasswordFor render -newPassword "$PW"; sudo dscl . -create /Users/render IsHidden 0; echo "$PW"
 then log in as "aibox render" via Fast User Switching and switch back.
 Update Playwright:  aibox browser setup   (reinstalls to latest)
@@ -2133,7 +2147,7 @@ _browser_run() {
   # The one thing standing between that browser's file:// and your files is
   # your home's mode; check it on every run, not only at setup.
   [[ "$(stat -f %Lp "$HOME")" == "700" ]] || _die "${HOME} is not mode 700, so the '${RENDER_USER}' browser could read it. Fix with: chmod 700 ~"
-  local ver line rc status
+  local ver rc status
   ver="$(cat "${RENDER_HOME}/.pw-version" 2>/dev/null)"
   # The server's exit status, written by the process substitution (bash 3.2
   # can't wait on one, and its status is otherwise lost).
@@ -2143,10 +2157,30 @@ _browser_run() {
   mkdir -p "${CONFIG_DIR}/host"
   _on_exit _browser_cleanup
   _info "Starting the GPU browser server as '${RENDER_USER}' (sudo may ask for your password). Ctrl-C stops it."
+  _browser_serve "$ver" "$status"
+  if [[ -z "${BROWSER_UP:-}" && -z "$BROWSER_INUSE" ]]; then
+    # Some Macs refuse a cross-user Chromium outside that user's launchd
+    # domain (it dies at startup registering its Mach rendezvous service).
+    _warn "Chromium didn't start under a plain sudo -u; retrying inside ${RENDER_USER}'s launchd domain (launchctl asuser). There, closing a page can crash the browser: it relaunches on the same URL, but sessions connected at that moment drop."
+    RENDER_START=asuser
+    : > "$status"
+    _browser_serve "$ver" "$status"
+  fi
+  rc="$(cat "$status" 2>/dev/null)"
+  [[ -n "${BROWSER_UP:-}" ]] || _die "The browser server stopped before it was listening (exit status ${rc:-unknown}); its output is above. If port ${BROWSER_PORT} is taken, see by what: lsof -iTCP:${BROWSER_PORT} -sTCP:LISTEN"
+  [[ "${rc:-0}" == 0 ]] || _die "The browser server stopped (exit status ${rc}); its output is above."
+}
+# One run of the server, its output on screen. Sets BROWSER_UP once it
+# listens (and advertises the URL), BROWSER_INUSE if the port was taken;
+# the exit status lands in $2.
+BROWSER_INUSE=""
+_browser_serve() {
+  local ver="$1" status="$2" line
   # Process substitution, not a pipe: the loop must run in this shell so
   # BROWSER_UP reaches the exit hook, and macOS's bash 3.2 has no lastpipe.
   while IFS= read -r line; do
     printf '%s\n' "$line"
+    [[ "$line" == *EADDRINUSE* ]] && BROWSER_INUSE=1
     if [[ "$line" == *"Listening on ws://"* ]]; then
       BROWSER_UP=1
       printf '%s\n%s\n' "${line##*Listening on }" "$ver" | sed '1s/127\.0\.0\.1/host.docker.internal/' > "${CONFIG_DIR}/host/browser.url"
@@ -2156,9 +2190,7 @@ _browser_run() {
   done < <(rc=0; _render_sh 'DEBUG="pw:browser*" node serve.js 2>&1' || rc=$?; echo "$rc" > "$status")
   # EOF can arrive a moment before the status is written.
   for _ in 1 2 3 4 5 6 7 8 9 10; do [[ -s "$status" ]] && break; sleep 0.2; done
-  rc="$(cat "$status" 2>/dev/null)"
-  [[ -n "${BROWSER_UP:-}" ]] || _die "The browser server stopped before it was listening (exit status ${rc:-unknown}); its output is above. If port ${BROWSER_PORT} is taken, see by what: lsof -iTCP:${BROWSER_PORT} -sTCP:LISTEN"
-  [[ "${rc:-0}" == 0 ]] || _die "The browser server stopped (exit status ${rc}); its output is above."
+  return 0
 }
 _browser_status_cleanup() { [[ -n "${BROWSER_STATUS:-}" ]] && rm -f "$BROWSER_STATUS"; return 0; }
 # Containers made before the host-directory mount (layout < 4) can't see
