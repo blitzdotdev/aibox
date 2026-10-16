@@ -2230,10 +2230,31 @@ function msgText(m) {
   return t.replace(/\s+/g, " ").trim();
 }
 function parseLine(l) { try { return JSON.parse(l); } catch (e) { return null; } }
-// Title prefers Claude Code's own summary records (what its resume picker
-// shows); falls back to the first real user message. `last` is the tail of
+// Title prefers the session's name (/rename, --name: what `claude --resume
+// <name>` matches), then Claude Code's own summary records and AI title
+// (what its resume picker shows), then the first real user message. `last` is the tail of
 // the conversation — the most recent assistant text. Reads only a head and
 // a tail window, transcripts can be many MB.
+// The last /rename record anywhere in the file: a native byte search in
+// 4 MB chunks, then a parse of just that line. Files over 256 MB are skipped.
+function lastNameIn(file, size) {
+  if (size > 268435456) return "";
+  const needle = Buffer.from('"type":"custom-title"'), CH = 4194304;
+  let at = -1;
+  try {
+    const fd = fs.openSync(file, "r"), b = Buffer.alloc(CH + needle.length);
+    for (let pos = 0; pos < size; pos += CH) {
+      const n = fs.readSync(fd, b, 0, CH + needle.length, pos), k = b.slice(0, n).lastIndexOf(needle);
+      if (k >= 0) at = pos + k;
+    }
+    if (at < 0) { fs.closeSync(fd); return ""; }
+    const start = Math.max(0, at - 4096), w = Buffer.alloc(16384), n = fs.readSync(fd, w, 0, 16384, start);
+    fs.closeSync(fd);
+    const buf = w.slice(0, n), rel = buf.lastIndexOf(10, at - start) + 1, end = buf.indexOf(10, at - start);
+    const j = parseLine(buf.slice(rel, end < 0 ? n : end).toString("utf8"));
+    return j && j.type === "custom-title" && typeof j.customTitle === "string" ? j.customTitle : "";
+  } catch (e) { return ""; }
+}
 function info(file, size) {
   let head = "", tail = "";
   try {
@@ -2246,20 +2267,24 @@ function info(file, size) {
     if (size > 262144) tail = rd(Math.max(0, size - 131072), 131072);
     fs.closeSync(fd);
   } catch (e) { return { title: "Untitled session", summary: "", last: "", lastUser: "" }; }
-  let firstUser = "", summary = "", last = "";
+  let firstUser = "", summary = "", last = "", name = "", aiTitle = "";
   for (const l of head.split("\n")) {
     const j = parseLine(l); if (!j) continue;
     if (j.type === "summary" && j.summary) summary = j.summary;
+    if (j.type === "custom-title" && typeof j.customTitle === "string") name = j.customTitle;
+    if (j.type === "ai-title" && typeof j.aiTitle === "string") aiTitle = j.aiTitle;
     if (!firstUser && j.type === "user" && j.message && !j.isMeta) {
       const t = msgText(j.message);
       if (t && !t.startsWith("Caveat:") && !t.startsWith("<command-")) firstUser = t;
     }
   }
   const tl = (tail || head).split("\n");
-  let tailSummary = "", lastUser = "";
+  let tailSummary = "", lastUser = "", tailName = "", tailAi = "";
   for (let i = tl.length - 1; i >= 0; i--) {
     const j = parseLine(tl[i]); if (!j) continue;
     if (!tailSummary && j.type === "summary" && j.summary) tailSummary = j.summary;
+    if (!tailName && j.type === "custom-title" && typeof j.customTitle === "string") tailName = j.customTitle;
+    if (!tailAi && j.type === "ai-title" && typeof j.aiTitle === "string") tailAi = j.aiTitle;
     if (!last && j.type === "assistant" && j.message) {
       const t = msgText(j.message);
       if (t) last = t.slice(0, 2000);
@@ -2268,11 +2293,15 @@ function info(file, size) {
       const t = msgText(j.message);
       if (t && !t.startsWith("Caveat:") && !t.startsWith("<command-")) lastUser = t.slice(0, 500);
     }
-    if (last && lastUser && tailSummary) break;
+    if (last && lastUser && tailSummary && tailName) break;
   }
   const sum = tailSummary || summary;
+  // A rename lands mid-transcript; Claude repeats it at the end only when
+  // the session exits, which a crash skips. So look further when the
+  // windows didn't have it.
+  const nm = tailName || (tail ? lastNameIn(file, size) : "") || name;
   return {
-    title: (sum || firstUser || "Untitled session").slice(0, 100),
+    title: (nm || sum || tailAi || aiTitle || firstUser || "Untitled session").slice(0, 100),
     summary: sum.slice(0, 600),
     last: last,
     lastUser: lastUser
