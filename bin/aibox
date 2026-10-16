@@ -1978,7 +1978,7 @@ _remind_proposals() {
 # through), so headless Chromium inside renders WebGL on the CPU. `aibox
 # browser` runs a Playwright browser server ON THE MAC as a hidden,
 # unprivileged user ("render": own node, own Playwright, own home), started
-# with sudo -u (see _render_sh for the launchd-domain fallback). Sessions
+# in its launchd domain (see _render_sh). Sessions
 # read the ws URL from the read-only ~/.aibox/host/browser.url and connect
 # through host.docker.internal; the browser sees that user's files, never yours.
 RENDER_USER=render
@@ -2018,13 +2018,11 @@ _render_isolate() {
 # first on PATH. sudo asks for your password. Launched from / : the
 # caller's cwd is inside a mode-700 home render can't enter, and bash
 # complains (getcwd) before its own `cd ~` runs.
-# How: a plain `sudo -u`. RENDER_START=asuser runs it inside render's own
-# launchd domain instead (`launchctl asuser`), the fallback for a Mac where
-# Chromium can't start the plain way. Under asuser, an account with no
-# display session crashes Chromium whenever a context closes (seen on
-# macOS CI: SIGSEGV after context.close(), GPU or not, while plain sudo -u
-# kept running on Metal), which drops every connected session.
-RENDER_START=sudo
+# How: inside render's own launchd domain (`launchctl asuser`);
+# RENDER_START=sudo is a plain `sudo -u` instead, the fallback if Chromium
+# doesn't come up that way. (On one Mac a plain sudo -u killed Chromium at
+# startup with SIGTRAP; on macOS CI both work.)
+RENDER_START=asuser
 _render_sh() {
   local as=(sudo -u "$RENDER_USER" -H env "PATH=${RENDER_HOME}/node/bin:/usr/bin:/bin" npm_config_update_notifier=false bash -c "cd ~ && $1")
   if [[ "$RENDER_START" == asuser ]]; then
@@ -2062,30 +2060,41 @@ _browser_setup() {
   # Rerunning setup is the update path: always resolve @latest, then fetch
   # the Chromium build that version wants.
   _render_sh '[ -f package.json ] || npm init -y >/dev/null; npm i @playwright/test@latest >/dev/null && npx playwright install chromium >/dev/null && node -e "console.log(require(\"@playwright/test/package.json\").version)" > .pw-version'
+  _browser_write_server
+  if [[ -n "$auto" ]]; then
+    _ok "'${RENDER_USER}' is ready (Playwright $(cat "${RENDER_HOME}/.pw-version" 2>/dev/null))."
+    return 0
+  fi
+  _ok "'${RENDER_USER}' is ready (Playwright $(cat "${RENDER_HOME}/.pw-version" 2>/dev/null)). Start the server with: aibox browser"
+}
+# The server and its README, rewritten on every start so an install made by
+# an older aibox runs the current server. Single-quoted for _render_sh:
+# no apostrophes inside.
+_browser_write_server() {
   _render_sh 'cat > serve.js <<"EOF"
-// aibox GPU browser server: full Chromium in new-headless mode (Metal via
-// ANGLE), one browser shared by all connecting sessions, each in its own
-// context. Run by `aibox browser` on the Mac (foreground, Ctrl-C stops it).
-// Started inside the launchd domain of this user (the fallback when a plain
-// sudo -u cannot start Chromium), closing a window can crash Chromium when
-// this user has no display session (NSWindow close). The server holds one
-// page open for its lifetime so the LAST one never closes, and relaunches
-// the browser on the same URL if it exits anyway.
+// aibox GPU browser server: one Chromium shared by all connecting sessions,
+// each in its own context, rendering on the Mac GPU (Metal via ANGLE). Run
+// by `aibox browser` on the Mac (foreground, Ctrl-C stops it).
+// It is the Chromium headless shell (the old headless mode), not full
+// Chromium in new-headless mode: this account has no display session, and
+// there full Chromium crashes whenever a context closes (it closes an
+// NSWindow), which drops every connected session. The headless shell opens
+// no windows. --use-angle=metal puts it on the GPU instead of SwiftShader.
+// If the browser exits anyway, it is relaunched on the same URL.
 const { chromium } = require("@playwright/test");
 const wsPath = "/" + require("crypto").randomBytes(8).toString("hex");
 const fatal = e => { console.error(e); process.exit(1); };
 async function serve() {
-  const s = await chromium.launchServer({ channel: "chromium", headless: true, host: "127.0.0.1", port: '"$BROWSER_PORT"', wsPath });
+  const s = await chromium.launchServer({ channel: "chromium-headless-shell", headless: true, args: ["--use-angle=metal"],
+    host: "127.0.0.1", port: '"$BROWSER_PORT"', wsPath });
   console.log("Listening on " + s.wsEndpoint());
   s.on("close", () => { console.log(new Date().toISOString() + " browser exited - relaunching"); setTimeout(() => serve().catch(fatal), 1000); });
-  try { const keeper = await chromium.connect(s.wsEndpoint()); await (await keeper.newContext()).newPage(); }
-  catch (e) { console.log("keeper page failed: " + e.message); }
 }
 serve().catch(fatal);
 EOF
 cat > README.md <<"EOF"
 # render - GPU browser server for aibox sessions
-Hidden, unprivileged macOS account created by `aibox browser setup`. No login
+Hidden, unprivileged macOS account created by `aibox browser`. No login
 password; used only via sudo. Its one job: run a Playwright browser server on
 the Mac so sandboxed aibox sessions (Docker in Colima) can render WebGL/WebGPU
 with the real GPU instead of SwiftShader.
@@ -2095,28 +2104,19 @@ the home of the person running aibox (which setup makes chmod 700). Its
 primary group is aibox-render, not staff, so staff-readable homes of other
 accounts are closed to it as well.
 Everything here is private to this account: node/ (official tarball),
-node_modules/ (Playwright), serve.js (the server), server.log, .pw-version.
+node_modules/ (Playwright), serve.js (the server, rewritten by every
+aibox browser start), .pw-version.
 Run:  aibox browser   (foreground, output on screen, Ctrl-C stops it)
-aibox starts it with a plain sudo -u render. If Chromium cannot start that
-way on a Mac, aibox retries inside the launchd domain of render (launchctl
-asuser); there, closing a page can crash Chromium (NSWindow close with no
-display), and serve.js relaunches it on the same URL.
-By hand:  cd / && sudo -u render -H env PATH=/var/render/node/bin:/usr/bin:/bin bash -c "cd ~ && node serve.js"
+aibox starts it inside the launchd domain of render (sudo launchctl asuser),
+and falls back to a plain sudo -u render if Chromium does not come up.
+By hand:  cd / && sudo launchctl asuser $(id -u render) sudo -u render -H env PATH=/var/render/node/bin:/usr/bin:/bin bash -c "cd ~ && node serve.js"
 Clients send the header Host: 127.0.0.1:3145 (anything else gets 403).
-If the browser keeps relaunching ("browser exited" in the output), give
-render a display session once: set a password
-  PW=$(openssl rand -base64 18); sudo sysadminctl -resetPasswordFor render -newPassword "$PW"; sudo dscl . -create /Users/render IsHidden 0; echo "$PW"
-then log in as "aibox render" via Fast User Switching and switch back.
+The browser is the Chromium headless shell with --use-angle=metal: full
+Chromium crashes here whenever a context closes (no display session).
 Update Playwright:  aibox browser setup   (reinstalls to latest)
 Remove everything:  stop the server (Ctrl-C), then
   sudo sysadminctl -deleteUser render; sudo rm -rf /var/render
 EOF'
-  if [[ -n "$auto" ]]; then
-    _ok "'${RENDER_USER}' is ready (Playwright $(cat "${RENDER_HOME}/.pw-version" 2>/dev/null))."
-    return 0
-  fi
-  _ok "'${RENDER_USER}' is ready (Playwright $(cat "${RENDER_HOME}/.pw-version" 2>/dev/null)). Start the server with: aibox browser"
-  _info "Optional, for several sessions rendering at once: give '${RENDER_USER}' a display session (see ${RENDER_HOME}/README.md)."
 }
 # Runs only for the invocation whose server came up (BROWSER_UP): a second
 # `aibox browser` that lost the port race must not kill the first one.
@@ -2143,6 +2143,11 @@ _browser_run() {
   fi
   _render_uid >/dev/null
   _render_isolate
+  _browser_write_server
+  # Playwright fetches the headless shell with chromium by default, so older
+  # installs have it; a no-op when present.
+  _render_sh 'npx playwright install chromium-headless-shell >/dev/null' \
+    || _die "Could not install the Chromium headless shell for '${RENDER_USER}'. Try: aibox browser setup"
   pgrep -u "$RENDER_USER" -f "node serve.js" >/dev/null 2>&1 && _die "A GPU browser server is already running (another terminal?). Stop it there, or: sudo pkill -u ${RENDER_USER} -f 'node serve.js'"
   # The one thing standing between that browser's file:// and your files is
   # your home's mode; check it on every run, not only at setup.
@@ -2159,10 +2164,8 @@ _browser_run() {
   _info "Starting the GPU browser server as '${RENDER_USER}' (sudo may ask for your password). Ctrl-C stops it."
   _browser_serve "$ver" "$status"
   if [[ -z "${BROWSER_UP:-}" && -z "$BROWSER_INUSE" ]]; then
-    # Some Macs refuse a cross-user Chromium outside that user's launchd
-    # domain (it dies at startup registering its Mach rendezvous service).
-    _warn "Chromium didn't start under a plain sudo -u; retrying inside ${RENDER_USER}'s launchd domain (launchctl asuser). There, closing a page can crash the browser: it relaunches on the same URL, but sessions connected at that moment drop."
-    RENDER_START=asuser
+    _warn "Chromium didn't start inside ${RENDER_USER}'s launchd domain; retrying with a plain sudo -u."
+    RENDER_START=sudo
     : > "$status"
     _browser_serve "$ver" "$status"
   fi
