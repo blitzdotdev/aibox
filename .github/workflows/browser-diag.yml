@@ -48,10 +48,10 @@ jobs:
             return gl + " | WebGPU: " + gpu })
           const a = await chromium.connect(url), b = await chromium.connect(url)
           let bGone = false; b.on("disconnected", () => { bGone = true })
-          const bc = await b.newContext(), bp = await bc.newPage(); await bp.goto("about:blank")
+          const bc = await b.newContext(), bp = await bc.newPage(); await bp.goto(process.argv[3])
           console.log("B before:", await probe(bp))
           for (let round = 1; round <= 3; round++) {
-            const ac = await a.newContext(), ap = await ac.newPage(); console.log("A round " + round + ":", await probe(ap))
+            const ac = await a.newContext(), ap = await ac.newPage(); await ap.goto(process.argv[3]); console.log("A round " + round + ":", await probe(ap))
             const ap2 = await ac.newPage(); await ap2.close(); await ap.close(); await ac.close()
             await new Promise((r) => setTimeout(r, 1500))
             console.log("after A closed page+context (round " + round + "): B " + (bGone ? "DISCONNECTED" : "still connected"))
@@ -61,5 +61,14 @@ jobs:
           try { console.log("B after:", await probe(bp)); console.log(bGone ? "RESULT: FAIL" : "RESULT: PASS") } catch (e) { console.log("RESULT: FAIL B broken:", e.message.split("\n")[0]) }
           await b.close()
           EOF
-          node c.mjs "$url" 2>&1 | tail -20
+          echo '<!doctype html><title>t</title>' > /tmp/cl/index.html
+          (cd /tmp/cl && python3 -m http.server 8765 --bind 127.0.0.1 >/dev/null 2>&1 &) ; sleep 1
+          node c.mjs "$url" http://127.0.0.1:8765/ 2>&1 | tail -20
+          echo "--- same, server restarted with --enable-unsafe-webgpu:"
+          sudo pkill -u diaguser -f "node serve.js"; sleep 2
+          sudo -u diaguser sed -i '' 's/args: \["--use-angle=metal"\]/args: ["--use-angle=metal", "--enable-unsafe-webgpu"]/' /tmp/diaghome/serve.js; grep -o 'args: [^]]*]' /tmp/diaghome/serve.js
+          (cd / && sudo launchctl asuser $uid sudo -u diaguser -H env PATH=$(dirname $node):/usr/bin:/bin bash -c 'cd ~ && node serve.js' > /tmp/server2.log 2>&1 &)
+          for i in $(seq 1 60); do grep -q "Listening on" /tmp/server2.log && break; sleep 1; done
+          url2=$(grep -o 'ws://[^ ]*' /tmp/server2.log | head -1)
+          node c.mjs "$url2" http://127.0.0.1:8765/ 2>&1 | grep -E "B before|RESULT"
           echo "--- server log (relaunches / signals):"; grep -E "Listening|exited|signal|SIG" /tmp/server.log | tail -10
