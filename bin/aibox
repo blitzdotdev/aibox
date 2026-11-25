@@ -547,7 +547,16 @@ _image_src_hash() { cat "${CONFIG_DIR}/Dockerfile" "${CONFIG_DIR}/entrypoint.sh"
 _build_image() {
   _write_image_src
   _info "Building ${IMAGE} (one-time; rebuilt when aibox, node_version or Dockerfile.extra change)..."
-  docker build --pull ${PLATFORM:+--platform "$PLATFORM"} --label "aibox.src=$(_image_src_hash)" -t "$IMAGE" "$CONFIG_DIR"
+  local log rc=0; log="$(mktemp)"
+  docker build --pull ${PLATFORM:+--platform "$PLATFORM"} --label "aibox.src=$(_image_src_hash)" -t "$IMAGE" "$CONFIG_DIR" 2>&1 | tee "$log" || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    # An x86_64 build on a runtime without x86_64 emulation fails at its
+    # first RUN step: the kernel refuses the binaries.
+    [[ -n "$PLATFORM" ]] && grep -q 'exec format error' "$log" && { rm -f "$log"; _x86_unsupported; }
+    rm -f "$log"
+    _die "Building ${IMAGE} failed (output above)."
+  fi
+  rm -f "$log"
   _ok "Image built."
 }
 
@@ -1137,7 +1146,9 @@ _awake_stop() { [[ -n "${AWAKE_PID:-}" ]] && kill "$AWAKE_PID" 2>/dev/null || tr
 # the real directory cannot be touched from inside. Shares the home volume
 # (login, sessions, claude binary) and gets its own dev URLs under
 # <slug>-copy. Removed when the session exits; work is kept by committing
-# and pushing from inside before exiting.
+# and pushing from inside before exiting. --x86 is the same in an amd64
+# container (<slug>-x86 URLs), from its own image and binary slices (see
+# _use_x86), for tools that ship no Linux arm64 build.
 
 _cleanup_copy() {
   docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
@@ -1153,13 +1164,13 @@ _use_x86() {
   IMAGE="${IMAGE}-amd64"
   BIN_SLICE=shared/local-bin-amd64
   APP_SLICE=shared/claude-app-amd64
-  local out
-  out="$(docker run --rm --platform linux/amd64 "$HELPER_IMAGE" uname -m 2>&1)" || true
-  [[ "$(printf '%s\n' "$out" | tail -1)" == x86_64 ]] && return 0
-  # Anything but the kernel refusing the binary (a failed pull, a daemon
-  # error) says nothing about emulation: show docker's own words.
-  [[ "$out" == *"exec format error"* ]] \
-    || _die "Could not check whether Docker runs x86_64 containers; docker said: $(printf '%s\n' "$out" | tail -1)"
+  # Whether the runtime runs x86_64 shows in the image build itself (see
+  # _build_image). No separate probe: pulling an image's amd64 variant would,
+  # with Docker's classic image store, replace the native one under the same
+  # tag, and every native run of that image would then need emulation.
+  return 0
+}
+_x86_unsupported() {
   if command -v colima >/dev/null 2>&1; then
     _die "This Docker can't run x86_64 containers. Colima runs them through Rosetta when started with it: colima stop && colima start --vz-rosetta (containers, files and sessions are kept)."
   fi
@@ -2841,7 +2852,7 @@ cmd_status() {
       # De-jargon docker's status ("Up 2 hours", "Exited (143) 3 days ago")
       cstatus="$(echo "$cstatus" | sed 's/^Up /running /; s/^Exited ([0-9]*) /stopped /; s/^Created$/created/')"
       printf "%-18s %-20s %-10s %-10s %-30s %s\n" "$cslug" "$cstatus" "${mem:--}" "${disk:--}" "$url" "$cpath"
-      [[ "$cimage" != "$IMAGE" ]] && _info "  ${cslug}: image ${cimage} (current: ${IMAGE} — recreated on next run)"
+      [[ "$cimage" != "$IMAGE" && "$cimage" != "${IMAGE}-amd64" ]] && _info "  ${cslug}: image ${cimage} (current: ${IMAGE} — recreated on next run)"
     done <<< "$rows"
   fi
   # Daemon-wide disk picture (images/containers/volumes + reclaimable).
