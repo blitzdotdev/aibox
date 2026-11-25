@@ -207,15 +207,9 @@ _ensure_docker() {
     || _die "docker CLI not found. Install a runtime first, e.g.: brew install colima docker && colima start"
   _disk_warn
   docker info >/dev/null 2>&1 && return 0
-  local hung=""
   if command -v colima >/dev/null 2>&1; then
-    _info "Docker daemon not running. Starting Colima..."
-    # "already running" with no daemon: the VM is wedged (e.g. it hit a full
-    # disk and macOS's Virtualization framework put it in an error state).
-    local out; out="$(mktemp)"
-    colima start 2>&1 | tee "$out" >&2 || true
-    grep -q 'already running' "$out" && hung=1
-    rm -f "$out"
+    _colima_up
+    return 0
   elif [[ -d /Applications/OrbStack.app ]]; then
     _info "Docker daemon not running. Starting OrbStack..."
     open -a OrbStack
@@ -225,15 +219,67 @@ _ensure_docker() {
   else
     _die "Docker daemon not running. Start it (Linux: sudo systemctl start docker; macOS: open your Docker app) and retry."
   fi
-  local i=0 limit=60   # seconds; a VM that says it's already up gets less
-  [[ -n "$hung" ]] && limit=10
+  _docker_wait 60 || _die "Docker daemon did not come up. Try again in a moment."
+}
+_docker_wait() {
+  local i=0
   until docker info >/dev/null 2>&1; do
-    if (( i++ >= limit )); then
-      [[ -n "$hung" ]] && _die "Colima says its VM is running, but Docker inside it doesn't answer — the VM is stuck. Restart it (containers, sessions and files are kept): colima stop -f && colima start"
-      _die "Docker daemon did not come up. Try again in a moment."
-    fi
+    (( i++ >= $1 )) && return 1
     sleep 1
   done
+  return 0
+}
+
+# Start Colima, repairing what a VM that died leaves behind. The rule for
+# when a forced stop is fine: only once nothing can still be running in the
+# VM. That holds when its host agent is gone (battery died, Mac crashed or
+# rebooted: stale pid files and disk lock make `colima start` fail), and
+# when macOS reports the VM in an "error" state (its guest is gone; the agent
+# only lingers). Then aibox cleans up and starts it again by itself. A VM
+# that runs but whose Docker doesn't answer may still have sessions inside,
+# so that case asks first. Containers, files and conversations live on the
+# VM's disk and survive all of this.
+COLIMA_INSTANCE=colima
+[[ -n "${COLIMA_PROFILE:-}" && "${COLIMA_PROFILE}" != default ]] && COLIMA_INSTANCE="colima-${COLIMA_PROFILE}"
+COLIMA_LIMA="${COLIMA_HOME:-$HOME/.colima}/_lima"
+_colima_agent_alive() {
+  local pid
+  pid="$(head -c 32 "${COLIMA_LIMA}/${COLIMA_INSTANCE}/ha.pid" 2>/dev/null | tr -dc 0-9)"
+  [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && ps -p "$pid" -o command= 2>/dev/null | grep -q hostagent
+}
+_colima_vm_error() {
+  tail -n 5 "${COLIMA_LIMA}/${COLIMA_INSTANCE}/ha.stderr.log" 2>/dev/null | grep -q 'Invalid virtual machine state'
+}
+_colima_up() {
+  local log="${COLIMA_LIMA}/${COLIMA_INSTANCE}/ha.stderr.log"
+  if _colima_agent_alive; then
+    if _colima_vm_error; then
+      _warn "Colima's VM has died (macOS reports it in an error state; a full disk or a crash). Nothing in it runs any more, so restarting it. Containers, files and conversations are kept."
+      colima stop -f >/dev/null 2>&1 || true
+    else
+      _info "Docker isn't answering yet; giving Colima's VM a moment..."
+      _docker_wait 15 && return 0
+      _colima_vm_error || {
+        [[ -t 0 && -t 1 ]] || _die "Colima's VM is running but Docker inside it doesn't answer. Restart it (containers, files and conversations are kept; anything running inside stops): colima stop -f && colima start"
+        _confirm "Colima's VM is running but Docker inside it doesn't answer. Force-restart it? Anything still running inside stops (it isn't responding anyway); containers, files and conversations are kept." \
+          || _die "Left as is. To restart it later: colima stop -f && colima start"
+      }
+      colima stop -f >/dev/null 2>&1 || true
+    fi
+  fi
+  _info "Docker daemon not running. Starting Colima..."
+  if ! colima start; then
+    # Nothing is running now (the start just failed), so clearing the last
+    # run's leftovers is safe: stale pid/socket files, and the data disk's
+    # "in use" lock that a VM killed mid-run never released.
+    _warn "Colima didn't start; cleaning up after a run that didn't shut down cleanly (nothing is running, nothing is lost) and trying again..."
+    colima stop -f >/dev/null 2>&1 || true
+    if command -v limactl >/dev/null 2>&1 && tail -n 30 "$log" 2>/dev/null | grep -q 'in use by'; then
+      LIMA_HOME="$COLIMA_LIMA" limactl disk unlock "$COLIMA_INSTANCE" >/dev/null 2>&1 || true
+    fi
+    colima start || _die "Colima still doesn't start. Its log says why: tail -30 ${log}"
+  fi
+  _docker_wait 60 || _die "Colima started, but Docker inside it doesn't answer. Its log: tail -30 ${log}"
 }
 
 # Colima's VM (and with it every session) dies when the Mac's disk fills:
@@ -339,48 +385,59 @@ cat > /usr/local/bin/aibox-live <<'LIVE'
 # ~/.aibox/inbox/<project>/.live/ — so `aibox recover` can reopen sessions
 # a crash cut off. start: the session runs (also after /clear or /resume,
 # which switch ids); end: it exited normally; busy/idle: mid-task or not.
+# A session is recorded only once it has a conversation to resume: Claude
+# writes the transcript on the first message, so a session that was opened
+# or /clear-ed and never used has none ("No conversation found" on resume).
+# start records a session whose transcript exists (a resume); otherwise the
+# first prompt (busy) does.
 # Silent and always exits 0: hook output would reach the session.
 exec >/dev/null 2>&1
 umask 077
 d="$HOME/.aibox/proposals/.live"
-id="$(head -c 65536 | jq -r '.session_id // empty')"
+in="$(head -c 65536)"
+id="$(jq -r '.session_id // empty' <<<"$in")"
+tp="$(jq -r '.transcript_path // empty' <<<"$in")"
 [[ "$id" =~ ^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$ ]] || exit 0
+record() {
+  [[ "${AIBOX_CONTAINER:-}" =~ ^aibox-[a-z0-9_-]+$ ]] || return 0
+  # The claude process: the nearest ancestor whose argv[0] is claude.
+  local p=$PPID q a args=() yolo=0 rc=0 detached=0
+  for _ in 1 2 3 4 5; do
+    mapfile -d '' args < "/proc/$p/cmdline" || return 0
+    [[ "${args[0]##*/}" == claude ]] && break
+    args=()
+    p="$(ps -o ppid= -p "$p" | tr -d ' ')"
+    [[ "$p" =~ ^[0-9]+$ && "$p" -gt 1 ]] || return 0
+  done
+  [[ ${#args[@]} -gt 0 ]] || return 0
+  for a in "${args[@]:1}"; do
+    case "$a" in
+      -p|--print) return 0 ;;   # one-shot runs (scheduled jobs) are not sessions to reopen
+      --dangerously-skip-permissions) yolo=1 ;;
+      --remote-control|--remote-control=*) rc=1 ;;
+    esac
+  done
+  # Started detached (sessions UI, rc-resume): claude runs under `script`
+  # (directly, or via the shell script -c starts).
+  q=$p
+  for _ in 1 2; do
+    q="$(ps -o ppid= -p "$q" | tr -d ' ')"
+    [[ "$q" =~ ^[0-9]+$ && "$q" -gt 1 ]] || break
+    [[ "$(ps -o comm= -p "$q")" == script ]] && { detached=1; break; }
+  done
+  mkdir -p "$d" || return 0
+  printf 'ctr=%s\nyolo=%s\nrc=%s\ndetached=%s\n' "$AIBOX_CONTAINER" "$yolo" "$rc" "$detached" > "$d/.$id.tmp" \
+    && mv -f "$d/.$id.tmp" "$d/$id"
+}
 case "${1:-}" in
   start)
-    [[ "${AIBOX_CONTAINER:-}" =~ ^aibox-[a-z0-9_-]+$ ]] || exit 0
-    # The claude process: the nearest ancestor whose argv[0] is claude.
-    p=$PPID args=()
-    for _ in 1 2 3 4 5; do
-      mapfile -d '' args < "/proc/$p/cmdline" || exit 0
-      [[ "${args[0]##*/}" == claude ]] && break
-      args=()
-      p="$(ps -o ppid= -p "$p" | tr -d ' ')"
-      [[ "$p" =~ ^[0-9]+$ && "$p" -gt 1 ]] || exit 0
-    done
-    [[ ${#args[@]} -gt 0 ]] || exit 0
-    yolo=0 rc=0 detached=0
-    for a in "${args[@]:1}"; do
-      case "$a" in
-        -p|--print) exit 0 ;;   # one-shot runs (scheduled jobs) are not sessions to reopen
-        --dangerously-skip-permissions) yolo=1 ;;
-        --remote-control|--remote-control=*) rc=1 ;;
-      esac
-    done
-    # Started detached (sessions UI, rc-resume): claude runs under `script`
-    # (directly, or via the shell script -c starts).
-    q=$p
-    for _ in 1 2; do
-      q="$(ps -o ppid= -p "$q" | tr -d ' ')"
-      [[ "$q" =~ ^[0-9]+$ && "$q" -gt 1 ]] || break
-      [[ "$(ps -o comm= -p "$q")" == script ]] && { detached=1; break; }
-    done
-    mkdir -p "$d" || exit 0
-    printf 'ctr=%s\nyolo=%s\nrc=%s\ndetached=%s\n' "$AIBOX_CONTAINER" "$yolo" "$rc" "$detached" > "$d/.$id.tmp" \
-      && mv -f "$d/.$id.tmp" "$d/$id"
+    rm -f "$d/$id.busy"
+    [[ -n "$tp" && -s "$tp" ]] && record
     # Reopened by hand after a crash: no longer one to recover.
-    rm -f "$d/$id.busy" "$d/cut/$id" "$d/cut/$id.busy" ;;
+    rm -f "$d/cut/$id" "$d/cut/$id.busy" ;;
   end)  rm -f "$d/$id" "$d/$id.busy" ;;
-  busy) [[ -f "$d/$id" ]] && : > "$d/$id.busy" ;;
+  busy) [[ -f "$d/$id" ]] || record
+        [[ -f "$d/$id" ]] && : > "$d/$id.busy" ;;
   idle) rm -f "$d/$id.busy" ;;
 esac
 exit 0
@@ -1568,7 +1625,7 @@ cmd_recover() {
         # app — the same launcher the sessions page uses. On failure it
         # holds the window open so the error can be read.
         cmdfile="${dir}/${id}.command"
-        printf '#!/bin/bash\ncd %q && AIBOX_RECOVERING=1 %q %s || { echo; echo "[exited $?] press Enter to close"; read -r _; }\n' \
+        printf '#!/bin/bash\ncd %q && AIBOX_RECOVERING=1 %q %s || { rc=$?; echo; echo "[exited $rc] press Enter to close"; read -r _; }\n' \
           "$project" "$bin" "$args" > "$cmdfile"
         chmod 700 "$cmdfile"
         open -a "$app" "$cmdfile" </dev/null && opened=$((opened+1)) || _warn "Could not open ${app} for ${id}"
@@ -2452,7 +2509,7 @@ function openTerminal(p, id, cb) {
   try {
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(file, "#!/bin/bash\ncd " + shq(p) + " && " + shq(AIBOX) + " --resume " + shq(id) +
-      " || { echo; echo \"[exited $?] press Enter to close\"; read -r _; }\n", { mode: 0o700 });
+      " || { rc=$?; echo; echo \"[exited $rc] press Enter to close\"; read -r _; }\n", { mode: 0o700 });
     fs.chmodSync(file, 0o700);
   } catch (e) { return cb("Could not write the launcher: " + e.message); }
   const app = fs.existsSync("/Applications/Ghostty.app") ? "Ghostty" : "Terminal";
