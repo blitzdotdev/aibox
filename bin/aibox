@@ -20,8 +20,15 @@
 #                             bind mount, the real directory can't be
 #                             touched, and the container is removed on exit
 #                             (commit & push from inside to keep work).
+#                             With --x86 (also on plain aibox/claude), the
+#                             same disposable copy, but an x86_64 (amd64)
+#                             container: for tools with no Linux arm64
+#                             build, e.g. the bpy wheel or official Blender
+#                             builds. Runs under Rosetta on Apple Silicon
+#                             (Colima: start it with --vz-rosetta).
 #                             A `--` ends aibox's own flag parsing, so a
-#                             literal --copy/--yolo can reach the program.
+#                             literal --copy/--x86/--yolo can reach the
+#                             program.
 #   aibox serve               Run the sessions UI on port 45789 (dev-proxy
 #                             URL): start new phone/browser-drivable
 #                             sessions, resume past ones, see and stop live
@@ -156,6 +163,12 @@ VERSION_TAG="$CLI_VERSION"
 [[ "$VERSION_TAG" == "__CLI_VERSION__" ]] && VERSION_TAG="dev"
 # VERSION_TAG also names backups (aibox-home-<tag>-<time>.tar.gz).
 IMAGE="aibox:${VERSION_TAG}-node${NODE_VERSION}"
+# Native by default. --x86 sets PLATFORM=linux/amd64: its own image tag and
+# its own slices for the claude binary (an arm64 build can't run against
+# the amd64 image's libraries). Login, settings and sessions stay shared.
+PLATFORM=""
+BIN_SLICE=shared/local-bin
+APP_SLICE=shared/claude-app
 
 # ── Small helpers ────────────────────────────────────────────────
 _require_safe_dir() {
@@ -534,7 +547,7 @@ _image_src_hash() { cat "${CONFIG_DIR}/Dockerfile" "${CONFIG_DIR}/entrypoint.sh"
 _build_image() {
   _write_image_src
   _info "Building ${IMAGE} (one-time; rebuilt when aibox, node_version or Dockerfile.extra change)..."
-  docker build --pull --label "aibox.src=$(_image_src_hash)" -t "$IMAGE" "$CONFIG_DIR"
+  docker build --pull ${PLATFORM:+--platform "$PLATFORM"} --label "aibox.src=$(_image_src_hash)" -t "$IMAGE" "$CONFIG_DIR"
   _ok "Image built."
 }
 
@@ -718,8 +731,8 @@ _docker_run() {
     --mount "type=volume,src=${VOLUME},dst=/home/aibox,volume-subpath=projects/${HASH6}/home" \
     --mount "type=volume,src=${VOLUME},dst=/home/aibox/.claude,volume-subpath=shared/claude-cfg" \
     --mount "type=volume,src=${VOLUME},dst=/home/aibox/.claude/projects,volume-subpath=projects/${HASH6}/claude-projects" \
-    --mount "type=volume,src=${VOLUME},dst=/home/aibox/.local/bin,volume-subpath=shared/local-bin" \
-    --mount "type=volume,src=${VOLUME},dst=/home/aibox/.local/share/claude,volume-subpath=shared/claude-app" \
+    --mount "type=volume,src=${VOLUME},dst=/home/aibox/.local/bin,volume-subpath=${BIN_SLICE}" \
+    --mount "type=volume,src=${VOLUME},dst=/home/aibox/.local/share/claude,volume-subpath=${APP_SLICE}" \
     -v "${CONFIG_DIR}/inbox/${HASH6}:/home/aibox/.aibox/proposals" \
     -v "${CONFIG_DIR}/host:/home/aibox/.aibox/host:ro" \
     -w "$PROJECT_DIR" \
@@ -926,7 +939,7 @@ _ensure_layout() {
     d="/v/projects/'"${HASH6}"'"
     # Shared dirs too: docker does not create a missing volume-subpath, so a
     # volume whose shared/ went missing would otherwise fail every create.
-    mkdir -p /v/shared/claude-cfg /v/shared/local-bin /v/shared/claude-app "$d/home" "$d/claude-projects"
+    mkdir -p /v/shared/claude-cfg /v/shared/local-bin /v/shared/claude-app /v/'"${BIN_SLICE}"' /v/'"${APP_SLICE}"' "$d/home" "$d/claude-projects"
     if [ -f "$d/.aibox-path" ]; then
       [ "$(cat "$d/.aibox-path")" = "$P" ] || { echo COLLISION; exit 0; }
     else printf %s "$P" > "$d/.aibox-path"; fi
@@ -1132,8 +1145,30 @@ _cleanup_copy() {
   [[ "$(_state "$PROXY")" == "running" ]] && _ensure_proxy >/dev/null 2>&1 || true
 }
 
+# --x86: switch this run to an amd64 image and its own binary slices, after
+# checking that the runtime can run amd64 at all.
+_use_x86() {
+  [[ "$(uname -m)" == x86_64 ]] && return 0   # already x86_64: native
+  PLATFORM=linux/amd64
+  IMAGE="${IMAGE}-amd64"
+  BIN_SLICE=shared/local-bin-amd64
+  APP_SLICE=shared/claude-app-amd64
+  local out
+  out="$(docker run --rm --platform linux/amd64 "$HELPER_IMAGE" uname -m 2>&1)" || true
+  [[ "$(printf '%s\n' "$out" | tail -1)" == x86_64 ]] && return 0
+  # Anything but the kernel refusing the binary (a failed pull, a daemon
+  # error) says nothing about emulation: show docker's own words.
+  [[ "$out" == *"exec format error"* ]] \
+    || _die "Could not check whether Docker runs x86_64 containers; docker said: $(printf '%s\n' "$out" | tail -1)"
+  if command -v colima >/dev/null 2>&1; then
+    _die "This Docker can't run x86_64 containers. Colima runs them through Rosetta when started with it: colima stop && colima start --vz-rosetta (containers, files and sessions are kept)."
+  fi
+  _die "This Docker can't run x86_64 containers. Turn on x86_64 emulation in your runtime (Docker Desktop: Settings > General > Use Rosetta; OrbStack: on by default)."
+}
+
 _ensure_copy_all() {
   _ensure_docker
+  [[ "${1:-}" == x86 ]] && _use_x86
   _ensure_image
   _require_safe_dir
   _ensure_net_vol
@@ -1141,9 +1176,12 @@ _ensure_copy_all() {
   # Unique name per run: concurrent --copy sessions are separate sandboxes.
   # The trailing random segment doubles as the URL suffix if slugs collide
   # (see _proxy_pairs). No --restart policy: disposable by design.
-  CONTAINER="${CONTAINER}-copy-$(printf '%04x%04x' "$RANDOM" "$RANDOM")"
+  local kind=copy tag=copy plat=()
+  # "-copy-" stays in the name: recovery skips such sessions (see _live_cut).
+  [[ -n "$PLATFORM" ]] && { kind=x86; tag=x86-copy; plat=(--platform "$PLATFORM"); }
+  CONTAINER="${CONTAINER}-${tag}-$(printf '%04x%04x' "$RANDOM" "$RANDOM")"
   _on_exit _cleanup_copy
-  _docker_run -l "aibox.slug=${SLUG}-copy" -l "aibox.copy=1" >/dev/null
+  _docker_run ${plat[@]+"${plat[@]}"} -l "aibox.slug=${SLUG}-${kind}" -l "aibox.copy=1" >/dev/null
   _wait_running "Copy container failed to start."
   _ensure_proxy   # independent of the snapshot — do it before the slow part
   _info "Snapshotting project into the container (the real ${PROJECT_DIR} is not mounted)..."
@@ -1155,7 +1193,7 @@ _ensure_copy_all() {
   COPYFILE_DISABLE=1 tar -cf - -C "$PROJECT_DIR" . \
     | docker exec -i -u aibox "$CONTAINER" tar -xpf - -C "$PROJECT_DIR" \
     || _die "Project snapshot failed."
-  _ok "Disposable copy ready — removed on exit; commit & push from inside to keep work. Dev servers: $(_dev_url)"
+  _ok "Disposable ${PLATFORM:+x86_64 }copy ready — removed on exit; commit & push from inside to keep work. Dev servers: $(_dev_url)"
 }
 
 # ── Commands ─────────────────────────────────────────────────────
@@ -1164,22 +1202,25 @@ _ensure_copy_all() {
 # semantics in the usage header) are consumed wherever they appear; the
 # first `--` ends that, everything after it passes through verbatim.
 cmd_run() {
-  local copy=false yolo=false passthru=false args=() a
+  local copy=false x86=false yolo=false passthru=false args=() a
   for a in "$@"; do
     if [[ "$passthru" == "true" ]]; then args+=("$a"); continue; fi
     case "$a" in
       --copy) copy=true ;;
+      --x86|--amd64) copy=true; x86=true ;;
       --yolo) yolo=true ;;
       --)     passthru=true ;;
       *)      args+=("$a") ;;
     esac
   done
-  [[ ${#args[@]} -ge 1 ]] || _die "Usage: aibox run [--copy] <program> [args...]"
+  [[ ${#args[@]} -ge 1 ]] || _die "Usage: aibox run [--copy|--x86] <program> [args...]"
   if [[ "$yolo" == "true" && "${args[0]}" != "claude" ]]; then
     _die "--yolo maps to claude's permission flags — pass ${args[0]}'s own approval flags as normal args."
   fi
 
-  if [[ "$copy" == "true" ]]; then
+  if [[ "$x86" == "true" ]]; then
+    _ensure_copy_all x86
+  elif [[ "$copy" == "true" ]]; then
     _ensure_copy_all
   else
     _ensure_all
