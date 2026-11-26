@@ -92,7 +92,7 @@ aibox restart
 
 lists the running sessions across all projects (`--here`: only this one), asks, and restarts each: Claude exits cleanly and the session resumes where it was, **in its own terminal tab** when the tab was opened with this version of aibox, otherwise in a new window like `aibox recover` (detached sessions come back detached). `--rc` turns on Remote Control in each, `--yes` skips the question, `--list` only lists. Only Claude restarts: containers, dev servers and anything else running in them keep going, and no container is recreated (a container moves to a new aibox image with `aibox stop && aibox` once its project is idle).
 
-Sessions that are mid-task, or have commands of their own still running (background tasks, which end with the session), are left alone and listed; restart them once they're done, or pass `--force`. Sessions that started before their container had session tracking can't be found; the list says how many, and they need an exit and `aibox --resume` by hand, once. A reply in progress is cut short; the conversation itself is kept.
+Sessions that are mid-task, or have commands of their own still running (background tasks, which end with the session), are left alone and listed; restart them once they're done, or pass `--force`. Sessions that started before this version of aibox can't be found safely; the list says how many per container, and they need an exit and `aibox --resume` by hand, once. A session resumed in its tab keeps the settings flags it was started with (`--model`, `--permission-mode`, `--add-dir`, ...). A reply in progress is cut short; the conversation itself is kept.
 
 ## Scheduled jobs
 

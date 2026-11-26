@@ -395,6 +395,7 @@ cat > /etc/claude-code/managed-settings.json <<'JSON'
       { "type": "command", "command": "/usr/local/bin/aibox-live busy" }] }],
     "PostToolUse": [{ "hooks": [{ "type": "command", "command": "touch \"$HOME/.aibox/proposals/.active\"" }] }],
     "Stop": [{ "hooks": [{ "type": "command", "command": "/usr/local/bin/aibox-live idle" }] }],
+    "Notification": [{ "matcher": "idle_prompt", "hooks": [{ "type": "command", "command": "/usr/local/bin/aibox-live idle" }] }],
     "SessionStart": [{ "hooks": [{ "type": "command", "command": "/usr/local/bin/aibox-live start" }] }],
     "SessionEnd": [{ "hooks": [{ "type": "command", "command": "/usr/local/bin/aibox-live end" }] }]
   }
@@ -450,8 +451,16 @@ record() {
   done
   # The tab token: set by the `aibox` process running this session in a
   # terminal, which resumes it in place when `aibox restart` asks it to.
-  local tab=""
-  [[ "${AIBOX_TAB:-}" =~ ^[0-9a-f]{16}$ ]] && tab="$AIBOX_TAB"
+  # Only for that tab's own claude: a detached session or a claude started
+  # from inside a session inherits the variable without owning the tab.
+  local tab="" up=$p c
+  [[ "${AIBOX_TAB:-}" =~ ^[0-9a-f]{16}$ && "$detached" == 0 ]] && tab="$AIBOX_TAB"
+  for _ in 1 2 3 4 5 6; do
+    up="$(ps -o ppid= -p "$up" | tr -d ' ')"
+    [[ "$up" =~ ^[0-9]+$ && "$up" -gt 1 ]] || break
+    c="$(tr '\0' '\n' < "/proc/$up/cmdline" 2>/dev/null | head -1)"
+    [[ "${c##*/}" == claude ]] && { tab=""; break; }
+  done
   mkdir -p "$d" || return 0
   printf 'ctr=%s\nyolo=%s\nrc=%s\ndetached=%s\npid=%s\ntab=%s\n' "$AIBOX_CONTAINER" "$yolo" "$rc" "$detached" "$p" "$tab" > "$d/.$id.tmp" \
     && mv -f "$d/.$id.tmp" "$d/$id"
@@ -1222,6 +1231,28 @@ _ensure_copy_all() {
   _ok "Disposable ${PLATFORM:+x86_64 }copy ready — removed on exit; commit & push from inside to keep work. Dev servers: $(_dev_url)"
 }
 
+# The flags of the original command line a resumed session should keep
+# (into the caller's `extra` array): settings and access, never the session
+# choice (--resume, --continue, --session-id), Remote Control (restart
+# decides) or a prompt (it would be sent again). A list of known flags, not
+# a parser: claude's options with values aren't all knowable from here.
+_resume_flags() {
+  local a take=""
+  for a in "$@"; do
+    if [[ -n "$take" ]]; then extra+=("$a"); take=""; continue; fi
+    case "$a" in
+      --model|--permission-mode|--settings|--effort|--agent|--add-dir|--mcp-config|--fallback-model|\
+      --allowedTools|--allowed-tools|--disallowedTools|--disallowed-tools|--append-system-prompt|--system-prompt)
+        extra+=("$a"); take=1 ;;
+      --model=*|--permission-mode=*|--settings=*|--effort=*|--agent=*|--add-dir=*|--mcp-config=*|--fallback-model=*|\
+      --allowedTools=*|--allowed-tools=*|--disallowedTools=*|--disallowed-tools=*|--append-system-prompt=*|--system-prompt=*|\
+      --strict-mcp-config|--verbose|--debug|--chrome|--no-chrome|--ide)
+        extra+=("$a") ;;
+    esac
+  done
+  return 0
+}
+
 # Killed with its container (VM crash, docker kill), Claude never restores
 # the terminal: focus reports and its keyboard mode keep arriving as ^[[I,
 # 9;5u... at the shell prompt. Undo them.
@@ -1279,20 +1310,24 @@ cmd_run() {
     # an _ensure_all here could recreate the container under them.
     marker="${CONFIG_DIR}/restart/${AIBOX_TAB:-none}"
     while [[ -n "${AIBOX_TAB:-}" && -f "$marker" && ! -L "$marker" ]]; do
+      # Claim it: restart gives up on a marker after a while and reopens the
+      # session elsewhere; only one of the two may act on it.
+      mv "$marker" "${marker}.tab.$$" 2>/dev/null || break
       id="" rcflag=0
       while IFS='=' read -r k v; do
         case "$k" in
           id) [[ "$v" =~ ^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$ ]] && id="$v" ;;
           rc) [[ "$v" == 1 ]] && rcflag=1 ;;
         esac
-      done < <(head -c 512 "$marker")
-      rm -f "$marker"
+      done < <(head -c 512 "${marker}.tab.$$")
+      rm -f "${marker}.tab.$$"
       [[ -n "$id" ]] || break
       [[ "$(_state "$CONTAINER")" == running ]] \
         || { _warn "The container isn't running; resume this session with: aibox --resume ${id}"; break; }
       _info "Restarting this session (aibox restart)..."
       extra=()
-      [[ "$rcflag" == 1 ]] && extra=(--remote-control)
+      _resume_flags "$@"
+      [[ "$rcflag" == 1 ]] && extra+=(--remote-control)
       rc=0
       _dexec claude "$perm_flag" --resume "$id" ${extra[@]+"${extra[@]}"} || rc=$?
       [[ "$rc" -ne 0 ]] && _tty_restore
@@ -1630,6 +1665,9 @@ _live_entries() {
         [[ "$running" == *" $ctr "* ]] || rm -f "$f" "$f.busy"
         continue
       fi
+      # The container is named after this inbox's project (aibox-<slug>-
+      # <hash6>): an entry naming another project's container is forged.
+      [[ "$ctr" == aibox-*-"$h" ]] || continue
       if [[ "$want" == alive ]]; then
         [[ "$running" == *" $ctr "* ]] || continue
       else
@@ -1793,62 +1831,74 @@ cmd_restart() {
     esac
   done
   _ensure_docker
-  local all line f project id yolo rc det busy ctr pid tab pick="" skip="" n=0 ctrs c info
+  # One restart at a time: two would claim each other's markers.
+  local lock="${CONFIG_DIR}/.lock-restart"
+  mkdir "$lock" 2>/dev/null || _die "Another aibox restart is running. (If none is, remove the stale lock: rmdir ${lock})"
+  LOCKS+=("$lock"); _on_exit _unlock_all
+  local all f project id yolo rc det busy ctr pid tab pick="" skip="" n=0 c info
   all="$(_live_entries alive)"
   [[ "$here" == "true" && -n "$all" ]] && all="$(awk -F'|' -v p="$PROJECT_DIR" '$2 == p' <<< "$all")"
 
-  # Per container, in one exec: which recorded claude pids still run and
-  # have a shell child (commands of their own), and how many claude
-  # processes run at all (to spot sessions with no entry).
-  ctrs="$(cut -d'|' -f8 <<< "$all" | sort -u)"
+  # Per container, in one exec: how many claude processes run (to spot
+  # sessions with no entry), and which processes have a shell child (a
+  # command of their own: Claude runs every Bash command as a compound
+  # `zsh -c "source ... && eval ..."`, so its shell stays while it runs).
   local kids=" " counts=""
   for c in $(docker ps --filter label=aibox.slug --format '{{.Names}}' 2>/dev/null); do
     [[ "$c" == *-copy-* ]] && continue
     [[ "$here" == "true" && "$c" != "$CONTAINER" ]] && continue
     info="$(docker exec "$c" sh -c '
-      n=0
+      k=0
       for d in /proc/[0-9]*; do
         a="$(tr "\0" " " < "$d/cmdline" 2>/dev/null)"
-        case "$a" in claude\ *|*/claude\ *) case " $a " in *" -p "*|*" --print "*) ;; *) n=$((n+1)) ;; esac ;; esac
+        case "$a" in claude\ *|*/claude\ *) case " $a " in *" -p "*|*" --print "*) ;; *) k=$((k+1)) ;; esac ;; esac
       done
-      echo "count $n"
+      echo "count $k"
       for p in $(ps -eo pid=,ppid=,comm= | awk "\$3 ~ /^(bash|zsh|sh)\$/ {print \$2}" | sort -u); do echo "kid $p"; done
     ' 2>/dev/null)" || continue
     counts+="$c $(awk '$1 == "count" {print $2}' <<< "$info")"$'\n'
     for pid in $(awk '$1 == "kid" {print $2}' <<< "$info"); do kids+="$c:$pid "; done
   done
 
+  # Pick, skipping mid-task sessions, ones with commands running, entries
+  # with no pid (written before restart existed: can't be found safely),
+  # and duplicates of a process or tab already picked.
+  local seen_pt=" "
   while IFS='|' read -r f project id yolo rc det busy ctr pid tab; do
     [[ -n "$id" ]] || continue
-    if [[ "$force" != "true" ]] && { [[ "$busy" == 1 ]] || [[ -n "$pid" && "$kids" == *" $ctr:$pid "* ]]; }; then
-      skip+="$(basename "$project") ${id:0:8} ($([[ "$busy" == 1 ]] && echo mid-task || echo "commands still running"))"$'\n'
+    if [[ -z "$pid" ]]; then
+      continue   # counted below with the untracked ones
+    elif [[ "$force" != "true" ]] && { [[ "$busy" == 1 ]] || [[ "$kids" == *" $ctr:$pid "* ]]; }; then
+      skip+="  $(basename "$project") ${id:0:8} ($([[ "$busy" == 1 ]] && echo mid-task || echo "commands still running"))"$'\n'
+    elif [[ "$seen_pt" == *" $ctr:$pid "* || ( -n "$tab" && "$seen_pt" == *" tab:$tab "* ) ]]; then
+      continue
     else
+      seen_pt+="$ctr:$pid "; [[ -n "$tab" ]] && seen_pt+="tab:$tab "
       pick+="$f|$project|$id|$yolo|$rc|$det|$busy|$ctr|$pid|$tab"$'\n'
     fi
   done <<< "$all"
   pick="${pick%$'\n'}"
 
-  # Claude processes in a container beyond its entries: sessions started
-  # before its container had tracking. They can't be found; say so.
-  local untracked="" have
-  while read -r c n; do
-    [[ -n "$c" && "$n" =~ ^[0-9]+$ ]] || continue
-    have="$(awk -F'|' -v c="$c" '$8 == c' <<< "$all" | grep -c . || true)"
-    (( n > have )) && untracked+="  ${c} ($((n - have)) session(s))"$'\n'
+  # Claude processes in a container beyond its pid-carrying entries.
+  local untracked="" have cc cn
+  while read -r cc cn; do
+    [[ -n "$cc" && "$cn" =~ ^[0-9]+$ ]] || continue
+    have="$(awk -F'|' -v c="$cc" '$8 == c && $9 != ""' <<< "$all" | grep -c . || true)"
+    (( cn > have )) && untracked+="  ${cc} ($((cn - have)) session(s))"$'\n'
   done <<< "$counts"
 
   if [[ -n "$pick" ]]; then
     echo "Sessions to restart:"
+    local how
     while IFS='|' read -r f project id yolo rc det busy ctr pid tab; do
-      local how
       if [[ "$det" != 1 && -n "$tab" ]]; then how="in its tab"; [[ "$rc_all" == "true" || "$rc" == 1 ]] && how+=", remote control"
       else how="$(_reopen_how "$det" "$rc" "$yolo" "" "$rc_all")"; [[ "$det" == 1 ]] || how="new window: ${how}"; fi
       printf '  %-28s %s  (%s)\n' "$(basename "$project")" "${id:0:8}" "$how"
       n=$((n+1))
     done <<< "$pick"
   fi
-  [[ -n "$skip" ]] && { echo "Skipped (restart them once they're done, or use --force; a forced restart ends what they're running):"; printf '%s' "$skip" | sed 's/^/  /'; }
-  [[ -n "$untracked" ]] && { echo "Not tracked, so not restarted (their container predates session tracking; exit and resume those by hand, or run aibox stop && aibox in that project once it's idle):"; printf '%s' "$untracked"; }
+  [[ -n "$skip" ]] && { echo "Skipped (restart them once they're done, or use --force; a forced restart ends what they're running):"; printf '%s' "$skip"; }
+  [[ -n "$untracked" ]] && { echo "Not restarted: sessions that started before this aibox version (exit and resume those by hand once, or run aibox stop && aibox in that project when it's idle):"; printf '%s' "$untracked"; }
   if [[ -z "$pick" ]]; then
     _ok "Nothing to restart."
     return 0
@@ -1858,73 +1908,89 @@ cmd_restart() {
     _confirm "Restart these ${n} session(s)? Each resumes where it was; a reply in progress is cut short." || { _info "Left as is."; return 0; }
   fi
 
-  # 2. Markers first, then the signal: the tab must find the marker when
-  # its Claude exits.
-  local rdir="${CONFIG_DIR}/restart" stopped="" later="" want
+  # Markers first, then the signal: the tab must find its marker when its
+  # Claude exits. A marker this run wrote and nobody claimed is removed on
+  # any exit (Ctrl-C included), or it would resume the session the next
+  # time the user exits it.
+  local rdir="${CONFIG_DIR}/restart" stopped="" later="" want mine wrote
   mkdir -p "$rdir"
+  RESTART_MARKERS=()
+  _on_exit _restart_markers_cleanup
   while IFS='|' read -r f project id yolo rc det busy ctr pid tab; do
+    wrote=""
     if [[ "$det" != 1 && -n "$tab" ]]; then
       want=0; [[ "$rc" == 1 || "$rc_all" == "true" ]] && want=1
       printf 'id=%s\nrc=%s\n' "$id" "$want" > "${rdir}/${tab}"
+      RESTART_MARKERS+=("${rdir}/${tab}"); wrote=1
     fi
-    # Find the process: the recorded pid, else (entries from before pids
-    # were recorded) Claude's own session file in the shared config.
+    # The recorded process, if it is still that session's Claude: a claude
+    # (not a -p job), carrying the tab token when there is one, so a pid
+    # reused by another session isn't signalled.
     if ! docker exec -u aibox "$ctr" sh -c '
-        p="$1"; id="$2"
-        if [ -z "$p" ]; then
-          for j in "$HOME"/.claude/sessions/*.json; do
-            grep -q "\"sessionId\":\"$id\"" "$j" 2>/dev/null || continue
-            q="${j##*/}"; q="${q%.json}"
-            case "$(tr "\0" " " < "/proc/$q/cmdline" 2>/dev/null)" in claude\ *|*/claude\ *) p="$q"; break ;; esac
-          done
-        fi
-        [ -n "$p" ] || exit 3
-        case "$(tr "\0" " " < "/proc/$p/cmdline" 2>/dev/null)" in claude\ *|*/claude\ *) ;; *) exit 3 ;; esac
-        kill -TERM "$p" && echo "$p"' _ "$pid" "$id" > "${rdir}/.pid" 2>/dev/null; then
-      _warn "Couldn't find the running Claude of $(basename "$project") ${id:0:8}; left as is."
-      [[ -n "$tab" ]] && rm -f "${rdir}/${tab}"
+        p="$1"; t="$2"
+        case "$(tr "\0" " " < "/proc/$p/cmdline" 2>/dev/null)" in
+          *" -p "*|*" --print "*) exit 3 ;;
+          claude\ *|*/claude\ *) ;;
+          *) exit 3 ;;
+        esac
+        if [ -n "$t" ]; then tr "\0" "\n" < "/proc/$p/environ" 2>/dev/null | grep -qx "AIBOX_TAB=$t" || exit 3; fi
+        kill -TERM "$p"' _ "$pid" "$tab" >/dev/null 2>&1; then
+      _warn "$(basename "$project") ${id:0:8} isn't running as recorded any more; left as is."
+      [[ -n "$wrote" ]] && rm -f "${rdir}/${tab}"
       continue
     fi
-    stopped+="$ctr:$(head -c 16 "${rdir}/.pid" | tr -dc 0-9) "
+    stopped+="$ctr:$pid "
     if [[ "$det" == 1 || -z "$tab" ]]; then later+="$f|$project|$id|$yolo|$rc|$det|$busy|$ctr|$pid|$tab"$'\n'; fi
   done <<< "$pick"
-  rm -f "${rdir}/.pid"
 
-  # Up to 15s for clean exits, then SIGKILL what's left.
-  local i e left
+  # Up to 15s for clean exits (polling only what's left), then SIGKILL.
+  local i e left="$stopped"
   for i in $(seq 1 30); do
-    left=""
-    for e in $stopped; do docker exec "${e%%:*}" test -d "/proc/${e##*:}" 2>/dev/null && left+="$e "; done
+    local still=""
+    for e in $left; do docker exec "${e%%:*}" test -d "/proc/${e##*:}" 2>/dev/null && still+="$e "; done
+    left="$still"
     [[ -z "$left" ]] && break
     sleep 0.5
   done
   for e in $left; do docker exec -u aibox "${e%%:*}" kill -KILL "${e##*:}" 2>/dev/null || true; done
 
-  # 3. Tabs take their markers within moments; after 20s, open the rest.
-  local tabs_ok=0 tabs_late=""
+  # Tabs claim their markers within moments; after 20s, claim what's left
+  # ourselves (the same atomic mv the tab uses) and open those elsewhere.
+  local waiting
   for i in $(seq 1 40); do
-    left=0
+    waiting=0
     while IFS='|' read -r f project id yolo rc det busy ctr pid tab; do
-      [[ "$det" != 1 && -n "$tab" && -f "${rdir}/${tab}" ]] && left=1
+      [[ "$det" != 1 && -n "$tab" && " $stopped" == *" $ctr:$pid "* && -f "${rdir}/${tab}" ]] && waiting=1
     done <<< "$pick"
-    [[ "$left" == 0 ]] && break
+    [[ "$waiting" == 0 ]] && break
     sleep 0.5
   done
+  local tabs_ok=0 tabs_late=""
   while IFS='|' read -r f project id yolo rc det busy ctr pid tab; do
-    [[ "$det" != 1 && -n "$tab" ]] || continue
-    case " $stopped " in *" $ctr:"*) ;; *) continue ;; esac
-    if [[ -f "${rdir}/${tab}" ]]; then
-      rm -f "${rdir}/${tab}"
+    [[ "$det" != 1 && -n "$tab" && " $stopped" == *" $ctr:$pid "* ]] || continue
+    if mv "${rdir}/${tab}" "${rdir}/${tab}.late.$$" 2>/dev/null; then
+      rm -f "${rdir}/${tab}.late.$$"
       tabs_late+="$f|$project|$id|$yolo|$rc|$det|$busy|$ctr|$pid|$tab"$'\n'
     else
       tabs_ok=$((tabs_ok+1))
     fi
   done <<< "$pick"
+  RESTART_MARKERS=()
   [[ "$tabs_ok" -gt 0 ]] && _ok "${tabs_ok} session(s) restarting in their own tabs."
+  [[ -n "$tabs_late" ]] && _info "$(grep -c . <<< "$tabs_late") tab(s) didn't pick up their session (closed, or running an older aibox); opening those in new windows."
   later+="$tabs_late"
   later="${later%$'\n'}"
-  [[ -n "$tabs_late" ]] && _info "$(grep -c . <<< "$tabs_late") tab(s) didn't pick up their session (closed, or running an older aibox); opening those in new windows."
-  [[ -n "$later" ]] && _reopen_sessions "$later" "" "$rc_all"
+  if [[ -n "$later" ]]; then
+    # Build once here rather than in every new window at the same moment.
+    _ensure_image
+    _reopen_sessions "$later" "" "$rc_all"
+  fi
+  return 0
+}
+RESTART_MARKERS=()
+_restart_markers_cleanup() {
+  local m
+  for m in ${RESTART_MARKERS[@]+"${RESTART_MARKERS[@]}"}; do rm -f "$m"; done
   return 0
 }
 
