@@ -82,6 +82,18 @@ lists every session, across all projects, that was running at the time, and afte
 
 How it knows: hooks in the container keep one small file per running interactive session in `~/.aibox/inbox/<project>/.live/`, removed when the session exits normally (`/clear` and `/resume` update it). When a container starts, it moves the leftovers to `.live/cut/`; any `aibox` run then reminds you they're there. `aibox stop` clears its project's list, since stopping is deliberate. A session is tracked from its first message (before that there is no conversation to resume), and headless runs (`-p`, scheduled jobs) and `--copy` sessions aren't tracked. This tracking starts once a project's container has been recreated with this version, which happens on the next `aibox` run when nothing is running in it.
 
+## Restarting sessions
+
+When Claude Code updates itself, every running session says to restart to apply it. Instead of exiting and resuming each one:
+
+```bash
+aibox restart
+```
+
+lists the running sessions across all projects (`--here`: only this one), asks, and restarts each: Claude exits cleanly and the session resumes where it was, **in its own terminal tab** when the tab was opened with this version of aibox, otherwise in a new window like `aibox recover` (detached sessions come back detached). `--rc` turns on Remote Control in each, `--yes` skips the question, `--list` only lists. Only Claude restarts: containers, dev servers and anything else running in them keep going, and no container is recreated (a container moves to a new aibox image with `aibox stop && aibox` once its project is idle).
+
+Sessions that are mid-task, or have commands of their own still running (background tasks, which end with the session), are left alone and listed; restart them once they're done, or pass `--force`. Sessions that started before this version of aibox can't be found safely; the list says how many per container, and they need an exit and `aibox --resume` by hand, once. A session resumed in its tab keeps the settings flags it was started with (`--model`, `--permission-mode`, `--add-dir`, ...). A reply in progress is cut short; the conversation itself is kept.
+
 ## Scheduled jobs
 
 ```bash
@@ -133,6 +145,7 @@ Sessions merge file-by-file (nothing is ever overwritten or deleted; sources are
 | `aibox serve` | Sessions UI in the container: start new phone/claude.ai-drivable sessions, resume past ones, stop live ones. `aibox serve stop` ends the UI and every live session of this project |
 | `aibox sessions` | All projects' sessions on one local page (host-side, loopback-only, foreground). Buttons per session: open in Ghostty/Terminal, copy the resume command, or send to your phone |
 | `aibox recover [--rc] [--detached]` | Reopen every session a VM crash or Docker restart cut off, each in its own terminal window or detached with Remote Control. Lists them and asks first. See [After a crash](#after-a-crash) |
+| `aibox restart [--rc] [--force] [--here]` | Restart running Claude sessions, e.g. after "restart to update": each resumes in its own tab where possible, else in a new window. Skips mid-task sessions unless `--force`. Containers and dev servers keep running. See [Restarting sessions](#restarting-sessions) |
 | `aibox browser [setup]` | GPU-backed Playwright browser server on the Mac that sessions connect to; foreground, Ctrl-C stops it (see [GPU rendering](#gpu-rendering)). macOS only |
 | `aibox schedule [add\|rm\|approve\|reject\|on\|off\|log]` | Jobs that run inside project sandboxes on a schedule or on container start; no args lists them with next/last run and pending proposals. See [Scheduled jobs](#scheduled-jobs) |
 | `aibox shell [cmd]` | zsh in the container, or run a one-off command |
